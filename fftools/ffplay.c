@@ -4791,6 +4791,8 @@ int main(int argc, char **argv)
     /* started without a file: empty window until one is opened/dropped */
     if (!input_filename)
         input_filename = wait_for_input_file();
+#if 0 /* disabled: the intermediate 640x480 stage was more distracting than
+       * the wait; the window now first appears at the video size */
     else if (window && renderer) {
         /* Immediate feedback for double-click launches: show the window
          * and paint it black right away (an unpainted window flashes its
@@ -4803,6 +4805,7 @@ int main(int argc, char **argv)
         SDL_RenderClear(renderer);
         SDL_RenderPresent(renderer); /* both buffers of the swap chain */
     }
+#endif
 
     is = stream_open(input_filename, file_iformat);
     if (!is) {
