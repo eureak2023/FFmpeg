@@ -3971,6 +3971,13 @@ static VideoState *switch_input(VideoState *old, char *filename)
  * chosen file (av_strdup'ed); exits on quit. */
 static char *wait_for_input_file(void)
 {
+    /* paint both swap-chain buffers before revealing the window, so no
+     * unpainted outline flashes */
+    for (int i = 0; i < 2; i++) {
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        SDL_RenderClear(renderer);
+        SDL_RenderPresent(renderer);
+    }
     SDL_ShowWindow(window);
     for (;;) {
         SDL_Event ev;
