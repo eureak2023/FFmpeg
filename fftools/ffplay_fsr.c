@@ -2301,6 +2301,9 @@ static const uint8_t *toast_glyph(char c)
     };
     static const uint8_t gDot[8] = {0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x00};
     static const uint8_t gColon[8] = {0x00,0x18,0x18,0x00,0x18,0x18,0x00,0x00};
+    static const uint8_t gX[8] = {0x66,0x66,0x3C,0x18,0x3C,0x66,0x66,0x00};
+    static const uint8_t gDash[8] = {0x00,0x00,0x00,0x7E,0x00,0x00,0x00,0x00};
+    static const uint8_t gGt[8] = {0x30,0x18,0x0C,0x06,0x0C,0x18,0x30,0x00};
 
     if (c >= '0' && c <= '9')
         return gDigits[c - '0'];
@@ -2319,6 +2322,9 @@ static const uint8_t *toast_glyph(char c)
     case '/': return gSl;
     case '.': return gDot;
     case ':': return gColon;
+    case 'X': return gX;
+    case '-': return gDash;
+    case '>': return gGt;
     default:  return NULL; /* rendered as blank */
     }
 }
@@ -2428,9 +2434,9 @@ int fsr_hud_draw(SDL_Renderer *renderer)
     if (!hud_tex)
         return 0;
     SDL_GetRendererOutputSize(renderer, &ow, &oh);
-    scale = oh / 180;
-    if (scale < 2)
-        scale = 2;
+    scale = oh / 300;
+    if (scale < 1)
+        scale = 1;
     dst.w = hud_w * scale;
     dst.h = hud_h * scale;
     dst.x = ow - dst.w - 16;

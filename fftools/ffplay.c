@@ -1449,20 +1449,32 @@ static int video_open(VideoState *is)
     return 0;
 }
 
-/* Refresh the TAB-toggled status overlay: presented frame rate (real +
- * generated frames) and the current FSR/denoise/sharpness/FG state. */
+static int    hud_src_w, hud_src_h;   /* source video dimensions */
+static double hud_src_fps;            /* source frame rate */
+
+/* Refresh the TAB-toggled status overlay: source resolution, source ->
+ * presented frame rate (incl. generated frames) and the current
+ * FSR/denoise/sharpness/FG state. */
 static void status_hud_update(int fps)
 {
     static int last_fps;
-    char buf[96];
+    char buf[128];
+    int n = 0;
 
     if (fps >= 0)
         last_fps = fps;
     if (!show_fps || !renderer)
         return;
-    snprintf(buf, sizeof(buf),
-             "%d FPS\nFSR %s\nSHARP %d\nNR %s\nFG %s",
-             last_fps,
+    if (hud_src_w && hud_src_h)
+        n += snprintf(buf + n, sizeof(buf) - n, "%dX%d\n",
+                      hud_src_w, hud_src_h);
+    if (hud_src_fps > 0)
+        n += snprintf(buf + n, sizeof(buf) - n, "%d -> %d FPS\n",
+                      (int)lrint(hud_src_fps), last_fps);
+    else
+        n += snprintf(buf + n, sizeof(buf) - n, "%d FPS\n", last_fps);
+    snprintf(buf + n, sizeof(buf) - n,
+             "FSR %s\nSHARP %d\nNR %s\nFG %s",
              fsr ? "ON" : "OFF",
              (int)lrint((2.0f - fsr_sharpness) / 2.0f * 100.0f),
              fsr_denoise ? "ON" : "OFF",
@@ -3265,12 +3277,16 @@ static int stream_component_open(VideoState *is, int stream_index)
         is->queue_attachments_req = 1;
         {
             char vname[16];
+            AVRational fr = av_guess_frame_rate(ic, is->video_st, NULL);
 
             snprintf(vname, sizeof(vname), "%s", avcodec_get_name(avctx->codec_id));
             for (char *p = vname; *p; p++)
                 *p = av_toupper(*p);
             ui_set_badges(avctx->hw_device_ctx ? "H/W" : "S/W", vname,
                           NULL, NULL);
+            hud_src_w   = avctx->width;
+            hud_src_h   = avctx->height;
+            hud_src_fps = fr.num && fr.den ? av_q2d(fr) : 0.0;
         }
         break;
     case AVMEDIA_TYPE_SUBTITLE:
