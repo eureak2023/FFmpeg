@@ -4068,6 +4068,23 @@ static void event_loop(VideoState *cur_stream)
                 break;
             }
             break;
+        case SDL_MOUSEWHEEL:
+            if (event.wheel.y) {
+                char toast[12];
+                int up = event.wheel.y > 0;
+
+                if (event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED)
+                    up = !up;
+                update_volume(cur_stream, up ? 1 : -1, SDL_VOLUME_STEP);
+                snprintf(toast, sizeof(toast), "VOL %d",
+                         (int)lrint(cur_stream->audio_volume * 100.0 / SDL_MIX_MAXVOLUME));
+                av_log(NULL, AV_LOG_INFO, "Volume: %d%%\n",
+                       (int)lrint(cur_stream->audio_volume * 100.0 / SDL_MIX_MAXVOLUME));
+                if (renderer)
+                    fsr_toast_show(renderer, toast);
+                cur_stream->force_refresh = 1;
+            }
+            break;
         case SDL_MOUSEBUTTONDOWN:
             if (exit_on_mousedown) {
                 do_exit(cur_stream);
