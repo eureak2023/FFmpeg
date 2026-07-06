@@ -4073,6 +4073,20 @@ static char *wait_for_input_file(void)
 
         SDL_GetWindowSize(window, &w, &h);
         while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_MOUSEBUTTONDOWN &&
+                ev.button.button == SDL_BUTTON_RIGHT)
+                ui_context_menu();
+            switch (ui_menu_result(&ev)) {
+            case UI_MENU_OPEN: {
+                char *f = ui_open_file_dialog();
+
+                if (f)
+                    return f;
+                break;
+            }
+            case UI_MENU_CLOSE:
+                do_exit(NULL);
+            }
             switch (ui_handle_event(&ev, w, h, &frac)) {
             case UI_ACT_CLOSE:
                 do_exit(NULL);
@@ -4132,12 +4146,7 @@ static int handle_ui_event(VideoState *cur_stream, const SDL_Event *event)
         return 0;
     if (event->type == SDL_MOUSEBUTTONDOWN &&
         event->button.button == SDL_BUTTON_RIGHT) {
-        switch (ui_context_menu()) {
-        case UI_MENU_OPEN:
-            return 2; /* caller runs the dialog and switches the input */
-        case UI_MENU_CLOSE:
-            do_exit(cur_stream); /* does not return */
-        }
+        ui_context_menu(); /* async; result arrives as a user event */
         return 1;
     }
     act = ui_handle_event(event, cur_stream->width, cur_stream->height,
@@ -4200,6 +4209,19 @@ static void event_loop(VideoState *cur_stream)
     for (;;) {
         double x;
         refresh_loop_wait_event(cur_stream, &event);
+        switch (ui_menu_result(&event)) {
+        case UI_MENU_OPEN: {
+            char *f = ui_open_file_dialog();
+
+            if (f)
+                cur_stream = switch_input(cur_stream, f);
+            continue;
+        }
+        case UI_MENU_CLOSE:
+            do_exit(cur_stream); /* does not return */
+        case 0:
+            continue; /* menu dismissed */
+        }
         switch (handle_ui_event(cur_stream, &event)) {
         case 2: { /* open-file dialog */
             char *f = ui_open_file_dialog();

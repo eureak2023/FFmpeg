@@ -114,6 +114,10 @@ static struct {
     int last_drawn_hover;
 } ui;
 
+/* SDL user event type for async results (context menu) */
+static Uint32       ui_event_type;
+static SDL_atomic_t menu_active;
+
 /* Rasterize UTF-8 text with the system font via GDI (handles Korean and
  * everything else the pixel font cannot). White glyphs, alpha from
  * coverage. Returns NULL on failure (caller falls back to the pixel font). */
@@ -386,6 +390,7 @@ void ui_init(SDL_Renderer *renderer)
     ui.renderer = renderer;
     ui.last_activity = av_gettime_relative();
     subs.lock = SDL_CreateMutex();
+    ui_event_type = SDL_RegisterEvents(1);
     /* Deliver the click that focuses the window too, so grabbing an
      * unfocused player and dragging it works in one motion. */
     SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
@@ -447,36 +452,65 @@ void ui_ping(void)
     ui.last_activity = av_gettime_relative();
 }
 
-/* Right-click context menu. Returns 0 (dismissed), UI_MENU_OPEN or
- * UI_MENU_CLOSE. Blocks while the menu is open; main thread only. */
-int ui_context_menu(void)
-{
+/* Right-click context menu, shown on its own thread (with its own hidden
+ * owner window) so playback keeps running behind it. The chosen command
+ * arrives back as an SDL user event; see ui_menu_result(). */
 #ifdef _WIN32
-    SDL_SysWMinfo wm;
+static int menu_thread(void *arg)
+{
+    HWND owner;
     HMENU menu;
     POINT pt;
-    int cmd;
+    int cmd = 0;
 
-    if (!ui.window)
-        return 0;
-    SDL_VERSION(&wm.version);
-    if (!SDL_GetWindowWMInfo(ui.window, &wm))
-        return 0;
+    owner = CreateWindowExW(WS_EX_TOOLWINDOW, L"STATIC", L"", WS_POPUP,
+                            0, 0, 0, 0, NULL, NULL, NULL, NULL);
     menu = CreatePopupMenu();
-    if (!menu)
-        return 0;
-    AppendMenuW(menu, MF_STRING, UI_MENU_OPEN, L"파일 열기(&O)...");
-    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-    AppendMenuW(menu, MF_STRING, UI_MENU_CLOSE, L"닫기(&X)");
-    GetCursorPos(&pt);
-    SetForegroundWindow(wm.info.win.window);
-    cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                         pt.x, pt.y, 0, wm.info.win.window, NULL);
-    DestroyMenu(menu);
-    return cmd;
-#else
+    if (owner && menu) {
+        AppendMenuW(menu, MF_STRING, UI_MENU_OPEN, L"파일 열기(&O)...");
+        AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(menu, MF_STRING, UI_MENU_CLOSE, L"닫기(&X)");
+        GetCursorPos(&pt);
+        SetForegroundWindow(owner);
+        cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                             pt.x, pt.y, 0, owner, NULL);
+    }
+    if (menu)
+        DestroyMenu(menu);
+    if (owner)
+        DestroyWindow(owner);
+    {
+        SDL_Event ev = { 0 };
+
+        ev.type      = ui_event_type;
+        ev.user.code = cmd;
+        SDL_PushEvent(&ev);
+    }
+    SDL_AtomicSet(&menu_active, 0);
     return 0;
+}
 #endif
+
+void ui_context_menu(void)
+{
+#ifdef _WIN32
+    SDL_Thread *t;
+
+    if (!ui_event_type || SDL_AtomicCAS(&menu_active, 0, 1) == SDL_FALSE)
+        return;
+    t = SDL_CreateThread(menu_thread, "ctxmenu", NULL);
+    if (t)
+        SDL_DetachThread(t);
+    else
+        SDL_AtomicSet(&menu_active, 0);
+#endif
+}
+
+int ui_menu_result(const SDL_Event *event)
+{
+    if (!ui_event_type || event->type != ui_event_type)
+        return -1;
+    return event->user.code;
 }
 
 /* Native "open file" dialog; returns an av_strdup'ed UTF-8 path or NULL. */
