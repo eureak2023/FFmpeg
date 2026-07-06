@@ -88,6 +88,8 @@ static struct {
     /* volume slider */
     int     vol_dragging;
 
+    int     mouse_x, mouse_y; /* last cursor position in the window */
+
     /* stream info badges: [0] highlighted (H/W), [1] vcodec, [2] acodec,
      * [3] channels. Set once from the open threads, rendered lazily on the
      * main thread. */
@@ -352,7 +354,7 @@ static int element_at(int x, int y)
     int bar_top  = ui.win_h - BAR_H;
     int seek_top = bar_top - SEEK_H;
 
-    if (y < TITLE_H && !ui_fullscreen()) {
+    if (y < TITLE_H) {
         int from_right = (ui.win_w - x) / WBTN_W;
 
         switch (from_right) {
@@ -446,6 +448,8 @@ int ui_handle_event(const SDL_Event *event, int win_w, int win_h,
     case SDL_MOUSEMOTION:
         x = event->motion.x;
         y = event->motion.y;
+        ui.mouse_x = x;
+        ui.mouse_y = y;
         ui.last_activity = av_gettime_relative();
         ui.hover = element_at(x, y);
         if (ui.dragging) {
@@ -528,8 +532,10 @@ int ui_handle_event(const SDL_Event *event, int win_w, int win_h,
     case SDL_WINDOWEVENT:
         /* cursor left the window: clear hover so the overlay can hide */
         if (event->window.event == SDL_WINDOWEVENT_LEAVE && !ui.dragging &&
-            !ui.wdrag_armed)
-            ui.hover = EL_NONE;
+            !ui.wdrag_armed) {
+            ui.hover   = EL_NONE;
+            ui.mouse_y = TITLE_H; /* also drop the fullscreen title reveal */
+        }
         return UI_ACT_NONE;
     }
     return UI_ACT_NONE;
@@ -729,8 +735,9 @@ void ui_draw(SDL_Renderer *renderer, int win_w, int win_h,
                   4 * BTN_W + BTN_W / 2, cy - 9.f, c);
     fill(renderer, 4 * BTN_W + BTN_W / 2 - 9, cy + 6, 19, 3, c.r, c.g, c.b, 255);
 
-    /* ---- title bar (hidden in fullscreen: video only + bottom controls) */
-    if (ui_fullscreen())
+    /* ---- title bar; in fullscreen it appears only while the cursor sits
+     * in the top zone and hides as soon as it moves away */
+    if (ui_fullscreen() && ui.mouse_y >= TITLE_H)
         goto controls;
     fill(renderer, 0, 0, win_w, TITLE_H, 14, 14, 14, 235);
     if (!ui.title_tex && ui.title[0]) {

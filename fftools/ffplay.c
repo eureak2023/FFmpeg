@@ -3914,7 +3914,9 @@ static int handle_ui_event(VideoState *cur_stream, const SDL_Event *event)
         SDL_MinimizeWindow(window);
         break;
     case UI_ACT_MAXIMIZE:
-        if (SDL_GetWindowFlags(window) & SDL_WINDOW_MAXIMIZED)
+        if (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN_DESKTOP)
+            toggle_full_screen(cur_stream);
+        else if (SDL_GetWindowFlags(window) & SDL_WINDOW_MAXIMIZED)
             SDL_RestoreWindow(window);
         else
             SDL_MaximizeWindow(window);
