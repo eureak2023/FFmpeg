@@ -32,6 +32,7 @@
 #include <SDL_syswm.h>
 #endif
 
+#include "libavutil/avstring.h"
 #include "libavutil/mem.h"
 #include "libavutil/time.h"
 
@@ -197,10 +198,187 @@ out:
 #endif
 }
 
+/* ---- text subtitles (SRT/SMI/ASS events rendered with the system font) */
+#define SUB_MAX_LINES 4
+
+typedef struct SubEvent {
+    double start, end;
+    char  *text;
+} SubEvent;
+
+static struct {
+    SDL_mutex *lock;
+    SubEvent  *ev;
+    int        n, cap;
+    /* draw cache */
+    char         cur[1024];
+    SDL_Texture *line_tex[SUB_MAX_LINES];
+    int          line_w[SUB_MAX_LINES], line_h[SUB_MAX_LINES];
+    int          nlines, font_px;
+} subs;
+
+void ui_sub_add(double start, double end, const char *text)
+{
+    if (!subs.lock || !text || !text[0])
+        return;
+    SDL_LockMutex(subs.lock);
+    for (int i = subs.n - 1; i >= 0; i--)  /* dedup (seek re-decodes) */
+        if (subs.ev[i].start == start && !strcmp(subs.ev[i].text, text)) {
+            SDL_UnlockMutex(subs.lock);
+            return;
+        }
+    if (subs.n == subs.cap) {
+        int ncap = subs.cap ? subs.cap * 2 : 256;
+        SubEvent *nev = av_realloc_array(subs.ev, ncap, sizeof(*nev));
+
+        if (!nev) {
+            SDL_UnlockMutex(subs.lock);
+            return;
+        }
+        subs.ev  = nev;
+        subs.cap = ncap;
+    }
+    subs.ev[subs.n].start = start;
+    subs.ev[subs.n].end   = end;
+    subs.ev[subs.n].text  = av_strdup(text);
+    if (subs.ev[subs.n].text)
+        subs.n++;
+    SDL_UnlockMutex(subs.lock);
+}
+
+/* Add a decoded ASS event line ("ReadOrder,Layer,Style,...,Text"): keep the
+ * text field, drop {\override} blocks, convert \N to newlines. */
+void ui_sub_add_ass(double start, double end, const char *ass)
+{
+    char out[1024];
+    const char *p = ass;
+    int commas = 0, o = 0;
+
+    while (*p && commas < 8)   /* skip to the 9th field (the text) */
+        if (*p++ == ',')
+            commas++;
+    if (commas < 8)
+        p = ass;               /* not an ASS line: take it as plain text */
+    while (*p && o < (int)sizeof(out) - 1) {
+        if (*p == '{') {       /* {\...} style override */
+            const char *q = strchr(p, '}');
+
+            if (q) {
+                p = q + 1;
+                continue;
+            }
+        }
+        if (p[0] == '\\' && (p[1] == 'N' || p[1] == 'n')) {
+            out[o++] = '\n';
+            p += 2;
+            continue;
+        }
+        if (p[0] == '\\' && p[1] == 'h') {
+            out[o++] = ' ';
+            p += 2;
+            continue;
+        }
+        out[o++] = *p++;
+    }
+    out[o] = 0;
+    ui_sub_add(start, end, out);
+}
+
+static void sub_drop_cache(void)
+{
+    for (int i = 0; i < SUB_MAX_LINES; i++)
+        if (subs.line_tex[i]) {
+            SDL_DestroyTexture(subs.line_tex[i]);
+            subs.line_tex[i] = NULL;
+        }
+    subs.nlines = 0;
+    subs.cur[0] = 0;
+}
+
+/* Main thread only. */
+void ui_sub_clear(void)
+{
+    if (!subs.lock)
+        return;
+    SDL_LockMutex(subs.lock);
+    for (int i = 0; i < subs.n; i++)
+        av_free(subs.ev[i].text);
+    subs.n = 0;
+    SDL_UnlockMutex(subs.lock);
+    sub_drop_cache();
+}
+
+void ui_sub_draw(SDL_Renderer *renderer, int win_w, int win_h, double now)
+{
+    char text[1024];
+    int px, y;
+
+    if (!subs.lock || !subs.n)
+        return;
+    text[0] = 0;
+    SDL_LockMutex(subs.lock);
+    for (int i = 0; i < subs.n; i++)
+        if (now >= subs.ev[i].start && now < subs.ev[i].end) {
+            snprintf(text, sizeof(text), "%s", subs.ev[i].text);
+            break;
+        }
+    SDL_UnlockMutex(subs.lock);
+
+    px = win_h / 16;
+    px = px < 18 ? 18 : px > 64 ? 64 : px;
+    if (strcmp(text, subs.cur) || px != subs.font_px) {
+        char *line, *save = NULL;
+
+        sub_drop_cache();
+        snprintf(subs.cur, sizeof(subs.cur), "%s", text);
+        subs.font_px = px;
+        line = av_strtok(text, "\n", &save);
+        while (line && subs.nlines < SUB_MAX_LINES) {
+            if (line[0]) {
+                int li = subs.nlines;
+
+                subs.line_tex[li] = render_text_sys(renderer, line, px,
+                                                    &subs.line_w[li],
+                                                    &subs.line_h[li]);
+                if (subs.line_tex[li])
+                    subs.nlines++;
+            }
+            line = av_strtok(NULL, "\n", &save);
+        }
+    }
+    if (!subs.nlines)
+        return;
+
+    y = win_h - win_h / 12;
+    for (int i = subs.nlines - 1; i >= 0; i--) {
+        SDL_Texture *t = subs.line_tex[i];
+        SDL_Rect dst;
+
+        y -= subs.line_h[i];
+        dst.x = (win_w - subs.line_w[i]) / 2;
+        dst.y = y;
+        dst.w = subs.line_w[i];
+        dst.h = subs.line_h[i];
+        /* outline: the same texture tinted black around, then white on top */
+        SDL_SetTextureColorMod(t, 0, 0, 0);
+        for (int dy = -2; dy <= 2; dy += 2)
+            for (int dx = -2; dx <= 2; dx += 2) {
+                SDL_Rect od = { dst.x + dx, dst.y + dy, dst.w, dst.h };
+
+                if (dx || dy)
+                    SDL_RenderCopy(renderer, t, NULL, &od);
+            }
+        SDL_SetTextureColorMod(t, 245, 245, 245);
+        SDL_RenderCopy(renderer, t, NULL, &dst);
+        y -= 4;
+    }
+}
+
 void ui_init(SDL_Renderer *renderer)
 {
     ui.renderer = renderer;
     ui.last_activity = av_gettime_relative();
+    subs.lock = SDL_CreateMutex();
     /* Deliver the click that focuses the window too, so grabbing an
      * unfocused player and dragging it works in one motion. */
     SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
@@ -253,6 +431,7 @@ void ui_set_window(SDL_Window *win, const char *title)
         ui.badge_str[i][0] = 0;
     ui.badges_dirty = 1;
     ui.nb_chapters  = 0;
+    ui_sub_clear();
     SDL_SetWindowHitTest(win, hit_test, NULL);
 }
 
@@ -335,6 +514,13 @@ void ui_uninit(void)
             SDL_DestroyTexture(ui.badge_tex[i]);
             ui.badge_tex[i] = NULL;
         }
+    ui_sub_clear();
+    if (subs.lock) {
+        SDL_DestroyMutex(subs.lock);
+        subs.lock = NULL;
+    }
+    av_freep(&subs.ev);
+    subs.cap = 0;
     if (ui.window)
         SDL_SetWindowHitTest(ui.window, NULL, NULL);
     ui.window   = NULL;

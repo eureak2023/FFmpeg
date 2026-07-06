@@ -1497,6 +1497,7 @@ static void ui_draw_overlay(VideoState *is)
 
     if (isnan(pos))
         pos = 0.0;
+    ui_sub_draw(renderer, is->width, is->height, pos);
     ui_draw(renderer, is->width, is->height, pos, dur, is->paused,
             is->audio_volume / (double)SDL_MIX_MAXVOLUME);
 }
@@ -2537,6 +2538,122 @@ static int video_thread(void *arg)
     return 0;
 }
 
+/* Lenient UTF-8 validity check (truncated tail sequences are fine). */
+static int buf_is_utf8(const uint8_t *b, int n)
+{
+    int i = 0;
+
+    while (i < n) {
+        int len;
+
+        if (b[i] < 0x80) {
+            i++;
+            continue;
+        }
+        len = (b[i] & 0xE0) == 0xC0 ? 2 : (b[i] & 0xF0) == 0xE0 ? 3 :
+              (b[i] & 0xF8) == 0xF0 ? 4 : 0;
+        if (!len)
+            return 0;
+        if (i + len > n)
+            break;
+        for (int j = 1; j < len; j++)
+            if ((b[i + j] & 0xC0) != 0x80)
+                return 0;
+        i += len;
+    }
+    return 1;
+}
+
+/* Look for an external subtitle file next to the media (same basename,
+ * .srt/.smi/.ass/.ssa), decode all cues up front and hand them to the UI
+ * renderer. Korean subtitle files are frequently CP949 - fall back to it
+ * when the file is not valid UTF-8. */
+static void load_external_subs(const char *media)
+{
+    static const char *const exts[] = { ".srt", ".smi", ".ass", ".ssa" };
+    AVFormatContext *sic = NULL;
+    AVCodecContext *dec_ctx = NULL;
+    const AVCodec *dec;
+    AVDictionary *opts = NULL;
+    AVPacket *pkt = NULL;
+    char path[2048];
+    const char *dot = strrchr(media, '.');
+    int si, count = 0;
+
+    if (!dot || strchr(dot, '/') || strchr(dot, '\\'))
+        return;
+    for (int e = 0; e < (int)FF_ARRAY_ELEMS(exts); e++) {
+        snprintf(path, sizeof(path), "%.*s%s", (int)(dot - media), media, exts[e]);
+        if (avformat_open_input(&sic, path, NULL, NULL) == 0)
+            break;
+        sic = NULL;
+    }
+    if (!sic)
+        return;
+    if (avformat_find_stream_info(sic, NULL) < 0)
+        goto done;
+    si = av_find_best_stream(sic, AVMEDIA_TYPE_SUBTITLE, -1, -1, NULL, 0);
+    if (si < 0)
+        goto done;
+    dec = avcodec_find_decoder(sic->streams[si]->codecpar->codec_id);
+    if (!dec)
+        goto done;
+    dec_ctx = avcodec_alloc_context3(dec);
+    if (!dec_ctx ||
+        avcodec_parameters_to_context(dec_ctx, sic->streams[si]->codecpar) < 0)
+        goto done;
+    {
+        SDL_RWops *rw = SDL_RWFromFile(path, "rb");
+
+        if (rw) {
+            uint8_t probe[8192];
+            size_t got = SDL_RWread(rw, probe, 1, sizeof(probe));
+
+            SDL_RWclose(rw);
+            if (got > 0 && !buf_is_utf8(probe, (int)got))
+                av_dict_set(&opts, "sub_charenc", "CP949", 0);
+        }
+    }
+    if (avcodec_open2(dec_ctx, dec, &opts) < 0)
+        goto done;
+    pkt = av_packet_alloc();
+    if (!pkt)
+        goto done;
+    while (av_read_frame(sic, pkt) >= 0) {
+        if (pkt->stream_index == si) {
+            AVSubtitle sub;
+            int got = 0;
+
+            if (avcodec_decode_subtitle2(dec_ctx, &sub, &got, pkt) >= 0 && got) {
+                double base = sub.pts != AV_NOPTS_VALUE ?
+                              sub.pts / (double)AV_TIME_BASE :
+                              pkt->pts != AV_NOPTS_VALUE ?
+                              pkt->pts * av_q2d(sic->streams[si]->time_base) : 0.0;
+                double start = base + sub.start_display_time / 1000.0;
+                double end   = sub.end_display_time ?
+                               base + sub.end_display_time / 1000.0 : start + 5.0;
+
+                for (unsigned i = 0; i < sub.num_rects; i++) {
+                    if (sub.rects[i]->ass)
+                        ui_sub_add_ass(start, end, sub.rects[i]->ass);
+                    else if (sub.rects[i]->text)
+                        ui_sub_add(start, end, sub.rects[i]->text);
+                    count++;
+                }
+                avsubtitle_free(&sub);
+            }
+        }
+        av_packet_unref(pkt);
+    }
+    av_log(NULL, AV_LOG_INFO, "Loaded external subtitles: %s (%d cues)\n",
+           path, count);
+done:
+    av_packet_free(&pkt);
+    avcodec_free_context(&dec_ctx);
+    av_dict_free(&opts);
+    avformat_close_input(&sic);
+}
+
 static int subtitle_thread(void *arg)
 {
     VideoState *is = arg;
@@ -2565,6 +2682,20 @@ static int subtitle_thread(void *arg)
             /* now we can update the picture count */
             frame_queue_push(&is->subpq);
         } else if (got_subtitle) {
+            if (sp->sub.format != 0) { /* text subtitles (SRT/SMI/ASS/...) */
+                double start = sp->sub.pts != AV_NOPTS_VALUE ?
+                               sp->sub.pts / (double)AV_TIME_BASE : 0.0;
+                double end = start + (sp->sub.end_display_time ?
+                                      sp->sub.end_display_time / 1000.0 : 5.0);
+
+                start += sp->sub.start_display_time / 1000.0;
+                for (unsigned i = 0; i < sp->sub.num_rects; i++) {
+                    if (sp->sub.rects[i]->ass)
+                        ui_sub_add_ass(start, end, sp->sub.rects[i]->ass);
+                    else if (sp->sub.rects[i]->text)
+                        ui_sub_add(start, end, sp->sub.rects[i]->text);
+                }
+            }
             avsubtitle_free(&sp->sub);
         }
     }
@@ -3308,6 +3439,8 @@ static int read_thread(void *arg)
         }
         ui_set_chapters(fracs, n);
     }
+
+    load_external_subs(is->filename);
 
     if (!window_title && (t = av_dict_get(ic->metadata, "title", NULL, 0)))
         window_title = av_asprintf("%s - %s", t->value, input_filename);

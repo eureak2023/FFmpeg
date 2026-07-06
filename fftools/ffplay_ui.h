@@ -82,6 +82,14 @@ void ui_ping(void);
  * UTF-8 path, or NULL if cancelled/unavailable. */
 char *ui_open_file_dialog(void);
 
+/* Text subtitles (SRT/SMI/ASS), rendered bottom-center with the system
+ * font. Events may be added from decode threads; drawing and clearing
+ * happen on the render thread. Times in seconds. */
+void ui_sub_add(double start, double end, const char *text);
+void ui_sub_add_ass(double start, double end, const char *ass);
+void ui_sub_clear(void);
+void ui_sub_draw(SDL_Renderer *renderer, int win_w, int win_h, double now);
+
 /* Returns 1 once whenever visibility or hover changed since the last draw,
  * so a paused player knows to redraw. Poll from the refresh loop. */
 int  ui_wants_refresh(void);
