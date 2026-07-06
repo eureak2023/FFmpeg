@@ -4853,9 +4853,13 @@ int main(int argc, char **argv)
 
                 if (!SDL_GetCurrentDisplayMode(SDL_GetWindowDisplayIndex(window), &mode) &&
                     mode.refresh_rate > 0) {
-                    fg_refresh = 1.0 / mode.refresh_rate;
-                    av_log(NULL, AV_LOG_INFO, "FG: display refresh %d Hz\n",
-                           mode.refresh_rate);
+                    /* generated output is capped at 60 fps even on
+                     * high-refresh displays */
+                    int rate = FFMIN(mode.refresh_rate, 60);
+
+                    fg_refresh = 1.0 / rate;
+                    av_log(NULL, AV_LOG_INFO, "FG: display refresh %d Hz, pacing %d fps\n",
+                           mode.refresh_rate, rate);
                 }
             }
         }
