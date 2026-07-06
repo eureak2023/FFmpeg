@@ -32,6 +32,7 @@
 #include <SDL_opengl.h>
 
 #include "libavutil/log.h"
+#include "libavutil/macros.h"
 #include "libavutil/time.h"
 
 #if CONFIG_D3D11VA
@@ -102,6 +103,111 @@ void fsr_precise_sleep(int64_t usec)
     }
 #endif
     av_usleep(usec);
+}
+
+/* When launched by double-click (Explorer file association) the process
+ * owns a console no one else uses - drop it so no empty terminal window
+ * sits behind the video. Launches from a shell keep their console. */
+void fsr_detach_console(void)
+{
+#ifdef _WIN32
+    DWORD pids[2];
+
+    if (GetConsoleProcessList(pids, 2) == 1)
+        FreeConsole();
+#endif
+}
+
+/* Register (install=1) or remove (install=0) current-user .mp4/.mkv file
+ * associations pointing at this executable. HKCU only - no admin rights
+ * needed. On Windows 10+ an existing user default still wins until the
+ * user picks ffplay via "Open with"; this makes it appear there and
+ * become the default where none is set. Returns 0 on success. */
+int fsr_register_associations(int install)
+{
+#ifdef _WIN32
+    typedef LONG (WINAPI *create_fn)(HKEY, LPCSTR, DWORD, LPSTR, DWORD,
+                                     REGSAM, const SECURITY_ATTRIBUTES *,
+                                     PHKEY, LPDWORD);
+    typedef LONG (WINAPI *setval_fn)(HKEY, LPCSTR, DWORD, DWORD,
+                                     const BYTE *, DWORD);
+    typedef LONG (WINAPI *close_fn)(HKEY);
+    typedef LONG (WINAPI *deltree_fn)(HKEY, LPCSTR);
+    typedef LONG (WINAPI *delkeyval_fn)(HKEY, LPCSTR, LPCSTR);
+    typedef void (WINAPI *shnotify_fn)(LONG, UINT, const void *, const void *);
+    static const char *const exts[] = { ".mp4", ".mkv" };
+    static const char progid[] = "ffplay.media";
+    HMODULE adv = LoadLibraryA("advapi32.dll");
+    HMODULE sh  = LoadLibraryA("shell32.dll");
+    create_fn    reg_create;
+    setval_fn    reg_setval;
+    close_fn     reg_close;
+    deltree_fn   reg_deltree;
+    delkeyval_fn reg_delkeyval;
+    shnotify_fn  sh_notify = NULL;
+    char exe[MAX_PATH], buf[MAX_PATH + 16], path[160];
+    int err = 0;
+
+    if (!adv)
+        return -1;
+    reg_create    = (create_fn)   GetProcAddress(adv, "RegCreateKeyExA");
+    reg_setval    = (setval_fn)   GetProcAddress(adv, "RegSetValueExA");
+    reg_close     = (close_fn)    GetProcAddress(adv, "RegCloseKey");
+    reg_deltree   = (deltree_fn)  GetProcAddress(adv, "RegDeleteTreeA");
+    reg_delkeyval = (delkeyval_fn)GetProcAddress(adv, "RegDeleteKeyValueA");
+    if (sh)
+        sh_notify = (shnotify_fn)GetProcAddress(sh, "SHChangeNotify");
+    if (!reg_create || !reg_setval || !reg_close || !reg_deltree ||
+        !reg_delkeyval)
+        return -1;
+    if (!GetModuleFileNameA(NULL, exe, sizeof(exe)))
+        return -1;
+
+#define SET_KEY(keypath, valname, value) do {                                \
+        HKEY k;                                                              \
+        if (reg_create(HKEY_CURRENT_USER, keypath, 0, NULL, 0, KEY_WRITE,    \
+                       NULL, &k, NULL) == 0) {                               \
+            if (reg_setval(k, valname, 0, 1 /* REG_SZ */,                    \
+                           (const BYTE *)(value),                            \
+                           (DWORD)strlen(value) + 1) != 0)                   \
+                err = -1;                                                    \
+            reg_close(k);                                                    \
+        } else                                                               \
+            err = -1;                                                        \
+    } while (0)
+
+    if (install) {
+        SET_KEY("Software\\Classes\\ffplay.media", NULL, "Media file (ffplay)");
+        snprintf(buf, sizeof(buf), "\"%s\",0", exe);
+        SET_KEY("Software\\Classes\\ffplay.media\\DefaultIcon", NULL, buf);
+        snprintf(buf, sizeof(buf), "\"%s\" \"%%1\"", exe);
+        SET_KEY("Software\\Classes\\ffplay.media\\shell\\open\\command", NULL, buf);
+        for (int i = 0; i < (int)FF_ARRAY_ELEMS(exts); i++) {
+            snprintf(path, sizeof(path), "Software\\Classes\\%s\\OpenWithProgids",
+                     exts[i]);
+            SET_KEY(path, progid, "");
+            /* Becomes the default when the user has not chosen another
+             * player; otherwise it shows up under "Open with". */
+            snprintf(path, sizeof(path), "Software\\Classes\\%s", exts[i]);
+            SET_KEY(path, NULL, progid);
+        }
+    } else {
+        reg_deltree(HKEY_CURRENT_USER, "Software\\Classes\\ffplay.media");
+        for (int i = 0; i < (int)FF_ARRAY_ELEMS(exts); i++) {
+            snprintf(path, sizeof(path), "Software\\Classes\\%s\\OpenWithProgids",
+                     exts[i]);
+            reg_delkeyval(HKEY_CURRENT_USER, path, progid);
+        }
+    }
+#undef SET_KEY
+
+    if (sh_notify)
+        sh_notify(0x08000000L /* SHCNE_ASSOCCHANGED */, 0 /* SHCNF_IDLIST */,
+                  NULL, NULL);
+    return err;
+#else
+    return -1;
+#endif
 }
 
 /* All GL entry points are resolved through SDL_GL_GetProcAddress so no

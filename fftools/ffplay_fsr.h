@@ -43,6 +43,14 @@ void fsr_timer_init(void);
  * Windows, av_usleep elsewhere). Main-thread only. */
 void fsr_precise_sleep(int64_t usec);
 
+/* Drop the process console when it is ours alone (double-click launch),
+ * so no empty terminal window shows behind the video. */
+void fsr_detach_console(void);
+
+/* Register (1) or remove (0) current-user .mp4/.mkv file associations
+ * pointing at this executable. Windows only; returns 0 on success. */
+int  fsr_register_associations(int install);
+
 /* Draw vid_texture upscaled into rect through EASU+RCAS.
  * Returns 1 if the frame was drawn, 0 if the caller must draw the stock
  * way (FSR unavailable, or no upscaling needed for this rect). */

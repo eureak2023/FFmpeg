@@ -361,6 +361,8 @@ static float fsr_sharpness = 0.0f; /* RCAS attenuation stops, 0 = maximum sharpn
 static int fsr_denoise = 0;
 static int fsr_fg = 1;             /* 2x frame generation (hardware optical flow) */
 static int show_fps = 0;           /* FPS overlay, toggled with TAB */
+static int install_assoc = 0;      /* register .mp4/.mkv associations and exit */
+static int uninstall_assoc = 0;
 static double fg_refresh = 1.0 / 60.0; /* display refresh period for frame generation */
 
 /* current context */
@@ -4167,6 +4169,8 @@ static const OptionDef options[] = {
     { "fsr_sharpness",      OPT_TYPE_FLOAT, OPT_EXPERT, { &fsr_sharpness }, "FSR RCAS sharpness attenuation in stops (0=sharpest, adjust at runtime with +/-)", "stops" },
     { "fsr_denoise",        OPT_TYPE_BOOL,  OPT_EXPERT, { &fsr_denoise }, "reduce FSR sharpening of noise and film grain; toggle at runtime with 'd'" },
     { "fsr_fg",             OPT_TYPE_BOOL,  OPT_EXPERT, { &fsr_fg }, "2x frame generation via NVIDIA hardware optical flow, on by default (-nofsr_fg disables); toggle at runtime with 'g'" },
+    { "install",            OPT_TYPE_BOOL,  OPT_EXPERT, { &install_assoc }, "register .mp4/.mkv file associations for the current user and exit" },
+    { "uninstall",          OPT_TYPE_BOOL,  OPT_EXPERT, { &uninstall_assoc }, "remove the .mp4/.mkv file associations and exit" },
     { NULL, },
 };
 
@@ -4220,6 +4224,7 @@ int main(int argc, char **argv)
     int flags, ret;
     VideoState *is;
 
+    fsr_detach_console();
     init_dynload();
 
     av_log_set_flags(AV_LOG_SKIP_REPEATED);
@@ -4239,6 +4244,18 @@ int main(int argc, char **argv)
     ret = parse_options(NULL, argc, argv, options, opt_input_file);
     if (ret < 0)
         exit(ret == AVERROR_EXIT ? 0 : 1);
+
+    if (install_assoc || uninstall_assoc) {
+        if (fsr_register_associations(install_assoc) == 0) {
+            av_log(NULL, AV_LOG_INFO, install_assoc ?
+                   "ffplay registered for .mp4/.mkv files (current user); "
+                   "pick it via \"Open with\" if another player is the default\n" :
+                   "ffplay file associations removed\n");
+            exit(0);
+        }
+        av_log(NULL, AV_LOG_ERROR, "updating file associations failed\n");
+        exit(1);
+    }
 
     if (!input_filename) {
         show_usage();
