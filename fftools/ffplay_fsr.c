@@ -113,18 +113,28 @@ void fsr_detach_console(void)
 {
 #ifdef _WIN32
     DWORD pids[2];
+    HANDLE err;
+    int need_log = 0;
 
     if (GetConsoleProcessList(pids, 2) == 1) {
+        FreeConsole();
+        need_log = 1;
+    }
+    /* Also catch launches that never had a console/stderr to begin with. */
+    err = GetStdHandle(STD_ERROR_HANDLE);
+    if (!err || err == INVALID_HANDLE_VALUE)
+        need_log = 1;
+    if (need_log) {
         char logpath[MAX_PATH + 16];
         DWORD n;
 
-        FreeConsole();
-        /* No console to report to: keep a log next to %TEMP% instead so
-         * double-click launches are still diagnosable. */
+        /* No console to report to: keep an unbuffered log in %TEMP% so
+         * double-click launches stay diagnosable. */
         n = GetTempPathA(sizeof(logpath) - 12, logpath);
         if (n > 0) {
             snprintf(logpath + n, sizeof(logpath) - n, "ffplay.log");
-            freopen(logpath, "w", stderr);
+            if (freopen(logpath, "w", stderr))
+                setvbuf(stderr, NULL, _IONBF, 0);
         }
     }
 #endif
