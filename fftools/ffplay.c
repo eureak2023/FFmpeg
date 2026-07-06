@@ -4385,10 +4385,14 @@ int main(int argc, char **argv)
 #else
             av_log(NULL, AV_LOG_WARNING, "Your SDL version doesn't support SDL_WINDOW_ALWAYS_ON_TOP. Feature will be inactive.\n");
 #endif
+        /* resizable even when borderless: maximize and the edge resize
+         * hit-test need WS_THICKFRAME/WS_MAXIMIZEBOX on Windows, which SDL
+         * only applies to borderless windows with these hints set */
+        SDL_SetHint("SDL_BORDERLESS_WINDOWED_STYLE", "1");
+        SDL_SetHint("SDL_BORDERLESS_RESIZABLE_STYLE", "1");
+        flags |= SDL_WINDOW_RESIZABLE;
         if (borderless)
             flags |= SDL_WINDOW_BORDERLESS;
-        else
-            flags |= SDL_WINDOW_RESIZABLE;
 
 #ifdef SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR
         SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0");
