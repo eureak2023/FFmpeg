@@ -1849,6 +1849,7 @@ retry:
                  * refresh rate with interpolated frames at refresh-aligned
                  * offsets (30fps -> 1 per interval, 24fps -> 2, ...). */
                 if (fsr_fg && !is->paused &&
+                    (hud_src_fps <= 0 || hud_src_fps < 50.0) &&
                     is->show_mode == SHOW_MODE_VIDEO && is->pictq.rindex_shown &&
                     frame_queue_nb_remaining(&is->pictq) > 0 &&
                     delay > fg_refresh * 1.5) {
@@ -3287,6 +3288,10 @@ static int stream_component_open(VideoState *is, int stream_index)
             hud_src_w   = avctx->width;
             hud_src_h   = avctx->height;
             hud_src_fps = fr.num && fr.den ? av_q2d(fr) : 0.0;
+            if (fsr_fg && hud_src_fps >= 50.0)
+                av_log(NULL, AV_LOG_INFO,
+                       "FG: %.0f fps source, frame generation not needed\n",
+                       hud_src_fps);
         }
         break;
     case AVMEDIA_TYPE_SUBTITLE:

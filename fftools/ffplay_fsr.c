@@ -73,6 +73,26 @@ void fsr_timer_init(void)
         if (tbp)
             tbp(1);
     }
+    /* Windows 11 ignores the raised timer resolution for unfocused GUI
+     * processes (power throttling), which wrecks frame pacing whenever the
+     * player is not the foreground window. Opt out explicitly. */
+    {
+        typedef BOOL (WINAPI *spi_fn)(HANDLE, PROCESS_INFORMATION_CLASS,
+                                      LPVOID, DWORD);
+        HMODULE k32 = GetModuleHandleA("kernel32.dll");
+        spi_fn spi = k32 ? (spi_fn)GetProcAddress(k32, "SetProcessInformation")
+                         : NULL;
+
+        if (spi) {
+            PROCESS_POWER_THROTTLING_STATE st = { 0 };
+
+            st.Version     = PROCESS_POWER_THROTTLING_CURRENT_VERSION;
+            st.ControlMask = PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION |
+                             PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+            st.StateMask   = 0; /* keep classic behavior: never throttle */
+            spi(GetCurrentProcess(), ProcessPowerThrottling, &st, sizeof(st));
+        }
+    }
 #endif
 }
 
