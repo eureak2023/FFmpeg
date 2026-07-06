@@ -35,6 +35,14 @@
  * a negative value if FSR is unavailable (non-GL renderer, old GL, ...). */
 int  fsr_init(SDL_Renderer *renderer);
 
+/* Raise the OS timer resolution so short sleeps in the refresh loop are
+ * accurate (Windows: timeBeginPeriod(1)); call once at startup. */
+void fsr_timer_init(void);
+
+/* Sleep with sub-millisecond accuracy (high-resolution waitable timer on
+ * Windows, av_usleep elsewhere). Main-thread only. */
+void fsr_precise_sleep(int64_t usec);
+
 /* Draw vid_texture upscaled into rect through EASU+RCAS.
  * Returns 1 if the frame was drawn, 0 if the caller must draw the stock
  * way (FSR unavailable, or no upscaling needed for this rect). */
@@ -69,6 +77,9 @@ int  fsr_d3d11_adapter_index(void);
  * Returns 1 if the frame was drawn (present it), 0 otherwise. */
 int  fsr_fg_draw(SDL_Renderer *renderer, struct AVFrame *prev, struct AVFrame *next,
                  const SDL_Rect *rect, int fsr_on, float sharpness, float phase);
+/* Precompute the optical flow for a frame pair (cached, cheap to repeat);
+ * call while waiting for a presentation slot so fsr_fg_draw is fast. */
+int  fsr_fg_prepare(SDL_Renderer *renderer, struct AVFrame *prev, struct AVFrame *next);
 int  fsr_fg_available(void);
 /* Load driver libraries and create the CUDA context; call at startup,
  * before decoding begins (device probing races with active decode). */

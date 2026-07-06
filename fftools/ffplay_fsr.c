@@ -44,9 +44,65 @@
 #include "libavutil/pixfmt.h"
 #endif
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #include "libavutil/avstring.h"
 
 #include "ffplay_fsr.h"
+
+/* Ask Windows for 1 ms timer resolution: av_usleep() otherwise rounds up to
+ * the default 15.6 ms tick, which ruins frame-generation slot pacing (and
+ * silently "fixes itself" whenever some other process holds the resolution).
+ * No-op elsewhere. */
+void fsr_timer_init(void)
+{
+#ifdef _WIN32
+    HMODULE winmm = LoadLibraryA("winmm.dll");
+
+    if (winmm) {
+        typedef UINT (WINAPI *tbp_fn)(UINT);
+        tbp_fn tbp = (tbp_fn)GetProcAddress(winmm, "timeBeginPeriod");
+
+        if (tbp)
+            tbp(1);
+    }
+#endif
+}
+
+/* Sleep with sub-millisecond accuracy. Windows 11 may ignore the raised
+ * timer resolution for unfocused processes, so use a high-resolution
+ * waitable timer (Win10 1803+) that is exempt from tick rounding; falls
+ * back to av_usleep(). Main-thread only. */
+#if defined(_WIN32) && !defined(CREATE_WAITABLE_TIMER_HIGH_RESOLUTION)
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+
+void fsr_precise_sleep(int64_t usec)
+{
+#ifdef _WIN32
+    static HANDLE timer;
+    static int timer_failed;
+    LARGE_INTEGER due;
+
+    if (usec <= 0)
+        return;
+    if (!timer && !timer_failed) {
+        timer = CreateWaitableTimerExW(NULL, NULL,
+                                       CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                       TIMER_ALL_ACCESS);
+        if (!timer)
+            timer_failed = 1;
+    }
+    due.QuadPart = -(usec * 10); /* relative, 100 ns units */
+    if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE)) {
+        WaitForSingleObject(timer, INFINITE);
+        return;
+    }
+#endif
+    av_usleep(usec);
+}
 
 /* All GL entry points are resolved through SDL_GL_GetProcAddress so no
  * OpenGL import library is needed. */
@@ -1194,6 +1250,7 @@ static const char *fg_src =
     "uniform isampler2D flowFwd;\n" /* prev->cur, S10.5 px, grid 4 */
     "uniform isampler2D flowBwd;\n" /* cur->prev */
     "uniform float phase;\n"        /* interpolation position, 0=prev 1=cur */
+    "uniform vec2 outSize;\n"       /* render size; may differ from native */
     "out vec4 fragColor;\n"
     /* Bilinearly sample the 4x4-grid flow field (integer texture, so the
      * filtering is done by hand); smooths out block-shaped artifacts. */
@@ -1211,8 +1268,8 @@ static const char *fg_src =
     "}\n"
     "void main() {\n"
     "    vec2 ts = vec2(textureSize(curTex, 0));\n"
-    "    vec2 uv = gl_FragCoord.xy / ts;\n"
-    "    vec2 pg = gl_FragCoord.xy / 4.0;\n"
+    "    vec2 uv = gl_FragCoord.xy / outSize;\n"
+    "    vec2 pg = uv * ts / 4.0;\n"
     "    vec2 F = sampleFlow(flowFwd, pg);\n"
     "    vec2 B = sampleFlow(flowBwd, pg);\n"
     "    vec3 cPrev = texture(prevTex, uv - phase * F / ts).rgb;\n"
@@ -1248,6 +1305,7 @@ static struct {
     GLuint flow_tex[2];
     GLuint prog;
     GLint phase_loc;
+    GLint outsize_loc;
     const void *in_frame[2];              /* what each OF input buffer holds */
     int64_t in_pts[2];
     const void *pair_a, *pair_b;          /* frames the current flow refers to */
@@ -1446,7 +1504,10 @@ static int fg_init_body(void)
     ip.height      = fg.h;
     ip.outGridSize = NV_OF_OUTPUT_VECTOR_GRID_SIZE_4;
     ip.mode        = NV_OF_MODE_OPTICALFLOW;
-    ip.perfLevel   = NV_OF_PERF_LEVEL_SLOW;
+    /* Best flow quality up to 1080p; above that the SLOW preset costs too
+     * much of the frame budget to sustain 60 presented fps. */
+    ip.perfLevel   = fg.w * fg.h > 1920 * 1080 ? NV_OF_PERF_LEVEL_MEDIUM
+                                               : NV_OF_PERF_LEVEL_SLOW;
     if (fg.of.nvOFInit(fg.hof, &ip) != NV_OF_SUCCESS) {
         last_err_sz = sizeof(last_err);
         last_err[0] = 0;
@@ -1541,7 +1602,8 @@ static int fg_init_body(void)
                 gl.Uniform1i(loc, i);
         }
         gl.UseProgram(prev_prog);
-        fg.phase_loc = gl.GetUniformLocation(fg.prog, "phase");
+        fg.phase_loc   = gl.GetUniformLocation(fg.prog, "phase");
+        fg.outsize_loc = gl.GetUniformLocation(fg.prog, "outSize");
     }
     return 0;
 }
@@ -1613,23 +1675,24 @@ static int fg_compute_flow(int sp, int sn)
 }
 
 /* Warp pass: prev+cur+flow -> fg_tex (native size, SDL target texture). */
-static int fg_warp(SDL_Renderer *renderer, int sp, int sn, float phase)
+static int fg_warp(SDL_Renderer *renderer, int sp, int sn, float phase,
+                   int ow, int oh)
 {
     GLint prev_prog = 0, prev_active = 0, prev_tex[4] = { 0 };
     GLboolean blend, scissor;
     HANDLE objs[2] = { hwgl.gl_object[sp], hwgl.gl_object[sn] };
     GLuint texs[4] = { hwgl.gl_tex[sp], hwgl.gl_tex[sn], fg.flow_tex[0], fg.flow_tex[1] };
 
-    if (fg.fg_w != fg.w || fg.fg_h != fg.h || !fg.fg_tex) {
+    if (fg.fg_w != ow || fg.fg_h != oh || !fg.fg_tex) {
         if (fg.fg_tex)
             SDL_DestroyTexture(fg.fg_tex);
         fg.fg_tex = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
-                                      SDL_TEXTUREACCESS_TARGET, fg.w, fg.h);
+                                      SDL_TEXTUREACCESS_TARGET, ow, oh);
         if (!fg.fg_tex)
             return -1;
         SDL_SetTextureBlendMode(fg.fg_tex, SDL_BLENDMODE_NONE);
-        fg.fg_w = fg.w;
-        fg.fg_h = fg.h;
+        fg.fg_w = ow;
+        fg.fg_h = oh;
     }
 
     if (SDL_SetRenderTarget(renderer, fg.fg_tex) < 0)
@@ -1653,9 +1716,10 @@ static int fg_warp(SDL_Renderer *renderer, int sp, int sn, float phase)
     }
     gl.Disable(GL_BLEND);
     gl.Disable(GL_SCISSOR_TEST);
-    gl.Viewport(0, 0, fg.w, fg.h);
+    gl.Viewport(0, 0, ow, oh);
     gl.UseProgram(fg.prog);
     gl.Uniform1f(fg.phase_loc, phase);
+    gl.Uniform2f(fg.outsize_loc, (GLfloat)ow, (GLfloat)oh);
     gl.DrawArrays(GL_TRIANGLES, 0, 3);
     gl.UseProgram(prev_prog);
     for (int i = 3; i >= 0; i--) {
@@ -1678,22 +1742,24 @@ int fsr_fg_available(void)
     return fg.state == 1;
 }
 
-int fsr_fg_draw(SDL_Renderer *renderer, AVFrame *prev, AVFrame *next,
-                const SDL_Rect *rect, int fsr_on, float sharpness, float phase)
+/* Everything a generated frame needs except the warp and draw: OF input
+ * conversion and the (cached) flow computation for the pair. Cheap when the
+ * pair is already prepared, so callers may invoke it while waiting for a
+ * presentation slot. Returns the frame slots in *out_sp / *out_sn. */
+static int fg_prepare_pair(SDL_Renderer *renderer, AVFrame *prev, AVFrame *next,
+                           int *out_sp, int *out_sn)
 {
-    int sp, sn, engaged;
-
-    phase = phase < 0.05f ? 0.05f : phase > 0.95f ? 0.95f : phase;
+    int sp, sn;
 
     if (fg.state < 0 || hwgl.state != 1 || fsr_state != 1)
-        return 0;
+        return -1;
     if (prev->width != next->width || prev->height != next->height)
-        return 0;
+        return -1;
 
     SDL_RenderFlush(renderer);
 
     if (hwgl_ensure_size(prev->width, prev->height) < 0)
-        return 0;
+        return -1;
 
     if (fg.state == 0 || fg.w != hwgl.w || fg.h != hwgl.h) {
         fg_destroy();
@@ -1701,7 +1767,7 @@ int fsr_fg_draw(SDL_Renderer *renderer, AVFrame *prev, AVFrame *next,
             fg_destroy();
             fg.state = -1;
             av_log(NULL, AV_LOG_WARNING, "FG: frame generation unavailable\n");
-            return 0;
+            return -1;
         }
         fg.state = 1;
         av_log(NULL, AV_LOG_INFO,
@@ -1712,30 +1778,30 @@ int fsr_fg_draw(SDL_Renderer *renderer, AVFrame *prev, AVFrame *next,
     sp = hwgl_frame_to_slot(prev, 0);
     if (sp < 0) {
         av_log(NULL, AV_LOG_VERBOSE, "FG: prev slot failed\n");
-        return 0;
+        return -1;
     }
     /* Refill the OF input if this frame was converted before FG was on. */
     if (fg.in_frame[sp] != prev || fg.in_pts[sp] != prev->pts)
         if (hwgl_convert(prev, sp) < 0) {
             av_log(NULL, AV_LOG_VERBOSE, "FG: prev refill failed\n");
-            return 0;
+            return -1;
         }
     sn = hwgl_frame_to_slot(next, 0);
     if (sn < 0 || sn == sp) {
         av_log(NULL, AV_LOG_VERBOSE, "FG: next slot failed (%d/%d)\n", sn, sp);
-        return 0;
+        return -1;
     }
     if (fg.in_frame[sn] != next || fg.in_pts[sn] != next->pts)
         if (hwgl_convert(next, sn) < 0) {
             av_log(NULL, AV_LOG_VERBOSE, "FG: next refill failed\n");
-            return 0;
+            return -1;
         }
 
     if (fg.pair_a != prev || fg.pair_apts != prev->pts ||
         fg.pair_b != next || fg.pair_bpts != next->pts) {
         if (fg_compute_flow(sp, sn) < 0) {
             av_log(NULL, AV_LOG_VERBOSE, "FG: flow computation failed\n");
-            return 0;
+            return -1;
         }
         fg.pair_a    = prev;
         fg.pair_apts = prev->pts;
@@ -1743,17 +1809,39 @@ int fsr_fg_draw(SDL_Renderer *renderer, AVFrame *prev, AVFrame *next,
         fg.pair_bpts = next->pts;
     }
 
-    if (ensure_textures(renderer, fg.w, fg.h, rect->w, rect->h) < 0)
+    *out_sp = sp;
+    *out_sn = sn;
+    return 0;
+}
+
+int fsr_fg_prepare(SDL_Renderer *renderer, AVFrame *prev, AVFrame *next)
+{
+    int sp, sn;
+
+    return fg_prepare_pair(renderer, prev, next, &sp, &sn) == 0;
+}
+
+int fsr_fg_draw(SDL_Renderer *renderer, AVFrame *prev, AVFrame *next,
+                const SDL_Rect *rect, int fsr_on, float sharpness, float phase)
+{
+    int sp, sn, engaged;
+
+    phase = phase < 0.05f ? 0.05f : phase > 0.95f ? 0.95f : phase;
+
+    if (fg_prepare_pair(renderer, prev, next, &sp, &sn) < 0)
         return 0;
-    if (fg_warp(renderer, sp, sn, phase) < 0) {
-        av_log(NULL, AV_LOG_VERBOSE, "FG: warp failed\n");
-        return 0;
-    }
 
     engaged = fsr_on && (rect->w > fg.w || rect->h > fg.h);
     if (engaged) {
+        /* FSR path: warp at native size, then EASU+RCAS up to the target. */
         GLfloat con0[4];
 
+        if (ensure_textures(renderer, fg.w, fg.h, rect->w, rect->h) < 0)
+            return 0;
+        if (fg_warp(renderer, sp, sn, phase, fg.w, fg.h) < 0) {
+            av_log(NULL, AV_LOG_VERBOSE, "FG: warp failed\n");
+            return 0;
+        }
         con0[0] = (GLfloat)fg.w / rect->w;
         con0[1] = (GLfloat)fg.h / rect->h;
         con0[2] = 0.5f * con0[0] - 0.5f;
@@ -1763,15 +1851,21 @@ int fsr_fg_draw(SDL_Renderer *renderer, AVFrame *prev, AVFrame *next,
             run_pass(renderer, rcas_prog, easu_tex, out_tex,
                      rect->w, rect->h, NULL, exp2f(-sharpness)) < 0)
             goto fail;
-    } else {
-        if (run_pass(renderer, copy_prog, fg.fg_tex, out_tex,
-                     rect->w, rect->h, NULL, 0.0f) < 0)
-            goto fail;
+        hwgl.last_frame = NULL; /* out_tex no longer holds the real frame */
+        SDL_SetRenderTarget(renderer, NULL);
+        SDL_RenderCopy(renderer, out_tex, NULL, rect);
+        return 1;
     }
 
-    hwgl.last_frame = NULL; /* out_tex no longer holds the real frame */
+    /* No upscaling: warp straight at the display size (much cheaper than
+     * shading at native size for high-resolution sources) and present the
+     * warp target directly. */
+    if (fg_warp(renderer, sp, sn, phase, rect->w, rect->h) < 0) {
+        av_log(NULL, AV_LOG_VERBOSE, "FG: warp failed\n");
+        return 0;
+    }
     SDL_SetRenderTarget(renderer, NULL);
-    SDL_RenderCopy(renderer, out_tex, NULL, rect);
+    SDL_RenderCopy(renderer, fg.fg_tex, NULL, rect);
     return 1;
 
 fail:
@@ -1798,6 +1892,11 @@ int fsr_hw_draw(SDL_Renderer *renderer, struct AVFrame *frame, const SDL_Rect *r
 }
 
 int fsr_fg_available(void)
+{
+    return 0;
+}
+
+int fsr_fg_prepare(SDL_Renderer *renderer, struct AVFrame *prev, struct AVFrame *next)
 {
     return 0;
 }

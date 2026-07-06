@@ -356,7 +356,7 @@ static int enable_vulkan = 0;
 static char *vulkan_params = NULL;
 static char *video_background = NULL;
 static const char *hwaccel = NULL;
-static int fsr = 1;
+static int fsr = -1; /* -1 = auto: on up to 1080p sources, off above */
 static float fsr_sharpness = 0.0f; /* RCAS attenuation stops, 0 = maximum sharpness */
 static int fsr_denoise = 0;
 static int fsr_fg = 1;             /* 2x frame generation (hardware optical flow) */
@@ -1703,6 +1703,21 @@ static void update_video_pts(VideoState *is, double pts, int serial)
 /* called to display each frame */
 /* Present an interpolated frame halfway between the displayed frame and the
  * next queued one (2x frame generation). Skipped when unavailable. */
+/* Precompute the optical flow for the current frame pair while the refresh
+ * loop is idle, so the flow cost is paid before the first presentation slot
+ * instead of eating into it. */
+static void video_fg_prepare(VideoState *is)
+{
+    Frame *vp = frame_queue_peek_last(&is->pictq);
+    Frame *nextvp = frame_queue_peek(&is->pictq);
+
+    if (!is->width || vp->serial != nextvp->serial ||
+        vp->frame->format != AV_PIX_FMT_D3D11 ||
+        nextvp->frame->format != AV_PIX_FMT_D3D11)
+        return;
+    fsr_fg_prepare(renderer, vp->frame, nextvp->frame);
+}
+
 static void video_fg_display(VideoState *is, double phase)
 {
     Frame *vp = frame_queue_peek_last(&is->pictq);
@@ -1807,8 +1822,14 @@ retry:
                         if (time >= is->fg_next) {
                             video_fg_display(is, (is->fg_next - is->frame_timer) / delay);
                             is->fg_next += fg_refresh;
-                        } else
-                            *remaining_time = FFMIN(is->fg_next - time, *remaining_time);
+                        } else {
+                            /* Pay the flow cost now, while waiting for the
+                             * slot; recheck the clock afterwards. */
+                            video_fg_prepare(is);
+                            time = av_gettime_relative() / 1000000.0;
+                            *remaining_time = FFMIN(FFMAX(is->fg_next - time, 0.0),
+                                                    *remaining_time);
+                        }
                     }
                 }
                 goto display;
@@ -2991,6 +3012,15 @@ static int stream_component_open(VideoState *is, int stream_index)
     av_dict_set(&opts, "flags", "+copy_opaque", AV_DICT_MULTIKEY);
 
     if (avctx->codec_type == AVMEDIA_TYPE_VIDEO) {
+        /* Auto mode: upscaling gains little above 1080p sources and its GPU
+         * cost competes with frame generation, so default it off there. */
+        if (fsr < 0) {
+            fsr = avctx->width <= 1920 && avctx->height <= 1080;
+            if (!fsr)
+                av_log(NULL, AV_LOG_INFO,
+                       "FSR upscaling default-off for %dx%d source (press 'x' to enable)\n",
+                       avctx->width, avctx->height);
+        }
         ret = create_hwaccel(codec, &avctx->hw_device_ctx);
         if (ret < 0)
             goto fail;
@@ -3648,7 +3678,7 @@ static void refresh_loop_wait_event(VideoState *is, SDL_Event *event) {
             cursor_hidden = 1;
         }
         if (remaining_time > 0.0)
-            av_usleep((int64_t)(remaining_time * 1000000.0));
+            fsr_precise_sleep((int64_t)(remaining_time * 1000000.0));
         remaining_time = REFRESH_RATE;
         if (fsr_toast_active())
             is->force_refresh = 1;
@@ -4133,7 +4163,7 @@ static const OptionDef options[] = {
     { "vulkan_params",      OPT_TYPE_STRING, OPT_EXPERT, { &vulkan_params }, "vulkan configuration using a list of key=value pairs separated by ':'" },
     { "video_bg",           OPT_TYPE_STRING, OPT_EXPERT, { &video_background }, "set video background for transparent videos" },
     { "hwaccel",            OPT_TYPE_STRING, OPT_EXPERT, { &hwaccel }, "HW accelerated decoding: d3d11va (default), auto, dxva2, cuda, ..., none disables", "type" },
-    { "fsr",                OPT_TYPE_BOOL,            0, { &fsr }, "upscale video output with FSR1 (EASU+RCAS), on by default; toggle at runtime with 'x'" },
+    { "fsr",                OPT_TYPE_BOOL,            0, { &fsr }, "upscale video output with FSR1 (EASU+RCAS); default: on for sources up to 1080p, off above; toggle at runtime with 'x'" },
     { "fsr_sharpness",      OPT_TYPE_FLOAT, OPT_EXPERT, { &fsr_sharpness }, "FSR RCAS sharpness attenuation in stops (0=sharpest, adjust at runtime with +/-)", "stops" },
     { "fsr_denoise",        OPT_TYPE_BOOL,  OPT_EXPERT, { &fsr_denoise }, "reduce FSR sharpening of noise and film grain; toggle at runtime with 'd'" },
     { "fsr_fg",             OPT_TYPE_BOOL,  OPT_EXPERT, { &fsr_fg }, "2x frame generation via NVIDIA hardware optical flow, on by default (-nofsr_fg disables); toggle at runtime with 'g'" },
@@ -4301,6 +4331,7 @@ int main(int argc, char **argv)
                 av_log(NULL, AV_LOG_FATAL, "Failed to create window or renderer: %s", SDL_GetError());
                 do_exit(NULL);
             }
+            fsr_timer_init();
             if (fsr && fsr_init(renderer) < 0)
                 av_log(NULL, AV_LOG_WARNING,
                        "FSR: OpenGL pipeline unavailable, falling back to standard SDL rendering\n");
