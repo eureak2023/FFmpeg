@@ -39,9 +39,12 @@
 #define COBJMACROS
 #include <d3d11.h>
 #include <d3d11_1.h>
+#include <d3d11_4.h>
+#include <dxgi1_5.h>
 #include <dxgi.h>
 #include "libavutil/frame.h"
 #include "libavutil/hwcontext.h"
+#include "libavutil/mastering_display_metadata.h"
 #include "libavutil/hwcontext_d3d11va.h"
 #include "libavutil/pixfmt.h"
 #endif
@@ -275,6 +278,9 @@ static int          fsr_state;      /* 0 = uninitialized, 1 = ready, -1 = unavai
 static char         gl_renderer_str[256];
 static GLuint       easu_prog, rcas_prog, copy_prog;
 static GLint        easu_con0_loc, rcas_sharp_loc, rcas_dns_loc, copy_invout_loc;
+static GLint        rcas_hdr_loc, rcas_peak_loc, copy_hdr_loc, copy_peak_loc;
+static int          hdr_active;       /* zero-copy stream is PQ BT.2020 */
+static float        hdr_peak = 1000.0f; /* content peak, nits */
 static int          rcas_denoise;
 static SDL_Texture *native_tex, *easu_tex, *out_tex;
 static int          native_w, native_h, out_w, out_h;
@@ -407,12 +413,36 @@ static const char *easu_src =
 
 /* RCAS: robust contrast-adaptive sharpening, port of FsrRcasF().
  * Small epsilons keep the flat-black / flat-white limiters away from 0/0. */
+/* HDR10 (PQ/BT.2020) to SDR BT.709: PQ EOTF, gamut map, white-preserving
+ * extended-Reinhard tone map against the content peak, 2.2 gamma encode.
+ * Appended to the shaders that produce final SDR output. */
+#define HDR_TM_GLSL \
+    "uniform float hdrMode;\n" /* 0 = passthrough, 1 = PQ BT.2020 input */ \
+    "uniform float hdrPeak;\n" /* content peak, nits */ \
+    "vec3 hdr_tonemap(vec3 v) {\n" \
+    "    const float m1 = 0.1593017578125, m2 = 78.84375;\n" \
+    "    const float c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;\n" \
+    "    vec3 p = pow(max(v, vec3(0.0)), vec3(1.0 / m2));\n" \
+    "    vec3 lin = pow(max(p - c1, vec3(0.0)) / (c2 - c3 * p),\n" \
+    "               vec3(1.0 / m1)) * 10000.0;\n" \
+    "    lin = mat3(1.6605, -0.1246, -0.0182,\n" \
+    "               -0.5876, 1.1329, -0.1006,\n" \
+    "               -0.0728, -0.0083, 1.1187) * lin;\n" \
+    "    vec3 n = max(lin, vec3(0.0)) / 230.0;\n" /* SDR reference white */ \
+    "    float L = max(max(n.r, n.g), n.b);\n" \
+    "    float Lp = max(hdrPeak, 400.0) / 230.0;\n" \
+    "    float Lt = L * (1.0 + L / (Lp * Lp)) / (1.0 + L);\n" \
+    "    n *= L > 1e-6 ? Lt / L : 0.0;\n" \
+    "    return pow(clamp(n, 0.0, 1.0), vec3(1.0 / 2.2));\n" \
+    "}\n"
+
 static const char *rcas_src =
     "#version 330\n"
     "uniform sampler2D srcTex;\n"
     "uniform float sharp;\n" /* exp2(-sharpness stops), computed on the CPU */
     "uniform float dns;\n"   /* 1.0 = FSR_RCAS_DENOISE behavior, 0.0 = off */
     "out vec4 fragColor;\n"
+    HDR_TM_GLSL
     "float APrxMedRcp(float a) {\n"
     "    float b = uintBitsToFloat(0x7ef19fffu - floatBitsToUint(a));\n"
     "    return b * (-b * a + 2.0);\n"
@@ -451,6 +481,8 @@ static const char *rcas_src =
     "    lobe *= mix(1.0, nz, dns);\n"
     "    float rcpL = APrxMedRcp(4.0 * lobe + 1.0);\n"
     "    vec3 pix = (lobe * (b + d + f + h) + e) * rcpL;\n"
+    "    if (hdrMode > 0.5)\n"
+    "        pix = hdr_tonemap(pix);\n"
     "    fragColor = vec4(pix, 1.0);\n"
     "}\n";
 
@@ -461,8 +493,12 @@ static const char *copy_src =
     "uniform sampler2D srcTex;\n"
     "uniform vec2 invOut;\n" /* 1 / output size */
     "out vec4 fragColor;\n"
+    HDR_TM_GLSL
     "void main() {\n"
-    "    fragColor = vec4(texture(srcTex, gl_FragCoord.xy * invOut).rgb, 1.0);\n"
+    "    vec3 c = texture(srcTex, gl_FragCoord.xy * invOut).rgb;\n"
+    "    if (hdrMode > 0.5)\n"
+    "        c = hdr_tonemap(c);\n"
+    "    fragColor = vec4(c, 1.0);\n"
     "}\n";
 
 static int load_gl_functions(void)
@@ -607,6 +643,10 @@ int fsr_init(SDL_Renderer *renderer)
     rcas_sharp_loc  = gl.GetUniformLocation(rcas_prog, "sharp");
     rcas_dns_loc    = gl.GetUniformLocation(rcas_prog, "dns");
     copy_invout_loc = gl.GetUniformLocation(copy_prog, "invOut");
+    rcas_hdr_loc    = gl.GetUniformLocation(rcas_prog, "hdrMode");
+    rcas_peak_loc   = gl.GetUniformLocation(rcas_prog, "hdrPeak");
+    copy_hdr_loc    = gl.GetUniformLocation(copy_prog, "hdrMode");
+    copy_peak_loc   = gl.GetUniformLocation(copy_prog, "hdrPeak");
 
     /* Bind the sampler uniforms to texture unit 0 once. */
     gl.GetIntegerv(GL_CURRENT_PROGRAM, &prev_prog);
@@ -733,10 +773,16 @@ static int run_pass2(SDL_Renderer *renderer, GLuint prog, SDL_Texture *src,
     gl.UseProgram(prog);
     if (prog == easu_prog && con0)
         gl.Uniform4f(easu_con0_loc, con0[0], con0[1], con0[2], con0[3]);
-    if (prog == rcas_prog)
+    if (prog == rcas_prog) {
         gl.Uniform1f(rcas_sharp_loc, sharp);
-    if (prog == copy_prog)
+        gl.Uniform1f(rcas_hdr_loc, hdr_active ? 1.0f : 0.0f);
+        gl.Uniform1f(rcas_peak_loc, hdr_peak);
+    }
+    if (prog == copy_prog) {
         gl.Uniform2f(copy_invout_loc, 1.0f / dw, 1.0f / dh);
+        gl.Uniform1f(copy_hdr_loc, hdr_active ? 1.0f : 0.0f);
+        gl.Uniform1f(copy_peak_loc, hdr_peak);
+    }
     gl.DrawArrays(GL_TRIANGLES, 0, 3);
     gl.UseProgram(prev_prog);
 
@@ -801,7 +847,9 @@ static struct {
     ID3D11VideoDevice *vdevice;
     ID3D11VideoContext *vcontext;
     ID3D11VideoContext1 *vcontext1; /* for DXGI color spaces (HDR input) */
+    ID3D11VideoContext2 *vcontext2; /* for HDR10 metadata (tone-map hints) */
     int cs_dxgi;                    /* DXGI input color space currently set */
+    int hdr_md_state;               /* 0 unset, 1 defaults, 2 from stream */
     void (*lock)(void *ctx);
     void (*unlock)(void *ctx);
     void *lock_ctx;
@@ -835,6 +883,8 @@ static const GUID iid_IDXGIDevice =
     { 0x54ec77fa, 0x1377, 0x44e6, { 0x8c, 0x32, 0x88, 0xfd, 0x5f, 0x44, 0xc8, 0x4c } };
 static const GUID iid_ID3D11VideoContext1 =
     { 0xa7f026da, 0xa5f8, 0x4487, { 0xa5, 0x64, 0x15, 0xe3, 0x43, 0x57, 0x65, 0x1e } };
+static const GUID iid_ID3D11VideoContext2 =
+    { 0xc4e7374c, 0x6243, 0x4d1b, { 0xae, 0x87, 0x52, 0xb4, 0xf7, 0x40, 0xe2, 0x61 } };
 
 /* ASCII-fold a DXGI adapter description for matching against GL_RENDERER. */
 static void adapter_desc_to_ascii(const WCHAR *src, char *dst, size_t dst_size)
@@ -988,7 +1038,13 @@ static void hwgl_destroy(void)
             ID3D11VideoContext1_Release(hwgl.vcontext1);
         hwgl.vcontext1 = NULL;
     }
+    if (hwgl.vcontext2) {
+        if (!hwgl_exiting)
+            ID3D11VideoContext2_Release(hwgl.vcontext2);
+        hwgl.vcontext2 = NULL;
+    }
     hwgl.cs_dxgi = -1;
+    hwgl.hdr_md_state = 0;
     av_buffer_unref(&hwgl.device_ref);
     if (hwgl.state == 1)
         hwgl.state = 0;
@@ -1063,10 +1119,15 @@ static int hwgl_init(AVFrame *frame)
     /* DXGI color spaces (BT.2020/PQ aware, Win10+); NULL falls back to the
      * legacy matrix-only API */
     hwgl.cs_dxgi = -1;
+    hwgl.hdr_md_state = 0;
     if (FAILED(ID3D11VideoContext_QueryInterface(hwgl.vcontext,
                                                  &iid_ID3D11VideoContext1,
                                                  (void **)&hwgl.vcontext1)))
         hwgl.vcontext1 = NULL;
+    if (FAILED(ID3D11VideoContext_QueryInterface(hwgl.vcontext,
+                                                 &iid_ID3D11VideoContext2,
+                                                 (void **)&hwgl.vcontext2)))
+        hwgl.vcontext2 = NULL;
     return 0;
 }
 
@@ -1191,9 +1252,17 @@ static int hwgl_convert(AVFrame *frame, int slot)
         int full = frame->color_range == AVCOL_RANGE_JPEG;
         int cs;
 
-        if (frame->color_trc == AVCOL_TRC_SMPTE2084)
-            cs = DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020;
-        else if (frame->color_trc == AVCOL_TRC_ARIB_STD_B67)
+        int out_cs = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+
+        if (frame->color_trc == AVCOL_TRC_SMPTE2084) {
+            /* Keep PQ/BT.2020 through the VP and tone-map in the GL shaders
+             * (the driver's own PQ->G22 conversion is NOT a tone map and
+             * crushes everything dark). Tagging both sides as G22 makes the
+             * transfer function a no-op, so the VP only de-matrixes YCbCr
+             * and the PQ code values pass through untouched. */
+            cs = DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P2020;
+            out_cs = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020;
+        } else if (frame->color_trc == AVCOL_TRC_ARIB_STD_B67)
             cs = DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020;
         else if (frame->colorspace == AVCOL_SPC_BT2020_NCL)
             cs = full ? DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P2020
@@ -1211,14 +1280,32 @@ static int hwgl_convert(AVFrame *frame, int slot)
             ID3D11VideoContext1_VideoProcessorSetStreamColorSpace1(hwgl.vcontext1,
                 hwgl.vp, 0, cs);
             ID3D11VideoContext1_VideoProcessorSetOutputColorSpace1(hwgl.vcontext1,
-                hwgl.vp, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+                hwgl.vp, out_cs);
             if (hwgl.unlock)
                 hwgl.unlock(hwgl.lock_ctx);
             hwgl.cs_dxgi = cs;
-            if (frame->color_trc == AVCOL_TRC_SMPTE2084 ||
-                frame->color_trc == AVCOL_TRC_ARIB_STD_B67)
+            if (frame->color_trc == AVCOL_TRC_SMPTE2084)
                 av_log(NULL, AV_LOG_INFO,
-                       "FSR: HDR input, tone mapping to SDR via the video processor\n");
+                       "FSR: HDR10 input, PQ tone mapping in the shader\n");
+        }
+        hdr_active = frame->color_trc == AVCOL_TRC_SMPTE2084;
+        /* Content peak for the shader tone mapper: MaxCLL when present,
+         * otherwise the mastering display peak, otherwise 1000 nits. */
+        if (hdr_active && hwgl.hdr_md_state < 2) {
+            AVFrameSideData *sd_m =
+                av_frame_get_side_data(frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
+            AVFrameSideData *sd_c =
+                av_frame_get_side_data(frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
+
+            if (sd_c && ((AVContentLightMetadata *)sd_c->data)->MaxCLL)
+                hdr_peak = (float)((AVContentLightMetadata *)sd_c->data)->MaxCLL;
+            else if (sd_m && ((AVMasteringDisplayMetadata *)sd_m->data)->has_luminance)
+                hdr_peak = (float)av_q2d(((AVMasteringDisplayMetadata *)sd_m->data)->max_luminance);
+            if (sd_c || sd_m) {
+                hwgl.hdr_md_state = 2;
+                av_log(NULL, AV_LOG_INFO, "FSR: HDR content peak %.0f nits\n",
+                       hdr_peak);
+            }
         }
         goto colorspace_done;
     }
@@ -1392,14 +1479,31 @@ int fsr_hw_draw(SDL_Renderer *renderer, AVFrame *frame, const SDL_Rect *rect,
     if (getenv("FSR_DEBUG_READBACK")) {
         static int rb_count;
 
-        if (rb_count < 5 && SDL_SetRenderTarget(renderer, out_tex) == 0) {
+        rb_count++;
+        if (rb_count > 60 && rb_count <= 65 &&
+            SDL_SetRenderTarget(renderer, out_tex) == 0) {
             unsigned char px[4] = { 0 };
+            unsigned char *buf = av_malloc((size_t)rect->w * 4);
 
             SDL_RenderFlush(renderer);
             gl.ReadPixels(rect->w / 2, rect->h / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
-            av_log(NULL, AV_LOG_INFO, "FSR: out_tex center pixel: %u %u %u %u\n",
-                   px[0], px[1], px[2], px[3]);
-            rb_count++;
+            if (buf) { /* average luma over a sparse grid of rows */
+                double sum = 0;
+                int n = 0;
+
+                for (int ry = rect->h / 8; ry < rect->h; ry += rect->h / 8) {
+                    gl.ReadPixels(0, ry, rect->w, 1, GL_RGBA, GL_UNSIGNED_BYTE, buf);
+                    for (int rx = 0; rx < rect->w; rx += 8) {
+                        sum += 0.299 * buf[rx * 4] + 0.587 * buf[rx * 4 + 1] +
+                               0.114 * buf[rx * 4 + 2];
+                        n++;
+                    }
+                }
+                av_log(NULL, AV_LOG_INFO,
+                       "FSR: out_tex center %u %u %u, avg luma %.1f (%d samples)\n",
+                       px[0], px[1], px[2], n ? sum / n : 0, n);
+                av_free(buf);
+            }
         }
     }
 
@@ -1436,6 +1540,7 @@ static const char *fg_src =
     "uniform float phase;\n"        /* interpolation position, 0=prev 1=cur */
     "uniform vec2 outSize;\n"       /* render size; may differ from native */
     "out vec4 fragColor;\n"
+    HDR_TM_GLSL
     /* Bilinearly sample the 4x4-grid flow field (integer texture, so the
      * filtering is done by hand); smooths out block-shaped artifacts. */
     "vec2 sampleFlow(isampler2D t, vec2 pg) {\n"
@@ -1467,6 +1572,8 @@ static const char *fg_src =
     "    vec3 fallback = phase < 0.5 ? texture(prevTex, uv).rgb\n"
     "                                : texture(curTex, uv).rgb;\n"
     "    vec3 mid = mix(fallback, mix(cPrev, cCur, phase), w);\n"
+    "    if (hdrMode > 0.5)\n"
+    "        mid = hdr_tonemap(mid);\n"
     "    fragColor = vec4(mid, 1.0);\n"
     "}\n";
 
@@ -1490,6 +1597,7 @@ static struct {
     GLuint prog;
     GLint phase_loc;
     GLint outsize_loc;
+    GLint hdr_loc, peak_loc;
     const void *in_frame[2];              /* what each OF input buffer holds */
     int64_t in_pts[2];
     const void *pair_a, *pair_b;          /* frames the current flow refers to */
@@ -1788,6 +1896,8 @@ static int fg_init_body(void)
         gl.UseProgram(prev_prog);
         fg.phase_loc   = gl.GetUniformLocation(fg.prog, "phase");
         fg.outsize_loc = gl.GetUniformLocation(fg.prog, "outSize");
+        fg.hdr_loc     = gl.GetUniformLocation(fg.prog, "hdrMode");
+        fg.peak_loc    = gl.GetUniformLocation(fg.prog, "hdrPeak");
     }
     return 0;
 }
@@ -1860,7 +1970,7 @@ static int fg_compute_flow(int sp, int sn)
 
 /* Warp pass: prev+cur+flow -> fg_tex (native size, SDL target texture). */
 static int fg_warp(SDL_Renderer *renderer, int sp, int sn, float phase,
-                   int ow, int oh)
+                   int ow, int oh, int tonemap)
 {
     GLint prev_prog = 0, prev_active = 0, prev_tex[4] = { 0 };
     GLboolean blend, scissor;
@@ -1904,6 +2014,8 @@ static int fg_warp(SDL_Renderer *renderer, int sp, int sn, float phase,
     gl.UseProgram(fg.prog);
     gl.Uniform1f(fg.phase_loc, phase);
     gl.Uniform2f(fg.outsize_loc, (GLfloat)ow, (GLfloat)oh);
+    gl.Uniform1f(fg.hdr_loc, tonemap && hdr_active ? 1.0f : 0.0f);
+    gl.Uniform1f(fg.peak_loc, hdr_peak);
     gl.DrawArrays(GL_TRIANGLES, 0, 3);
     gl.UseProgram(prev_prog);
     for (int i = 3; i >= 0; i--) {
@@ -2022,7 +2134,8 @@ int fsr_fg_draw(SDL_Renderer *renderer, AVFrame *prev, AVFrame *next,
 
         if (ensure_textures(renderer, fg.w, fg.h, rect->w, rect->h) < 0)
             return 0;
-        if (fg_warp(renderer, sp, sn, phase, fg.w, fg.h) < 0) {
+        /* keep PQ through the warp; RCAS tone-maps at the end */
+        if (fg_warp(renderer, sp, sn, phase, fg.w, fg.h, 0) < 0) {
             av_log(NULL, AV_LOG_VERBOSE, "FG: warp failed\n");
             return 0;
         }
@@ -2043,8 +2156,8 @@ int fsr_fg_draw(SDL_Renderer *renderer, AVFrame *prev, AVFrame *next,
 
     /* No upscaling: warp straight at the display size (much cheaper than
      * shading at native size for high-resolution sources) and present the
-     * warp target directly. */
-    if (fg_warp(renderer, sp, sn, phase, rect->w, rect->h) < 0) {
+     * warp target directly (tone-mapping HDR inline). */
+    if (fg_warp(renderer, sp, sn, phase, rect->w, rect->h, 1) < 0) {
         av_log(NULL, AV_LOG_VERBOSE, "FG: warp failed\n");
         return 0;
     }
