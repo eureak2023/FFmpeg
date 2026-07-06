@@ -1709,9 +1709,9 @@ static void video_fg_display(VideoState *is, double phase)
     Frame *nextvp = frame_queue_peek(&is->pictq);
     SDL_Rect *rect = &is->render_params.target_rect;
 
-    if (!is->width || is->subtitle_st || vp->serial != nextvp->serial) {
-        av_log(NULL, AV_LOG_VERBOSE, "FG: skip (w=%d subs=%p serial %d/%d)\n",
-               is->width, (void *)is->subtitle_st, vp->serial, nextvp->serial);
+    if (!is->width || vp->serial != nextvp->serial) {
+        av_log(NULL, AV_LOG_VERBOSE, "FG: skip (w=%d serial %d/%d)\n",
+               is->width, vp->serial, nextvp->serial);
         return;
     }
     if (vp->frame->format != AV_PIX_FMT_D3D11 ||
@@ -1728,6 +1728,15 @@ static void video_fg_display(VideoState *is, double phase)
     if (!fsr_fg_draw(renderer, vp->frame, nextvp->frame, rect, fsr, fsr_sharpness,
                      (float)phase))
         return;
+    /* Re-composite the currently shown (bitmap) subtitle, if any; it was
+     * uploaded by the regular display path. */
+    if (is->subtitle_st && frame_queue_nb_remaining(&is->subpq) > 0) {
+        Frame *sp = frame_queue_peek(&is->subpq);
+
+        if (sp->uploaded &&
+            vp->pts >= sp->pts + ((float)sp->sub.start_display_time / 1000))
+            SDL_RenderCopy(renderer, is->sub_texture, NULL, rect);
+    }
     fsr_toast_draw(renderer);
     fsr_hud_draw(renderer);
     SDL_RenderPresent(renderer);
