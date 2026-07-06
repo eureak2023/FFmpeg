@@ -323,7 +323,7 @@ static const char* wanted_stream_spec[AVMEDIA_TYPE_NB] = {0};
 static int seek_by_bytes = -1;
 static float seek_interval = 10;
 static int display_disable;
-static int borderless;
+static int borderless = 1; /* the on-screen UI provides its own title bar */
 static int alwaysontop;
 static int startup_volume = 100;
 static int show_status = -1;
@@ -3764,7 +3764,8 @@ static int handle_ui_event(VideoState *cur_stream, const SDL_Event *event)
 
     if (event->type != SDL_MOUSEMOTION &&
         event->type != SDL_MOUSEBUTTONDOWN &&
-        event->type != SDL_MOUSEBUTTONUP)
+        event->type != SDL_MOUSEBUTTONUP &&
+        event->type != SDL_WINDOWEVENT)
         return 0;
     act = ui_handle_event(event, cur_stream->width, cur_stream->height,
                           &seek_frac);
@@ -3788,6 +3789,18 @@ static int handle_ui_event(VideoState *cur_stream, const SDL_Event *event)
     }
     case UI_ACT_SEEK_FRAC:
         stream_seek_frac(cur_stream, seek_frac);
+        break;
+    case UI_ACT_MINIMIZE:
+        SDL_MinimizeWindow(window);
+        break;
+    case UI_ACT_MAXIMIZE:
+        if (SDL_GetWindowFlags(window) & SDL_WINDOW_MAXIMIZED)
+            SDL_RestoreWindow(window);
+        else
+            SDL_MaximizeWindow(window);
+        break;
+    case UI_ACT_CLOSE:
+        do_exit(cur_stream); /* does not return */
         break;
     case UI_ACT_CONSUMED:
         break;
@@ -4211,7 +4224,7 @@ static const OptionDef options[] = {
     { "bytes",              OPT_TYPE_INT,             0, { &seek_by_bytes }, "seek by bytes 0=off 1=on -1=auto", "val" },
     { "seek_interval",      OPT_TYPE_FLOAT,           0, { &seek_interval }, "set seek interval for left/right keys, in seconds", "seconds" },
     { "nodisp",             OPT_TYPE_BOOL,            0, { &display_disable }, "disable graphical display" },
-    { "noborder",           OPT_TYPE_BOOL,            0, { &borderless }, "borderless window" },
+    { "noborder",           OPT_TYPE_BOOL,            0, { &borderless }, "borderless window (default; -nonoborder restores the system frame)" },
     { "alwaysontop",        OPT_TYPE_BOOL,            0, { &alwaysontop }, "window always on top" },
     { "volume",             OPT_TYPE_INT,             0, { &startup_volume}, "set startup volume 0=min 100=max", "volume" },
     { "f",                  OPT_TYPE_FUNC, OPT_FUNC_ARG, { .func_arg = opt_format }, "force format", "fmt" },
@@ -4432,6 +4445,7 @@ int main(int argc, char **argv)
             }
             fsr_timer_init();
             ui_init(renderer);
+            ui_set_window(window, input_filename ? input_filename : program_name);
             if (fsr && fsr_init(renderer) < 0)
                 av_log(NULL, AV_LOG_WARNING,
                        "FSR: OpenGL pipeline unavailable, falling back to standard SDL rendering\n");

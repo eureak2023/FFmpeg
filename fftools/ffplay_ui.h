@@ -40,9 +40,16 @@ enum {
     UI_ACT_SEEK_BACK,     /* seek backward (short jump) */
     UI_ACT_SEEK_FWD,      /* seek forward (short jump) */
     UI_ACT_SEEK_FRAC,     /* seek to *seek_frac of the duration */
+    UI_ACT_MINIMIZE,
+    UI_ACT_MAXIMIZE,      /* toggle maximize/restore */
+    UI_ACT_CLOSE,
 };
 
 void ui_init(SDL_Renderer *renderer);
+
+/* Attach the window: enables the title bar (uppercased basename of title),
+ * grab-anywhere window dragging and resize borders for borderless mode. */
+void ui_set_window(SDL_Window *window, const char *title);
 
 /* Feed a mouse event (motion/button); win_w/win_h are the current window
  * size. Returns a UI_ACT_* value; for UI_ACT_SEEK_FRAC the target position
