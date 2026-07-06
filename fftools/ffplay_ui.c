@@ -447,6 +447,38 @@ void ui_ping(void)
     ui.last_activity = av_gettime_relative();
 }
 
+/* Right-click context menu. Returns 0 (dismissed), UI_MENU_OPEN or
+ * UI_MENU_CLOSE. Blocks while the menu is open; main thread only. */
+int ui_context_menu(void)
+{
+#ifdef _WIN32
+    SDL_SysWMinfo wm;
+    HMENU menu;
+    POINT pt;
+    int cmd;
+
+    if (!ui.window)
+        return 0;
+    SDL_VERSION(&wm.version);
+    if (!SDL_GetWindowWMInfo(ui.window, &wm))
+        return 0;
+    menu = CreatePopupMenu();
+    if (!menu)
+        return 0;
+    AppendMenuW(menu, MF_STRING, UI_MENU_OPEN, L"파일 열기(&O)...");
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING, UI_MENU_CLOSE, L"닫기(&X)");
+    GetCursorPos(&pt);
+    SetForegroundWindow(wm.info.win.window);
+    cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                         pt.x, pt.y, 0, wm.info.win.window, NULL);
+    DestroyMenu(menu);
+    return cmd;
+#else
+    return 0;
+#endif
+}
+
 /* Native "open file" dialog; returns an av_strdup'ed UTF-8 path or NULL. */
 char *ui_open_file_dialog(void)
 {

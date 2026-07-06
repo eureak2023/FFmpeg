@@ -1512,7 +1512,10 @@ static int video_open(VideoState *is)
     SDL_SetWindowTitle(window, window_title);
 
     SDL_SetWindowSize(window, w, h);
-    SDL_SetWindowPosition(window, screen_left, screen_top);
+    /* position (centered by default) only on the first reveal: opening
+     * another file must not move the window around */
+    if (!(SDL_GetWindowFlags(window) & SDL_WINDOW_SHOWN))
+        SDL_SetWindowPosition(window, screen_left, screen_top);
     if (is_full_screen)
         SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP);
     SDL_ShowWindow(window);
@@ -4127,6 +4130,16 @@ static int handle_ui_event(VideoState *cur_stream, const SDL_Event *event)
         event->type != SDL_MOUSEBUTTONUP &&
         event->type != SDL_WINDOWEVENT)
         return 0;
+    if (event->type == SDL_MOUSEBUTTONDOWN &&
+        event->button.button == SDL_BUTTON_RIGHT) {
+        switch (ui_context_menu()) {
+        case UI_MENU_OPEN:
+            return 2; /* caller runs the dialog and switches the input */
+        case UI_MENU_CLOSE:
+            do_exit(cur_stream); /* does not return */
+        }
+        return 1;
+    }
     act = ui_handle_event(event, cur_stream->width, cur_stream->height,
                           &seek_frac);
     switch (act) {

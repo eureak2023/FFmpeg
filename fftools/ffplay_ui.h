@@ -82,6 +82,10 @@ void ui_ping(void);
  * UTF-8 path, or NULL if cancelled/unavailable. */
 char *ui_open_file_dialog(void);
 
+/* Right-click context menu (blocks). Returns 0 when dismissed. */
+enum { UI_MENU_OPEN = 1, UI_MENU_CLOSE = 2 };
+int  ui_context_menu(void);
+
 /* Text subtitles (SRT/SMI/ASS), rendered bottom-center with the system
  * font. Events may be added from decode threads; drawing and clearing
  * happen on the render thread. Times in seconds. */
