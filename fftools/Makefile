@@ -56,6 +56,9 @@ OBJS-ffplay += fftools/ffplay_renderer.o
 OBJS-ffplay += fftools/ffplay_fsr.o
 OBJS-ffplay += fftools/ffplay_ui.o
 OBJS-ffplay-$(HAVE_GNU_WINDRES) += fftools/ffplay_res.o
+# GUI subsystem: no console window flashes on double-click launches;
+# fsr_detach_console() re-attaches to the parent console when run from one.
+EXTRALIBS-ffplay += $(if $(HAVE_GNU_WINDRES),-mwindows)
 
 define DOFFTOOL
 OBJS-$(1) += fftools/cmdutils.o fftools/opt_common.o fftools/$(1).o $(OBJS-$(1)-yes)

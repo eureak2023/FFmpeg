@@ -112,28 +112,25 @@ void fsr_precise_sleep(int64_t usec)
 /* When launched by double-click (Explorer file association) the process
  * owns a console no one else uses - drop it so no empty terminal window
  * sits behind the video. Launches from a shell keep their console. */
+/* ffplay links as a GUI-subsystem binary so double-click launches never
+ * flash a console window. When stderr is not already connected (shell
+ * redirection keeps its handle), attach to the parent console if there is
+ * one, else log to %TEMP%\ffplay.log so failures stay diagnosable. */
 void fsr_detach_console(void)
 {
 #ifdef _WIN32
-    DWORD pids[2];
-    HANDLE err;
-    int need_log = 0;
+    HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
 
-    if (GetConsoleProcessList(pids, 2) == 1) {
-        FreeConsole();
-        need_log = 1;
-    }
-    /* Also catch launches that never had a console/stderr to begin with. */
-    err = GetStdHandle(STD_ERROR_HANDLE);
-    if (!err || err == INVALID_HANDLE_VALUE)
-        need_log = 1;
-    if (need_log) {
+    if (err && err != INVALID_HANDLE_VALUE)
+        return; /* launched with stderr connected (shell/redirection) */
+    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+        if (freopen("CONOUT$", "w", stderr))
+            setvbuf(stderr, NULL, _IONBF, 0);
+        freopen("CONOUT$", "w", stdout);
+    } else {
         char logpath[MAX_PATH + 16];
-        DWORD n;
+        DWORD n = GetTempPathA(sizeof(logpath) - 12, logpath);
 
-        /* No console to report to: keep an unbuffered log in %TEMP% so
-         * double-click launches stay diagnosable. */
-        n = GetTempPathA(sizeof(logpath) - 12, logpath);
         if (n > 0) {
             snprintf(logpath + n, sizeof(logpath) - n, "ffplay.log");
             if (freopen(logpath, "w", stderr))
