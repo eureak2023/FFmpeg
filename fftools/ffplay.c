@@ -57,6 +57,7 @@
 
 #include "cmdutils.h"
 #include "ffplay_renderer.h"
+#include "ffplay_fsr.h"
 #include "opt_common.h"
 
 const char program_name[] = "ffplay";
@@ -204,6 +205,7 @@ typedef struct VideoState {
     const AVInputFormat *iformat;
     int abort_request;
     int force_refresh;
+    double fg_next;    /* absolute time of the next generated-frame present */
     int paused;
     int last_paused;
     int queue_attachments_req;
@@ -354,6 +356,12 @@ static int enable_vulkan = 0;
 static char *vulkan_params = NULL;
 static char *video_background = NULL;
 static const char *hwaccel = NULL;
+static int fsr = 1;
+static float fsr_sharpness = 0.0f; /* RCAS attenuation stops, 0 = maximum sharpness */
+static int fsr_denoise = 0;
+static int fsr_fg = 1;             /* 2x frame generation (hardware optical flow) */
+static int show_fps = 0;           /* FPS overlay, toggled with TAB */
+static double fg_refresh = 1.0 / 60.0; /* display refresh period for frame generation */
 
 /* current context */
 static int is_full_screen;
@@ -1007,6 +1015,7 @@ static void video_image_display(VideoState *is)
     Frame *vp;
     Frame *sp = NULL;
     SDL_Rect *rect = &is->render_params.target_rect;
+    int hw_drawn = 0;
 
     vp = frame_queue_peek_last(&is->pictq);
     calculate_display_rect(rect, is->xleft, is->ytop, is->width, is->height, vp->width, vp->height, vp->sar);
@@ -1060,20 +1069,45 @@ static void video_image_display(VideoState *is)
         }
     }
 
-    set_sdl_yuv_conversion_mode(vp->frame);
+    draw_video_background(is);
 
-    if (!vp->uploaded) {
-        if (upload_texture(&is->vid_texture, vp->frame) < 0) {
-            set_sdl_yuv_conversion_mode(NULL);
-            return;
+    if (vp->frame->format == AV_PIX_FMT_D3D11) {
+        hw_drawn = fsr_hw_draw(renderer, vp->frame, rect, fsr, fsr_sharpness);
+        if (!hw_drawn) {
+            /* Zero-copy display unavailable: convert this frame in place and
+             * fall through to the regular upload path. Subsequent frames are
+             * copied back on the decoder thread. */
+            AVFrame *sw_frame = av_frame_alloc();
+
+            if (!sw_frame)
+                return;
+            if (av_hwframe_transfer_data(sw_frame, vp->frame, 0) < 0) {
+                av_frame_free(&sw_frame);
+                return;
+            }
+            av_frame_unref(vp->frame);
+            av_frame_move_ref(vp->frame, sw_frame);
+            av_frame_free(&sw_frame);
         }
-        vp->uploaded = 1;
-        vp->flip_v = vp->frame->linesize[0] < 0;
     }
 
-    draw_video_background(is);
-    SDL_RenderCopyEx(renderer, is->vid_texture, NULL, rect, 0, NULL, vp->flip_v ? SDL_FLIP_VERTICAL : 0);
-    set_sdl_yuv_conversion_mode(NULL);
+    if (!hw_drawn) {
+        set_sdl_yuv_conversion_mode(vp->frame);
+
+        if (!vp->uploaded) {
+            if (upload_texture(&is->vid_texture, vp->frame) < 0) {
+                set_sdl_yuv_conversion_mode(NULL);
+                return;
+            }
+            vp->uploaded = 1;
+            vp->flip_v = vp->frame->linesize[0] < 0;
+        }
+
+        if (!fsr || !fsr_draw(renderer, is->vid_texture, vp->width, vp->height, rect,
+                              vp->flip_v, fsr_sharpness))
+            SDL_RenderCopyEx(renderer, is->vid_texture, NULL, rect, 0, NULL, vp->flip_v ? SDL_FLIP_VERTICAL : 0);
+        set_sdl_yuv_conversion_mode(NULL);
+    }
     if (sp) {
 #if USE_ONEPASS_SUBTITLE_RENDER
         SDL_RenderCopy(renderer, is->sub_texture, NULL, rect);
@@ -1348,6 +1382,7 @@ static void do_exit(VideoState *is)
     if (is) {
         stream_close(is);
     }
+    fsr_uninit();
     if (renderer)
         SDL_DestroyRenderer(renderer);
     if (vk_renderer)
@@ -1410,6 +1445,43 @@ static int video_open(VideoState *is)
     return 0;
 }
 
+/* Refresh the TAB-toggled status overlay: presented frame rate (real +
+ * generated frames) and the current FSR/denoise/sharpness/FG state. */
+static void status_hud_update(int fps)
+{
+    static int last_fps;
+    char buf[96];
+
+    if (fps >= 0)
+        last_fps = fps;
+    if (!show_fps || !renderer)
+        return;
+    snprintf(buf, sizeof(buf),
+             "%d FPS\nFSR %s\nSHARP %d\nNR %s\nFG %s",
+             last_fps,
+             fsr ? "ON" : "OFF",
+             (int)lrint((2.0f - fsr_sharpness) / 2.0f * 100.0f),
+             fsr_denoise ? "ON" : "OFF",
+             fsr_fg ? "ON" : "OFF");
+    fsr_hud_set(renderer, buf);
+}
+
+static void fps_tick(void)
+{
+    static int64_t win_start;
+    static int count;
+    int64_t now = av_gettime_relative();
+
+    count++;
+    if (!win_start)
+        win_start = now;
+    if (now - win_start >= 500000) {
+        status_hud_update((int)lrint(count * 1000000.0 / (now - win_start)));
+        win_start = now;
+        count = 0;
+    }
+}
+
 /* display the current picture, if any */
 static void video_display(VideoState *is)
 {
@@ -1422,7 +1494,10 @@ static void video_display(VideoState *is)
         video_audio_display(is);
     else if (is->video_st)
         video_image_display(is);
+    fsr_toast_draw(renderer);
+    fsr_hud_draw(renderer);
     SDL_RenderPresent(renderer);
+    fps_tick();
 }
 
 static double get_clock(Clock *c)
@@ -1626,6 +1701,40 @@ static void update_video_pts(VideoState *is, double pts, int serial)
 }
 
 /* called to display each frame */
+/* Present an interpolated frame halfway between the displayed frame and the
+ * next queued one (2x frame generation). Skipped when unavailable. */
+static void video_fg_display(VideoState *is, double phase)
+{
+    Frame *vp = frame_queue_peek_last(&is->pictq);
+    Frame *nextvp = frame_queue_peek(&is->pictq);
+    SDL_Rect *rect = &is->render_params.target_rect;
+
+    if (!is->width || is->subtitle_st || vp->serial != nextvp->serial) {
+        av_log(NULL, AV_LOG_VERBOSE, "FG: skip (w=%d subs=%p serial %d/%d)\n",
+               is->width, (void *)is->subtitle_st, vp->serial, nextvp->serial);
+        return;
+    }
+    if (vp->frame->format != AV_PIX_FMT_D3D11 ||
+        nextvp->frame->format != AV_PIX_FMT_D3D11) {
+        av_log(NULL, AV_LOG_VERBOSE, "FG: skip (formats %d/%d, want %d)\n",
+               vp->frame->format, nextvp->frame->format, AV_PIX_FMT_D3D11);
+        return;
+    }
+    calculate_display_rect(rect, is->xleft, is->ytop, is->width, is->height,
+                           vp->width, vp->height, vp->sar);
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+    SDL_RenderClear(renderer);
+    draw_video_background(is);
+    if (!fsr_fg_draw(renderer, vp->frame, nextvp->frame, rect, fsr, fsr_sharpness,
+                     (float)phase))
+        return;
+    fsr_toast_draw(renderer);
+    fsr_hud_draw(renderer);
+    SDL_RenderPresent(renderer);
+    fps_tick();
+    av_log(NULL, AV_LOG_VERBOSE, "FG: interpolated frame presented\n");
+}
+
 static void video_refresh(void *opaque, double *remaining_time)
 {
     VideoState *is = opaque;
@@ -1675,6 +1784,24 @@ retry:
             time= av_gettime_relative()/1000000.0;
             if (time < is->frame_timer + delay) {
                 *remaining_time = FFMIN(is->frame_timer + delay - time, *remaining_time);
+                /* Frame generation: fill the interval up to the display
+                 * refresh rate with interpolated frames at refresh-aligned
+                 * offsets (30fps -> 1 per interval, 24fps -> 2, ...). */
+                if (fsr_fg && !is->paused &&
+                    is->show_mode == SHOW_MODE_VIDEO && is->pictq.rindex_shown &&
+                    frame_queue_nb_remaining(&is->pictq) > 0 &&
+                    delay > fg_refresh * 1.5) {
+                    if (is->fg_next < is->frame_timer + fg_refresh * 0.5 ||
+                        is->fg_next > is->frame_timer + delay)
+                        is->fg_next = is->frame_timer + fg_refresh;
+                    if (is->fg_next < is->frame_timer + delay - fg_refresh * 0.2) {
+                        if (time >= is->fg_next) {
+                            video_fg_display(is, (is->fg_next - is->frame_timer) / delay);
+                            is->fg_next += fg_refresh;
+                        } else
+                            *remaining_time = FFMIN(is->fg_next - time, *remaining_time);
+                    }
+                }
                 goto display;
             }
 
@@ -1733,6 +1860,7 @@ retry:
 
             frame_queue_next(&is->pictq);
             is->force_refresh = 1;
+            is->fg_next = 0;
 
             if (is->step && !is->paused)
                 stream_toggle_pause(is);
@@ -1834,6 +1962,37 @@ static int get_video_frame(VideoState *is, AVFrame *frame)
     if (got_picture) {
         double dpts = NAN;
 
+        /* Hardware-decoded frames are copied back to system memory (NV12)
+         * so the regular SDL/FSR display path can consume them. The vulkan
+         * renderer displays hardware frames directly instead, and D3D11
+         * frames stay on the GPU when zero-copy GL interop is usable. */
+        if (frame->hw_frames_ctx && !vk_renderer &&
+            !(frame->format == AV_PIX_FMT_D3D11 && fsr_available() &&
+              !fsr_hw_interop_failed())) {
+            static int copyback_logged;
+            AVFrame *sw_frame = av_frame_alloc();
+            int ret;
+
+            if (!sw_frame)
+                return -1;
+            ret = av_hwframe_transfer_data(sw_frame, frame, 0);
+            if (ret < 0) {
+                av_frame_free(&sw_frame);
+                av_log(NULL, AV_LOG_ERROR,
+                       "Failed to copy hardware frame to system memory: %s\n",
+                       av_err2str(ret));
+                return -1;
+            }
+            av_frame_unref(frame);
+            av_frame_move_ref(frame, sw_frame);
+            av_frame_free(&sw_frame);
+            if (!copyback_logged) {
+                av_log(NULL, AV_LOG_INFO, "Hardware decoding active (copy-back as %s)\n",
+                       av_get_pix_fmt_name(frame->format));
+                copyback_logged = 1;
+            }
+        }
+
         if (frame->pts != AV_NOPTS_VALUE)
             dpts = av_q2d(is->video_st->time_base) * frame->pts;
 
@@ -1902,7 +2061,7 @@ fail:
 
 static int configure_video_filters(AVFilterGraph *graph, VideoState *is, const char *vfilters, AVFrame *frame)
 {
-    enum AVPixelFormat pix_fmts[FF_ARRAY_ELEMS(sdl_texture_format_map)];
+    enum AVPixelFormat pix_fmts[FF_ARRAY_ELEMS(sdl_texture_format_map) + 1];
     char sws_flags_str[512] = "";
     int ret;
     AVFilterContext *filt_src = NULL, *filt_out = NULL, *last_filter = NULL;
@@ -1911,6 +2070,7 @@ static int configure_video_filters(AVFilterGraph *graph, VideoState *is, const c
     const AVDictionaryEntry *e = NULL;
     int nb_pix_fmts = 0;
     int i, j;
+    int d3d11_passthrough = hwaccel && fsr_available() && !fsr_hw_interop_failed();
     AVBufferSrcParameters *par = av_buffersrc_parameters_alloc();
 
     if (!par)
@@ -1924,6 +2084,10 @@ static int configure_video_filters(AVFilterGraph *graph, VideoState *is, const c
             }
         }
     }
+    /* Let D3D11 hardware frames pass through untouched so they can be
+     * displayed zero-copy via GL interop. */
+    if (d3d11_passthrough)
+        pix_fmts[nb_pix_fmts++] = AV_PIX_FMT_D3D11;
 
     while ((e = av_dict_iterate(sws_dict, e))) {
         if (!strcmp(e->key, "sws_flags")) {
@@ -1972,7 +2136,10 @@ static int configure_video_filters(AVFilterGraph *graph, VideoState *is, const c
     if ((ret = av_opt_set_array(filt_out, "pixel_formats", AV_OPT_SEARCH_CHILDREN,
                                 0, nb_pix_fmts, AV_OPT_TYPE_PIXEL_FMT, pix_fmts)) < 0)
         goto fail;
-    if (!vk_renderer &&
+    /* A colorspace constraint would make lavfi insert a conversion filter,
+     * which cannot operate on D3D11 hardware frames - skip it when they may
+     * pass through (the GL path picks the matrix from frame metadata). */
+    if (!vk_renderer && !d3d11_passthrough &&
         (ret = av_opt_set_array(filt_out, "colorspaces", AV_OPT_SEARCH_CHILDREN,
                                 0, FF_ARRAY_ELEMS(sdl_supported_color_spaces),
                                 AV_OPT_TYPE_INT, sdl_supported_color_spaces)) < 0)
@@ -2648,40 +2815,104 @@ static int audio_open(void *opaque, AVChannelLayout *wanted_channel_layout, int 
     return spec.size;
 }
 
-static int create_hwaccel(AVBufferRef **device_ctx)
+static int create_hwaccel_type(enum AVHWDeviceType type, const AVCodec *codec,
+                               AVBufferRef **device_ctx)
 {
-    enum AVHWDeviceType type;
-    int ret;
-    AVBufferRef *vk_dev;
+    int ret, found = 0;
 
-    *device_ctx = NULL;
-
-    if (!hwaccel)
-        return 0;
-
-    type = av_hwdevice_find_type_by_name(hwaccel);
-    if (type == AV_HWDEVICE_TYPE_NONE)
-        return AVERROR(ENOTSUP);
-
-    if (!vk_renderer) {
-        av_log(NULL, AV_LOG_ERROR, "Vulkan renderer is not available\n");
+    for (int i = 0;; i++) {
+        const AVCodecHWConfig *cfg = avcodec_get_hw_config(codec, i);
+        if (!cfg)
+            break;
+        if (cfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX &&
+            cfg->device_type == type) {
+            found = 1;
+            break;
+        }
+    }
+    if (!found) {
+        av_log(NULL, AV_LOG_VERBOSE, "Decoder %s does not support %s hardware decoding\n",
+               codec->name, av_hwdevice_get_type_name(type));
         return AVERROR(ENOTSUP);
     }
 
-    ret = vk_renderer_get_hw_dev(vk_renderer, &vk_dev);
-    if (ret < 0)
-        return ret;
+    if (vk_renderer) {
+        AVBufferRef *vk_dev;
 
-    ret = av_hwdevice_ctx_create_derived(device_ctx, type, vk_dev, 0);
-    if (!ret)
+        ret = vk_renderer_get_hw_dev(vk_renderer, &vk_dev);
+        if (ret < 0)
+            return ret;
+        ret = av_hwdevice_ctx_create_derived(device_ctx, type, vk_dev, 0);
+        if (!ret)
+            return 0;
+        if (ret != AVERROR(ENOSYS))
+            return ret;
+        av_log(NULL, AV_LOG_WARNING, "Derive %s from vulkan not supported.\n",
+               av_hwdevice_get_type_name(type));
+    }
+    /* Create the D3D11 device on the same GPU as the GL context so decoded
+     * frames can be displayed zero-copy (multi-adapter systems default to
+     * adapter 0, which may be a different GPU). */
+    if (type == AV_HWDEVICE_TYPE_D3D11VA) {
+        int idx = fsr_d3d11_adapter_index();
+
+        if (idx >= 0) {
+            char buf[16];
+
+            snprintf(buf, sizeof(buf), "%d", idx);
+            if (av_hwdevice_ctx_create(device_ctx, type, buf, NULL, 0) >= 0)
+                return 0;
+        }
+    }
+    return av_hwdevice_ctx_create(device_ctx, type, NULL, NULL, 0);
+}
+
+static int create_hwaccel(const AVCodec *codec, AVBufferRef **device_ctx)
+{
+    enum AVHWDeviceType type;
+    int ret;
+
+    *device_ctx = NULL;
+
+    if (!hwaccel || !strcmp(hwaccel, "none"))
         return 0;
 
-    if (ret != AVERROR(ENOSYS))
-        return ret;
+    if (!strcmp(hwaccel, "auto")) {
+        static const char *const candidates[] = { "d3d11va", "cuda", "dxva2", NULL };
 
-    av_log(NULL, AV_LOG_WARNING, "Derive %s from vulkan not supported.\n", hwaccel);
-    ret = av_hwdevice_ctx_create(device_ctx, type, NULL, NULL, 0);
-    return ret;
+        for (int i = 0; candidates[i]; i++) {
+            type = av_hwdevice_find_type_by_name(candidates[i]);
+            if (type == AV_HWDEVICE_TYPE_NONE)
+                continue;
+            if (create_hwaccel_type(type, codec, device_ctx) >= 0) {
+                av_log(NULL, AV_LOG_INFO, "Using %s hardware decoding\n", candidates[i]);
+                return 0;
+            }
+        }
+        av_log(NULL, AV_LOG_WARNING,
+               "No usable hardware decoder found, using software decoding\n");
+        return 0;
+    }
+
+    type = av_hwdevice_find_type_by_name(hwaccel);
+    if (type == AV_HWDEVICE_TYPE_NONE) {
+        av_log(NULL, AV_LOG_ERROR, "Unknown hwaccel type '%s'. Available:", hwaccel);
+        while ((type = av_hwdevice_iterate_types(type)) != AV_HWDEVICE_TYPE_NONE)
+            av_log(NULL, AV_LOG_ERROR, " %s", av_hwdevice_get_type_name(type));
+        av_log(NULL, AV_LOG_ERROR, "\n");
+        return AVERROR(ENOTSUP);
+    }
+    ret = create_hwaccel_type(type, codec, device_ctx);
+    if (ret < 0) {
+        /* Codecs the hwaccel simply does not cover are expected with
+         * hardware decoding enabled by default - stay quiet about them. */
+        av_log(NULL, ret == AVERROR(ENOTSUP) ? AV_LOG_VERBOSE : AV_LOG_WARNING,
+               "Cannot initialize %s hardware decoding, using software decoding\n", hwaccel);
+        av_buffer_unref(device_ctx);
+        return 0;
+    }
+    av_log(NULL, AV_LOG_INFO, "Using %s hardware decoding\n", hwaccel);
+    return 0;
 }
 
 /* open a given stream. Return 0 if OK */
@@ -2751,7 +2982,7 @@ static int stream_component_open(VideoState *is, int stream_index)
     av_dict_set(&opts, "flags", "+copy_opaque", AV_DICT_MULTIKEY);
 
     if (avctx->codec_type == AVMEDIA_TYPE_VIDEO) {
-        ret = create_hwaccel(&avctx->hw_device_ctx);
+        ret = create_hwaccel(codec, &avctx->hw_device_ctx);
         if (ret < 0)
             goto fail;
     }
@@ -3410,6 +3641,8 @@ static void refresh_loop_wait_event(VideoState *is, SDL_Event *event) {
         if (remaining_time > 0.0)
             av_usleep((int64_t)(remaining_time * 1000000.0));
         remaining_time = REFRESH_RATE;
+        if (fsr_toast_active())
+            is->force_refresh = 1;
         if (is->show_mode != SHOW_MODE_NONE && (!is->paused || is->force_refresh))
             video_refresh(is, &remaining_time);
         SDL_PumpEvents();
@@ -3498,6 +3731,76 @@ static void event_loop(VideoState *cur_stream)
             case SDLK_t:
                 stream_cycle_channel(cur_stream, AVMEDIA_TYPE_SUBTITLE);
                 break;
+            case SDLK_x:
+                fsr = !fsr;
+                av_log(NULL, AV_LOG_INFO, "FSR %s%s\n",
+                       fsr ? "enabled" : "disabled",
+                       fsr_available() ? "" : " (unavailable, using standard rendering)");
+                if (renderer)
+                    fsr_toast_show(renderer, !fsr ? "FSR OFF" :
+                                   fsr_available() ? "FSR ON" : "FSR N/A");
+                cur_stream->force_refresh = 1;
+                break;
+            case SDLK_g:
+                fsr_fg = !fsr_fg;
+                av_log(NULL, AV_LOG_INFO, "FG %s\n", fsr_fg ? "enabled" : "disabled");
+                if (renderer)
+                    fsr_toast_show(renderer, fsr_fg ? "FG ON" : "FG OFF");
+                cur_stream->force_refresh = 1;
+                break;
+            case SDLK_d:
+                fsr_denoise = !fsr_denoise;
+                fsr_set_denoise(renderer, fsr_denoise);
+                av_log(NULL, AV_LOG_INFO, "FSR RCAS denoise %s\n",
+                       fsr_denoise ? "enabled" : "disabled");
+                if (renderer)
+                    fsr_toast_show(renderer, fsr_denoise ? "NR ON" : "NR OFF");
+                cur_stream->force_refresh = 1;
+                break;
+            case SDLK_PLUS:
+            case SDLK_EQUALS:
+            case SDLK_KP_PLUS:
+            case SDLK_MINUS:
+            case SDLK_KP_MINUS: {
+                int softer = event.key.keysym.sym == SDLK_MINUS ||
+                             event.key.keysym.sym == SDLK_KP_MINUS;
+                char toast[16];
+
+                /* fsr_sharpness is RCAS attenuation in stops (0 = sharpest);
+                 * '+' sharpens, '-' softens, shown as a 0-100 level. */
+                fsr_sharpness = av_clipf(fsr_sharpness + (softer ? 0.1f : -0.1f),
+                                         0.0f, 2.0f);
+                av_log(NULL, AV_LOG_INFO, "FSR sharpness: %.1f stops\n", fsr_sharpness);
+                snprintf(toast, sizeof(toast), "SHARP %d",
+                         (int)lrint((2.0f - fsr_sharpness) / 2.0f * 100.0f));
+                if (renderer)
+                    fsr_toast_show(renderer, toast);
+                cur_stream->force_refresh = 1;
+                break;
+            }
+            case SDLK_1:
+            case SDLK_2:
+            case SDLK_3:
+            case SDLK_4:
+                if (cur_stream->video_st) {
+                    double factor = event.key.keysym.sym == SDLK_1 ? 0.5 :
+                                    event.key.keysym.sym == SDLK_2 ? 1.0 :
+                                    event.key.keysym.sym == SDLK_3 ? 1.5 : 2.0;
+                    Frame *vp = frame_queue_peek_last(&cur_stream->pictq);
+                    if (is_full_screen) {
+                        av_log(NULL, AV_LOG_INFO, "Window scaling ignored in fullscreen\n");
+                    } else if (vp && vp->width > 0 && vp->height > 0) {
+                        double sar = vp->sar.num > 0 ? av_q2d(vp->sar) : 1.0;
+                        int w = lrint(vp->width * sar * factor);
+                        int h = lrint(vp->height * factor);
+                        if (w > 0 && h > 0) {
+                            SDL_SetWindowSize(window, w, h);
+                            av_log(NULL, AV_LOG_INFO, "Window scaled to %.1fx (%dx%d)\n",
+                                   factor, w, h);
+                        }
+                    }
+                }
+                break;
             case SDLK_w:
                 if (cur_stream->show_mode == SHOW_MODE_VIDEO && cur_stream->vfilter_idx < nb_vfilters - 1) {
                     if (++cur_stream->vfilter_idx >= nb_vfilters)
@@ -3528,10 +3831,29 @@ static void event_loop(VideoState *cur_stream)
                 incr = seek_interval ? seek_interval : 10.0;
                 goto do_seek;
             case SDLK_UP:
-                incr = 60.0;
-                goto do_seek;
-            case SDLK_DOWN:
-                incr = -60.0;
+            case SDLK_DOWN: {
+                char toast[12];
+
+                update_volume(cur_stream, event.key.keysym.sym == SDLK_UP ? 1 : -1,
+                              SDL_VOLUME_STEP);
+                snprintf(toast, sizeof(toast), "VOL %d",
+                         (int)lrint(cur_stream->audio_volume * 100.0 / SDL_MIX_MAXVOLUME));
+                av_log(NULL, AV_LOG_INFO, "Volume: %d%%\n",
+                       (int)lrint(cur_stream->audio_volume * 100.0 / SDL_MIX_MAXVOLUME));
+                if (renderer)
+                    fsr_toast_show(renderer, toast);
+                cur_stream->force_refresh = 1;
+                break;
+            }
+            case SDLK_TAB:
+                show_fps = !show_fps;
+                av_log(NULL, AV_LOG_INFO, "Status display %s\n", show_fps ? "on" : "off");
+                if (show_fps)
+                    status_hud_update(-1);
+                else
+                    fsr_hud_set(renderer, NULL);
+                cur_stream->force_refresh = 1;
+                break;
             do_seek:
                     if (seek_by_bytes) {
                         pos = -1;
@@ -3801,7 +4123,11 @@ static const OptionDef options[] = {
     { "enable_vulkan",      OPT_TYPE_BOOL,            0, { &enable_vulkan }, "enable vulkan renderer" },
     { "vulkan_params",      OPT_TYPE_STRING, OPT_EXPERT, { &vulkan_params }, "vulkan configuration using a list of key=value pairs separated by ':'" },
     { "video_bg",           OPT_TYPE_STRING, OPT_EXPERT, { &video_background }, "set video background for transparent videos" },
-    { "hwaccel",            OPT_TYPE_STRING, OPT_EXPERT, { &hwaccel }, "use HW accelerated decoding" },
+    { "hwaccel",            OPT_TYPE_STRING, OPT_EXPERT, { &hwaccel }, "HW accelerated decoding: d3d11va (default), auto, dxva2, cuda, ..., none disables", "type" },
+    { "fsr",                OPT_TYPE_BOOL,            0, { &fsr }, "upscale video output with FSR1 (EASU+RCAS), on by default; toggle at runtime with 'x'" },
+    { "fsr_sharpness",      OPT_TYPE_FLOAT, OPT_EXPERT, { &fsr_sharpness }, "FSR RCAS sharpness attenuation in stops (0=sharpest, adjust at runtime with +/-)", "stops" },
+    { "fsr_denoise",        OPT_TYPE_BOOL,  OPT_EXPERT, { &fsr_denoise }, "reduce FSR sharpening of noise and film grain; toggle at runtime with 'd'" },
+    { "fsr_fg",             OPT_TYPE_BOOL,  OPT_EXPERT, { &fsr_fg }, "2x frame generation via NVIDIA hardware optical flow, on by default (-nofsr_fg disables); toggle at runtime with 'g'" },
     { NULL, },
 };
 
@@ -3835,8 +4161,14 @@ void show_help_default(const char *opt, const char *arg)
            "c                   cycle program\n"
            "w                   cycle video filters or show modes\n"
            "s                   activate frame-step mode\n"
+           "x                   toggle FSR upscaling\n"
+           "+, -                increase and decrease FSR sharpness respectively\n"
+           "d                   toggle FSR noise/grain-aware sharpening (denoise)\n"
+           "g                   toggle 2x frame generation (NVIDIA optical flow)\n"
+           "tab                 toggle the status overlay (FPS, FSR, sharpness, denoise, FG)\n"
+           "1, 2, 3, 4          scale window to 0.5x, 1x, 1.5x, 2x of the video size\n"
            "left/right          seek backward/forward by 10 seconds or a custom interval if -seek_interval is set\n"
-           "down/up             seek backward/forward 1 minute\n"
+           "down/up             decrease and increase volume respectively\n"
            "page down/page up   seek to previous/next chapter or backward/forward 10 minutes if no chapters\n"
            "right mouse click   seek to percentage in file corresponding to fraction of width\n"
            "left double-click   toggle full screen\n"
@@ -3910,10 +4242,6 @@ int main(int argc, char **argv)
 #ifdef SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR
         SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0");
 #endif
-        if (hwaccel && !enable_vulkan) {
-            av_log(NULL, AV_LOG_INFO, "Enable vulkan renderer to support hwaccel %s\n", hwaccel);
-            enable_vulkan = 1;
-        }
         if (enable_vulkan) {
             vk_renderer = vk_get_renderer();
             if (vk_renderer) {
@@ -3949,6 +4277,8 @@ int main(int argc, char **argv)
                 do_exit(NULL);
             }
         } else {
+            if (fsr)
+                SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
             renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
             if (!renderer) {
                 av_log(NULL, AV_LOG_WARNING, "Failed to initialize a hardware accelerated renderer: %s\n", SDL_GetError());
@@ -3962,8 +4292,30 @@ int main(int argc, char **argv)
                 av_log(NULL, AV_LOG_FATAL, "Failed to create window or renderer: %s", SDL_GetError());
                 do_exit(NULL);
             }
+            if (fsr && fsr_init(renderer) < 0)
+                av_log(NULL, AV_LOG_WARNING,
+                       "FSR: OpenGL pipeline unavailable, falling back to standard SDL rendering\n");
+            fsr_set_denoise(renderer, fsr_denoise);
+            if (fsr_fg && fsr_fg_boot() < 0)
+                av_log(NULL, AV_LOG_WARNING,
+                       "FG: hardware optical flow unavailable, frame generation disabled\n");
+            {
+                SDL_DisplayMode mode;
+
+                if (!SDL_GetCurrentDisplayMode(SDL_GetWindowDisplayIndex(window), &mode) &&
+                    mode.refresh_rate > 0) {
+                    fg_refresh = 1.0 / mode.refresh_rate;
+                    av_log(NULL, AV_LOG_INFO, "FG: display refresh %d Hz\n",
+                           mode.refresh_rate);
+                }
+            }
         }
     }
+
+    /* Hardware decoding by default on Windows; explicit -hwaccel (or 'none')
+     * and the vulkan renderer keep their own configuration. */
+    if (!hwaccel && !enable_vulkan)
+        hwaccel = "d3d11va";
 
     is = stream_open(input_filename, file_iformat);
     if (!is) {
