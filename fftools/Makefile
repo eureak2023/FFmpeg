@@ -55,6 +55,7 @@ OBJS-ffmpeg += $(COMPAT_OBJS:%=compat/%)
 OBJS-ffplay += fftools/ffplay_renderer.o
 OBJS-ffplay += fftools/ffplay_fsr.o
 OBJS-ffplay += fftools/ffplay_ui.o
+OBJS-ffplay-$(HAVE_GNU_WINDRES) += fftools/ffplay_res.o
 
 define DOFFTOOL
 OBJS-$(1) += fftools/cmdutils.o fftools/opt_common.o fftools/$(1).o $(OBJS-$(1)-yes)
