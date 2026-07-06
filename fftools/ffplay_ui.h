@@ -43,6 +43,7 @@ enum {
     UI_ACT_MINIMIZE,
     UI_ACT_MAXIMIZE,      /* toggle maximize/restore */
     UI_ACT_CLOSE,
+    UI_ACT_SET_VOLUME,    /* set volume to *seek_frac (0..1) */
 };
 
 void ui_init(SDL_Renderer *renderer);
@@ -57,9 +58,20 @@ void ui_set_window(SDL_Window *window, const char *title);
 int  ui_handle_event(const SDL_Event *event, int win_w, int win_h,
                      double *seek_frac);
 
-/* Draw the overlay (no-op while hidden). pos/dur in seconds. */
+/* Draw the overlay (no-op while hidden). pos/dur in seconds,
+ * volume 0..1. */
 void ui_draw(SDL_Renderer *renderer, int win_w, int win_h,
-             double pos, double dur, int paused);
+             double pos, double dur, int paused, double volume);
+
+/* Stream info badges shown at the right of the control bar. hw is the
+ * highlighted decode badge ("H/W"), the rest are boxed labels; NULL keeps
+ * a slot unchanged. Callable from the stream-open thread (textures are
+ * built lazily on the render thread). */
+void ui_set_badges(const char *hw, const char *vcodec,
+                   const char *acodec, const char *chans);
+
+/* Chapter start positions as 0..1 fractions of the duration. */
+void ui_set_chapters(const double *fracs, int n);
 
 /* Returns 1 once whenever visibility or hover changed since the last draw,
  * so a paused player knows to redraw. Poll from the refresh loop. */

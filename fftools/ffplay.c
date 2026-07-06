@@ -1497,7 +1497,8 @@ static void ui_draw_overlay(VideoState *is)
 
     if (isnan(pos))
         pos = 0.0;
-    ui_draw(renderer, is->width, is->height, pos, dur, is->paused);
+    ui_draw(renderer, is->width, is->height, pos, dur, is->paused,
+            is->audio_volume / (double)SDL_MIX_MAXVOLUME);
 }
 
 /* display the current picture, if any */
@@ -3104,6 +3105,23 @@ static int stream_component_open(VideoState *is, int stream_index)
         if ((ret = decoder_start(&is->auddec, audio_thread, "audio_decoder", is)) < 0)
             goto out;
         SDL_PauseAudioDevice(audio_dev, 0);
+        {
+            char aname[16], chans[8];
+            int ch = avctx->ch_layout.nb_channels;
+
+            switch (avctx->codec_id) {
+            case AV_CODEC_ID_EAC3:   snprintf(aname, sizeof(aname), "DD+");    break;
+            case AV_CODEC_ID_AC3:    snprintf(aname, sizeof(aname), "DD");     break;
+            case AV_CODEC_ID_TRUEHD: snprintf(aname, sizeof(aname), "TRUEHD"); break;
+            default:
+                snprintf(aname, sizeof(aname), "%s", avcodec_get_name(avctx->codec_id));
+                for (char *p = aname; *p; p++)
+                    *p = av_toupper(*p);
+            }
+            snprintf(chans, sizeof(chans), "%d.%d",
+                     ch > 2 ? ch - 1 : ch, ch > 2 ? 1 : 0);
+            ui_set_badges(NULL, NULL, aname, chans);
+        }
         break;
     case AVMEDIA_TYPE_VIDEO:
         is->video_stream = stream_index;
@@ -3114,6 +3132,15 @@ static int stream_component_open(VideoState *is, int stream_index)
         if ((ret = decoder_start(&is->viddec, video_thread, "video_decoder", is)) < 0)
             goto out;
         is->queue_attachments_req = 1;
+        {
+            char vname[16];
+
+            snprintf(vname, sizeof(vname), "%s", avcodec_get_name(avctx->codec_id));
+            for (char *p = vname; *p; p++)
+                *p = av_toupper(*p);
+            ui_set_badges(avctx->hw_device_ctx ? "H/W" : "S/W", vname,
+                          NULL, NULL);
+        }
         break;
     case AVMEDIA_TYPE_SUBTITLE:
         is->subtitle_stream = stream_index;
@@ -3263,6 +3290,24 @@ static int read_thread(void *arg)
                         strcmp("ogg", ic->iformat->name);
 
     is->max_frame_duration = (ic->iformat->flags & AVFMT_TS_DISCONT) ? 10.0 : 3600.0;
+
+    /* feed chapter positions to the seek bar */
+    if (ic->nb_chapters > 0 && ic->duration > 0) {
+        double fracs[128];
+        double dur   = ic->duration / (double)AV_TIME_BASE;
+        double start = ic->start_time != AV_NOPTS_VALUE ?
+                       ic->start_time / (double)AV_TIME_BASE : 0.0;
+        int n = 0;
+
+        for (unsigned i = 0; i < ic->nb_chapters && n < 128; i++) {
+            double sec = ic->chapters[i]->start * av_q2d(ic->chapters[i]->time_base);
+            double f   = (sec - start) / dur;
+
+            if (f > 0.002 && f < 0.998)
+                fracs[n++] = f;
+        }
+        ui_set_chapters(fracs, n);
+    }
 
     if (!window_title && (t = av_dict_get(ic->metadata, "title", NULL, 0)))
         window_title = av_asprintf("%s - %s", t->value, input_filename);
@@ -3801,6 +3846,10 @@ static int handle_ui_event(VideoState *cur_stream, const SDL_Event *event)
         break;
     case UI_ACT_CLOSE:
         do_exit(cur_stream); /* does not return */
+        break;
+    case UI_ACT_SET_VOLUME:
+        cur_stream->audio_volume = av_clip((int)lrint(seek_frac * SDL_MIX_MAXVOLUME),
+                                           0, SDL_MIX_MAXVOLUME);
         break;
     case UI_ACT_CONSUMED:
         break;

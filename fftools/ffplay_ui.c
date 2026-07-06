@@ -26,6 +26,10 @@
 
 #include <SDL.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #include "libavutil/time.h"
 
 #include "ffplay_fsr.h"
@@ -45,6 +49,7 @@
 enum {
     EL_NONE = 0,
     EL_SEEK,       /* seek track */
+    EL_VOL,        /* volume slider */
     EL_PAUSE,
     EL_STOP,
     EL_BACK,
@@ -56,6 +61,11 @@ enum {
     EL_CLOSE,
 };
 
+#define VOL_AREA   150  /* right end of the seek row: icon + slider */
+#define VOL_TRACK  100  /* slider track width */
+#define MAX_CHAPTERS 128
+#define NBADGE 4
+
 static struct {
     int64_t last_activity;
     int     hover;         /* element under the cursor */
@@ -65,22 +75,121 @@ static struct {
     int     win_w, win_h;
 
     SDL_Window *window;
-    char    title[64];
+    char    title[512];    /* UTF-8 basename */
     /* window-move drag (grab the video or the title bar) */
     int     wdrag_armed, wdrag_moving;
     int     wdrag_mouse_x, wdrag_mouse_y; /* global, at buttondown */
     int     wdrag_win_x, wdrag_win_y;
 
+    /* volume slider */
+    int     vol_dragging;
+
+    /* stream info badges: [0] highlighted (H/W), [1] vcodec, [2] acodec,
+     * [3] channels. Set once from the open threads, rendered lazily on the
+     * main thread. */
+    char         badge_str[NBADGE][16];
+    SDL_Texture *badge_tex[NBADGE];
+    int          badge_w[NBADGE], badge_h[NBADGE];
+    int          badges_dirty;
+
+    /* chapter start positions as fractions of the duration */
+    double  chapters[MAX_CHAPTERS];
+    int     nb_chapters;
+
     SDL_Texture *text_tex; /* rendered time string */
     int          text_w, text_h;
     char         text_str[64];
     SDL_Texture *title_tex;
-    int          title_w, title_h;
+    int          title_w, title_h, title_scale;
     SDL_Renderer *renderer;
 
     int last_drawn_visible;
     int last_drawn_hover;
 } ui;
+
+/* Rasterize UTF-8 text with the system font via GDI (handles Korean and
+ * everything else the pixel font cannot). White glyphs, alpha from
+ * coverage. Returns NULL on failure (caller falls back to the pixel font). */
+static SDL_Texture *render_text_sys(SDL_Renderer *r, const char *utf8,
+                                    int px_h, int *out_w, int *out_h)
+{
+#ifdef _WIN32
+    wchar_t wbuf[512];
+    BITMAPINFO bmi = { 0 };
+    SDL_Texture *tex = NULL;
+    uint32_t *bits = NULL, *px = NULL;
+    HDC dc = NULL;
+    HFONT font = NULL, old_font = NULL;
+    HBITMAP bmp = NULL, old_bmp = NULL;
+    RECT rc = { 0, 0, 0, 0 };
+    int tw, th;
+
+    if (!MultiByteToWideChar(CP_UTF8, 0, utf8, -1, wbuf,
+                             (int)(sizeof(wbuf) / sizeof(*wbuf))))
+        return NULL;
+    dc = CreateCompatibleDC(NULL);
+    if (!dc)
+        return NULL;
+    font = CreateFontW(-px_h, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                       DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                       ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+                       L"Malgun Gothic");
+    if (!font)
+        goto out;
+    old_font = (HFONT)SelectObject(dc, font);
+    DrawTextW(dc, wbuf, -1, &rc, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+    tw = rc.right;
+    th = rc.bottom;
+    if (tw <= 0 || th <= 0)
+        goto out;
+
+    bmi.bmiHeader.biSize        = sizeof(bmi.bmiHeader);
+    bmi.bmiHeader.biWidth       = tw;
+    bmi.bmiHeader.biHeight      = -th; /* top-down */
+    bmi.bmiHeader.biPlanes      = 1;
+    bmi.bmiHeader.biBitCount    = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    bmp = CreateDIBSection(dc, &bmi, DIB_RGB_COLORS, (void **)&bits, NULL, 0);
+    if (!bmp)
+        goto out;
+    old_bmp = (HBITMAP)SelectObject(dc, bmp);
+    memset(bits, 0, (size_t)tw * th * 4);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, RGB(255, 255, 255));
+    DrawTextW(dc, wbuf, -1, &rc, DT_SINGLELINE | DT_NOPREFIX);
+    GdiFlush();
+
+    px = SDL_malloc((size_t)tw * th * 4);
+    if (!px)
+        goto out;
+    for (int i = 0; i < tw * th; i++)
+        px[i] = ((bits[i] & 0xFF) << 24) | 0x00E8E8E8; /* coverage -> alpha */
+
+    tex = SDL_CreateTexture(r, SDL_PIXELFORMAT_ARGB8888,
+                            SDL_TEXTUREACCESS_STATIC, tw, th);
+    if (tex) {
+        SDL_UpdateTexture(tex, NULL, px, tw * 4);
+        SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_BLEND);
+        *out_w = tw;
+        *out_h = th;
+    }
+out:
+    SDL_free(px);
+    if (old_bmp)
+        SelectObject(dc, old_bmp);
+    if (bmp)
+        DeleteObject(bmp);
+    if (old_font)
+        SelectObject(dc, old_font);
+    if (font)
+        DeleteObject(font);
+    if (dc)
+        DeleteDC(dc);
+    return tex;
+#else
+    return NULL;
+#endif
+}
 
 void ui_init(SDL_Renderer *renderer)
 {
@@ -124,17 +233,32 @@ static SDL_HitTestResult hit_test(SDL_Window *win, const SDL_Point *p, void *dat
 void ui_set_window(SDL_Window *win, const char *title)
 {
     const char *base = title, *p;
-    int n = 0;
 
     ui.window = win;
-    /* basename, uppercased for the pixel font (others render as blanks) */
     for (p = title; *p; p++)
         if (*p == '/' || *p == '\\')
             base = p + 1;
-    for (p = base; *p && n < (int)sizeof(ui.title) - 1; p++)
-        ui.title[n++] = *p >= 'a' && *p <= 'z' ? *p - 32 : *p;
-    ui.title[n] = 0;
+    snprintf(ui.title, sizeof(ui.title), "%s", base);
     SDL_SetWindowHitTest(win, hit_test, NULL);
+}
+
+void ui_set_badges(const char *hw, const char *vcodec,
+                   const char *acodec, const char *chans)
+{
+    const char *s[NBADGE] = { hw, vcodec, acodec, chans };
+
+    for (int i = 0; i < NBADGE; i++)
+        if (s[i])
+            snprintf(ui.badge_str[i], sizeof(ui.badge_str[i]), "%s", s[i]);
+    ui.badges_dirty = 1;
+}
+
+void ui_set_chapters(const double *fracs, int n)
+{
+    if (n > MAX_CHAPTERS)
+        n = MAX_CHAPTERS;
+    memcpy(ui.chapters, fracs, n * sizeof(*fracs));
+    ui.nb_chapters = n;
 }
 
 void ui_uninit(void)
@@ -147,6 +271,11 @@ void ui_uninit(void)
         SDL_DestroyTexture(ui.title_tex);
         ui.title_tex = NULL;
     }
+    for (int i = 0; i < NBADGE; i++)
+        if (ui.badge_tex[i]) {
+            SDL_DestroyTexture(ui.badge_tex[i]);
+            ui.badge_tex[i] = NULL;
+        }
     if (ui.window)
         SDL_SetWindowHitTest(ui.window, NULL, NULL);
     ui.window   = NULL;
@@ -177,7 +306,7 @@ static int element_at(int x, int y)
         }
     }
     if (y >= seek_top && y < bar_top)
-        return EL_SEEK;
+        return x >= ui.win_w - VOL_AREA ? EL_VOL : EL_SEEK;
     if (y >= bar_top && y < ui.win_h) {
         int i = x / BTN_W;
 
@@ -227,9 +356,22 @@ static int wdrag_motion(void)
     return 0;
 }
 
+static int seek_track_w(void)
+{
+    return ui.win_w - 2 * SEEK_PAD - VOL_AREA;
+}
+
 static double seek_frac_at(int x)
 {
-    double f = (double)(x - SEEK_PAD) / (ui.win_w - 2 * SEEK_PAD);
+    double f = (double)(x - SEEK_PAD) / seek_track_w();
+
+    return f < 0.0 ? 0.0 : f > 1.0 ? 1.0 : f;
+}
+
+static double vol_frac_at(int x)
+{
+    int x0 = ui.win_w - VOL_TRACK - 12;
+    double f = (double)(x - x0) / VOL_TRACK;
 
     return f < 0.0 ? 0.0 : f > 1.0 ? 1.0 : f;
 }
@@ -259,6 +401,10 @@ int ui_handle_event(const SDL_Event *event, int win_w, int win_h,
             }
             return UI_ACT_CONSUMED;
         }
+        if (ui.vol_dragging) {
+            *seek_frac = vol_frac_at(x);
+            return UI_ACT_SET_VOLUME;
+        }
         if ((event->motion.state & SDL_BUTTON_LMASK) && wdrag_motion())
             return UI_ACT_CONSUMED;
         return UI_ACT_NONE; /* let ffplay keep its cursor logic */
@@ -279,6 +425,10 @@ int ui_handle_event(const SDL_Event *event, int win_w, int win_h,
             ui.last_drag_seek = av_gettime_relative();
             *seek_frac = ui.drag_frac;
             return UI_ACT_SEEK_FRAC;
+        case EL_VOL:
+            ui.vol_dragging = 1;
+            *seek_frac = vol_frac_at(x);
+            return UI_ACT_SET_VOLUME;
         case EL_PAUSE: return UI_ACT_TOGGLE_PAUSE;
         case EL_STOP:  return UI_ACT_STOP;
         case EL_BACK:  return UI_ACT_SEEK_BACK;
@@ -301,6 +451,11 @@ int ui_handle_event(const SDL_Event *event, int win_w, int win_h,
             ui.dragging = 0;
             *seek_frac  = seek_frac_at(event->button.x);
             return UI_ACT_SEEK_FRAC;
+        }
+        if (ui.vol_dragging) {
+            ui.vol_dragging = 0;
+            *seek_frac = vol_frac_at(event->button.x);
+            return UI_ACT_SET_VOLUME;
         }
         if (ui.wdrag_armed) {
             int moved = ui.wdrag_moving;
@@ -414,7 +569,7 @@ static SDL_Color icon_color(int el)
 }
 
 void ui_draw(SDL_Renderer *renderer, int win_w, int win_h,
-             double pos, double dur, int paused)
+             double pos, double dur, int paused, double volume)
 {
     int bar_top, seek_top, track_y, track_w, fill_w, cy;
     double frac;
@@ -431,7 +586,7 @@ void ui_draw(SDL_Renderer *renderer, int win_w, int win_h,
     bar_top  = win_h - BAR_H;
     seek_top = bar_top - SEEK_H;
     track_y  = seek_top + SEEK_H / 2;
-    track_w  = win_w - 2 * SEEK_PAD;
+    track_w  = seek_track_w();
     cy       = bar_top + BAR_H / 2;
 
     if (dur > 0) {
@@ -447,13 +602,37 @@ void ui_draw(SDL_Renderer *renderer, int win_w, int win_h,
     fill(renderer, 0, seek_top, win_w, SEEK_H, 14, 14, 14, 200);
     fill(renderer, 0, bar_top, win_w, BAR_H, 14, 14, 14, 235);
 
-    /* seek track, played fill, handle */
+    /* seek track, chapter markers, played fill, handle */
     fill(renderer, SEEK_PAD, track_y - 1, track_w, 3, 85, 85, 85, 255);
     fill(renderer, SEEK_PAD, track_y - 1, fill_w, 3, 250, 200, 40, 255);
+    for (int i = 0; i < ui.nb_chapters; i++) {
+        int cx = SEEK_PAD + (int)lrint(ui.chapters[i] * track_w);
+
+        fill(renderer, cx - 2, track_y - 4, 5, 9, 235, 235, 235, 255);
+    }
     fill(renderer, SEEK_PAD + fill_w - 4, track_y - 6, 9, 12,
          ui.hover == EL_SEEK || ui.dragging ? 250 : 235,
          ui.hover == EL_SEEK || ui.dragging ? 200 : 235,
          ui.hover == EL_SEEK || ui.dragging ?  40 : 235, 255);
+
+    /* volume: speaker icon + slider at the right end of the seek row */
+    {
+        int vx = win_w - VOL_TRACK - 12;   /* track left edge */
+        int sx = vx - 24;                  /* speaker icon */
+        int vw = (int)lrint(volume * VOL_TRACK);
+
+        c = icon_color(EL_VOL);
+        fill(renderer, sx, track_y - 3, 4, 7, c.r, c.g, c.b, 255);
+        tri(renderer, sx + 4.f, (float)track_y,
+                      sx + 12.f, track_y - 8.f,
+                      sx + 12.f, track_y + 8.f, c);
+        fill(renderer, vx, track_y - 1, VOL_TRACK, 3, 85, 85, 85, 255);
+        fill(renderer, vx, track_y - 1, vw, 3, 250, 200, 40, 255);
+        fill(renderer, vx + vw - 3, track_y - 5, 7, 11,
+             ui.hover == EL_VOL || ui.vol_dragging ? 250 : 235,
+             ui.hover == EL_VOL || ui.vol_dragging ? 200 : 235,
+             ui.hover == EL_VOL || ui.vol_dragging ?  40 : 235, 255);
+    }
 
     /* pause / play */
     c = icon_color(EL_PAUSE);
@@ -488,17 +667,26 @@ void ui_draw(SDL_Renderer *renderer, int win_w, int win_h,
     if (ui_fullscreen())
         goto controls;
     fill(renderer, 0, 0, win_w, TITLE_H, 14, 14, 14, 235);
-    if (!ui.title_tex && ui.title[0])
-        ui.title_tex = render_text(renderer, ui.title, &ui.title_w, &ui.title_h);
+    if (!ui.title_tex && ui.title[0]) {
+        ui.title_scale = 1; /* system font renders at final size */
+        ui.title_tex = render_text_sys(renderer, ui.title, TITLE_H - 14,
+                                       &ui.title_w, &ui.title_h);
+        if (!ui.title_tex) { /* fallback: pixel font (ASCII only), drawn x2 */
+            ui.title_scale = 2;
+            ui.title_tex = render_text(renderer, ui.title,
+                                       &ui.title_w, &ui.title_h);
+        }
+    }
     if (ui.title_tex) {
-        SDL_Rect dst = { 14, TITLE_H / 2 - ui.title_h,
-                         ui.title_w * 2, ui.title_h * 2 };
+        int s = ui.title_scale;
+        SDL_Rect dst = { 14, TITLE_H / 2 - ui.title_h * s / 2,
+                         ui.title_w * s, ui.title_h * s };
         int max_w = win_w - 3 * WBTN_W - 28;
 
         if (dst.w > max_w) { /* clip long names against the buttons */
-            SDL_Rect src = { 0, 0, max_w / 2, ui.title_h };
+            SDL_Rect src = { 0, 0, max_w / s, ui.title_h };
 
-            dst.w = max_w;
+            dst.w = src.w * s;
             SDL_RenderCopy(renderer, ui.title_tex, &src, &dst);
         } else
             SDL_RenderCopy(renderer, ui.title_tex, NULL, &dst);
@@ -548,5 +736,41 @@ controls:
                          ui.text_w * 2, ui.text_h * 2 };
 
         SDL_RenderCopy(renderer, ui.text_tex, NULL, &dst);
+    }
+
+    /* stream info badges, right-aligned: [H/W] [VCODEC] [ACODEC] [CH] */
+    if (ui.badges_dirty) {
+        for (int i = 0; i < NBADGE; i++) {
+            if (ui.badge_tex[i]) {
+                SDL_DestroyTexture(ui.badge_tex[i]);
+                ui.badge_tex[i] = NULL;
+            }
+            if (ui.badge_str[i][0])
+                ui.badge_tex[i] = render_text_sys(renderer, ui.badge_str[i],
+                                                  16, &ui.badge_w[i],
+                                                  &ui.badge_h[i]);
+        }
+        ui.badges_dirty = 0;
+    }
+    {
+        int bx = win_w - 14;
+
+        for (int i = NBADGE - 1; i >= 0; i--) {
+            SDL_Rect dst;
+
+            if (!ui.badge_tex[i])
+                continue;
+            bx -= ui.badge_w[i] + 12;
+            dst.x = bx + 6;
+            dst.y = cy - ui.badge_h[i] / 2;
+            dst.w = ui.badge_w[i];
+            dst.h = ui.badge_h[i];
+            if (i == 0) /* hardware decode: PotPlayer yellow */
+                SDL_SetTextureColorMod(ui.badge_tex[i], 250, 200, 40);
+            else
+                fill(renderer, bx, cy - 11, ui.badge_w[i] + 12, 22,
+                     45, 45, 45, 255);
+            SDL_RenderCopy(renderer, ui.badge_tex[i], NULL, &dst);
+        }
     }
 }
