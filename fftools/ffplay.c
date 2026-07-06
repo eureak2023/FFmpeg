@@ -1380,6 +1380,23 @@ static void stream_close(VideoState *is)
     av_free(is);
 }
 
+/* Query the display refresh rate for frame-generation pacing (remote
+ * sessions switch it at runtime); generated output is capped at 60 fps. */
+static void update_fg_refresh(void)
+{
+    SDL_DisplayMode mode;
+
+    if (window &&
+        !SDL_GetCurrentDisplayMode(SDL_GetWindowDisplayIndex(window), &mode) &&
+        mode.refresh_rate > 0) {
+        int rate = FFMIN(mode.refresh_rate, 60);
+
+        fg_refresh = 1.0 / rate;
+        av_log(NULL, AV_LOG_INFO, "FG: display refresh %d Hz, pacing %d fps\n",
+               mode.refresh_rate, rate);
+    }
+}
+
 /* ---- persisted settings: last (non-maximized) window size and volume */
 static int last_normal_w, last_normal_h; /* latest windowed (not maximized/
                                             fullscreen) client size */
@@ -4477,6 +4494,10 @@ static void event_loop(VideoState *cur_stream)
                         vk_renderer_resize(vk_renderer, screen_width, screen_height);
                 case SDL_WINDOWEVENT_EXPOSED:
                     cur_stream->force_refresh = 1;
+                    break;
+                case SDL_WINDOWEVENT_DISPLAY_CHANGED:
+                    update_fg_refresh(); /* moved to another monitor */
+                    break;
             }
             break;
         case SDL_QUIT:
@@ -4848,20 +4869,7 @@ int main(int argc, char **argv)
             if (fsr_fg && fsr_fg_boot() < 0)
                 av_log(NULL, AV_LOG_WARNING,
                        "FG: hardware optical flow unavailable, frame generation disabled\n");
-            {
-                SDL_DisplayMode mode;
-
-                if (!SDL_GetCurrentDisplayMode(SDL_GetWindowDisplayIndex(window), &mode) &&
-                    mode.refresh_rate > 0) {
-                    /* generated output is capped at 60 fps even on
-                     * high-refresh displays */
-                    int rate = FFMIN(mode.refresh_rate, 60);
-
-                    fg_refresh = 1.0 / rate;
-                    av_log(NULL, AV_LOG_INFO, "FG: display refresh %d Hz, pacing %d fps\n",
-                           mode.refresh_rate, rate);
-                }
-            }
+            update_fg_refresh();
         }
     }
 
