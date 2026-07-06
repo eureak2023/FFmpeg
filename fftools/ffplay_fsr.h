@@ -105,6 +105,10 @@ int  fsr_toast_active(void);
 void fsr_hud_set(SDL_Renderer *renderer, const char *text);
 int  fsr_hud_draw(SDL_Renderer *renderer);
 
+/* 8x8 bitmap for a pixel-font character (uppercase letters, digits,
+ * ':', '/', '.'), or NULL for characters rendered as blanks. */
+const uint8_t *fsr_glyph(char c);
+
 /* Destroy GL programs and intermediate textures. Call before the renderer
  * is destroyed. */
 void fsr_uninit(void);

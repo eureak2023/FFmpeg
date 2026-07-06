@@ -58,6 +58,7 @@
 #include "cmdutils.h"
 #include "ffplay_renderer.h"
 #include "ffplay_fsr.h"
+#include "ffplay_ui.h"
 #include "opt_common.h"
 
 const char program_name[] = "ffplay";
@@ -1384,6 +1385,7 @@ static void do_exit(VideoState *is)
     if (is) {
         stream_close(is);
     }
+    ui_uninit();
     fsr_uninit();
     if (renderer)
         SDL_DestroyRenderer(renderer);
@@ -1484,6 +1486,20 @@ static void fps_tick(void)
     }
 }
 
+static double get_master_clock(VideoState *is);
+
+/* Draw the on-screen controls with the current position/duration. */
+static void ui_draw_overlay(VideoState *is)
+{
+    double pos = get_master_clock(is);
+    double dur = is->ic && is->ic->duration != AV_NOPTS_VALUE ?
+                 is->ic->duration / (double)AV_TIME_BASE : 0.0;
+
+    if (isnan(pos))
+        pos = 0.0;
+    ui_draw(renderer, is->width, is->height, pos, dur, is->paused);
+}
+
 /* display the current picture, if any */
 static void video_display(VideoState *is)
 {
@@ -1496,6 +1512,7 @@ static void video_display(VideoState *is)
         video_audio_display(is);
     else if (is->video_st)
         video_image_display(is);
+    ui_draw_overlay(is);
     fsr_toast_draw(renderer);
     fsr_hud_draw(renderer);
     SDL_RenderPresent(renderer);
@@ -1754,6 +1771,7 @@ static void video_fg_display(VideoState *is, double phase)
             vp->pts >= sp->pts + ((float)sp->sub.start_display_time / 1000))
             SDL_RenderCopy(renderer, is->sub_texture, NULL, rect);
     }
+    ui_draw_overlay(is);
     fsr_toast_draw(renderer);
     fsr_hud_draw(renderer);
     SDL_RenderPresent(renderer);
@@ -1767,6 +1785,9 @@ static void video_refresh(void *opaque, double *remaining_time)
     double time;
 
     Frame *sp, *sp2;
+
+    if (ui_wants_refresh())
+        is->force_refresh = 1;
 
     if (!is->paused && get_master_sync_type(is) == AV_SYNC_EXTERNAL_CLOCK && is->realtime)
         check_external_clock_speed(is);
@@ -3718,6 +3739,65 @@ static void seek_chapter(VideoState *is, int incr)
 }
 
 /* handle an event sent by the GUI */
+/* Seek to a 0..1 fraction of the input (same math as right-click seek). */
+static void stream_seek_frac(VideoState *is, double frac)
+{
+    if (seek_by_bytes || is->ic->duration <= 0) {
+        uint64_t size = avio_size(is->ic->pb);
+
+        stream_seek(is, size * frac, 0, 1);
+    } else {
+        int64_t ts = frac * is->ic->duration;
+
+        if (is->ic->start_time != AV_NOPTS_VALUE)
+            ts += is->ic->start_time;
+        stream_seek(is, ts, 0, 0);
+    }
+}
+
+/* Route mouse events through the on-screen controls; returns nonzero when
+ * the event was consumed (default handling must be skipped). */
+static int handle_ui_event(VideoState *cur_stream, const SDL_Event *event)
+{
+    double seek_frac = 0.0;
+    int act;
+
+    if (event->type != SDL_MOUSEMOTION &&
+        event->type != SDL_MOUSEBUTTONDOWN &&
+        event->type != SDL_MOUSEBUTTONUP)
+        return 0;
+    act = ui_handle_event(event, cur_stream->width, cur_stream->height,
+                          &seek_frac);
+    switch (act) {
+    case UI_ACT_TOGGLE_PAUSE:
+        toggle_pause(cur_stream);
+        break;
+    case UI_ACT_STOP:
+        stream_seek_frac(cur_stream, 0.0);
+        if (!cur_stream->paused)
+            toggle_pause(cur_stream);
+        break;
+    case UI_ACT_SEEK_BACK:
+    case UI_ACT_SEEK_FWD: {
+        SDL_Event kev = { 0 };
+
+        kev.type = SDL_KEYDOWN;
+        kev.key.keysym.sym = act == UI_ACT_SEEK_BACK ? SDLK_LEFT : SDLK_RIGHT;
+        SDL_PushEvent(&kev);
+        break;
+    }
+    case UI_ACT_SEEK_FRAC:
+        stream_seek_frac(cur_stream, seek_frac);
+        break;
+    case UI_ACT_CONSUMED:
+        break;
+    default:
+        return 0;
+    }
+    cur_stream->force_refresh = 1;
+    return 1;
+}
+
 static void event_loop(VideoState *cur_stream)
 {
     SDL_Event event;
@@ -3726,6 +3806,8 @@ static void event_loop(VideoState *cur_stream)
     for (;;) {
         double x;
         refresh_loop_wait_event(cur_stream, &event);
+        if (handle_ui_event(cur_stream, &event))
+            continue;
         switch (event.type) {
         case SDL_KEYDOWN:
             if (exit_on_keydown || event.key.keysym.sym == SDLK_ESCAPE || event.key.keysym.sym == SDLK_q) {
@@ -4349,6 +4431,7 @@ int main(int argc, char **argv)
                 do_exit(NULL);
             }
             fsr_timer_init();
+            ui_init(renderer);
             if (fsr && fsr_init(renderer) < 0)
                 av_log(NULL, AV_LOG_WARNING,
                        "FSR: OpenGL pipeline unavailable, falling back to standard SDL rendering\n");

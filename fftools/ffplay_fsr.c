@@ -2109,6 +2109,7 @@ static const uint8_t *toast_glyph(char c)
         {0x3C,0x66,0x66,0x3E,0x06,0x66,0x3C,0x00},
     };
     static const uint8_t gDot[8] = {0x00,0x00,0x00,0x00,0x00,0x18,0x18,0x00};
+    static const uint8_t gColon[8] = {0x00,0x18,0x18,0x00,0x18,0x18,0x00,0x00};
 
     if (c >= '0' && c <= '9')
         return gDigits[c - '0'];
@@ -2126,8 +2127,15 @@ static const uint8_t *toast_glyph(char c)
     case 'V': return gV;
     case '/': return gSl;
     case '.': return gDot;
+    case ':': return gColon;
     default:  return NULL; /* rendered as blank */
     }
+}
+
+/* Public alias so other UI modules can reuse the pixel font. */
+const uint8_t *fsr_glyph(char c)
+{
+    return toast_glyph(c);
 }
 
 /* Compose text (up to 6 lines, '\n'-separated) into a pixel-font texture.
