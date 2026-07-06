@@ -166,7 +166,7 @@ static int element_at(int x, int y)
     int bar_top  = ui.win_h - BAR_H;
     int seek_top = bar_top - SEEK_H;
 
-    if (y < TITLE_H) {
+    if (y < TITLE_H && !ui_fullscreen()) {
         int from_right = (ui.win_w - x) / WBTN_W;
 
         switch (from_right) {
@@ -484,7 +484,9 @@ void ui_draw(SDL_Renderer *renderer, int win_w, int win_h,
                   3 * BTN_W + BTN_W / 2 + 4.f, (float)cy, c);
     fill(renderer, 3 * BTN_W + BTN_W / 2 + 6, cy - 8, 3, 16, c.r, c.g, c.b, 255);
 
-    /* ---- title bar ---- */
+    /* ---- title bar (hidden in fullscreen: video only + bottom controls) */
+    if (ui_fullscreen())
+        goto controls;
     fill(renderer, 0, 0, win_w, TITLE_H, 14, 14, 14, 235);
     if (!ui.title_tex && ui.title[0])
         ui.title_tex = render_text(renderer, ui.title, &ui.title_w, &ui.title_h);
@@ -529,6 +531,7 @@ void ui_draw(SDL_Renderer *renderer, int win_w, int win_h,
         fill(renderer, bx - 6, ty, 13, 2, c.r, c.g, c.b, 255);
     }
 
+controls:
     /* separator + time text "cur / total" */
     fill(renderer, 4 * BTN_W + 6, bar_top + 10, 1, BAR_H - 20, 70, 70, 70, 255);
     {
