@@ -317,11 +317,18 @@ void ui_sub_draw(SDL_Renderer *renderer, int win_w, int win_h, double now)
         return;
     text[0] = 0;
     SDL_LockMutex(subs.lock);
-    for (int i = 0; i < subs.n; i++)
-        if (now >= subs.ev[i].start && now < subs.ev[i].end) {
-            snprintf(text, sizeof(text), "%s", subs.ev[i].text);
-            break;
-        }
+    {
+        /* Latest-starting active cue wins: cues with an open/huge end time
+         * (common in SAMI) are superseded by the next one. */
+        double best = -1.0;
+
+        for (int i = 0; i < subs.n; i++)
+            if (now >= subs.ev[i].start && now < subs.ev[i].end &&
+                subs.ev[i].start > best) {
+                best = subs.ev[i].start;
+                snprintf(text, sizeof(text), "%s", subs.ev[i].text);
+            }
+    }
     SDL_UnlockMutex(subs.lock);
 
     px = win_h / 16;

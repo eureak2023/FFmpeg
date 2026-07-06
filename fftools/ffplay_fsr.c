@@ -114,8 +114,19 @@ void fsr_detach_console(void)
 #ifdef _WIN32
     DWORD pids[2];
 
-    if (GetConsoleProcessList(pids, 2) == 1)
+    if (GetConsoleProcessList(pids, 2) == 1) {
+        char logpath[MAX_PATH + 16];
+        DWORD n;
+
         FreeConsole();
+        /* No console to report to: keep a log next to %TEMP% instead so
+         * double-click launches are still diagnosable. */
+        n = GetTempPathA(sizeof(logpath) - 12, logpath);
+        if (n > 0) {
+            snprintf(logpath + n, sizeof(logpath) - n, "ffplay.log");
+            freopen(logpath, "w", stderr);
+        }
+    }
 #endif
 }
 

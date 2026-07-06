@@ -4775,6 +4775,9 @@ int main(int argc, char **argv)
     /* started without a file: empty window until one is opened/dropped */
     if (!input_filename)
         input_filename = wait_for_input_file();
+    else if (window)
+        SDL_ShowWindow(window); /* immediate feedback for double-click
+                                   launches; sized properly on first frame */
 
     is = stream_open(input_filename, file_iformat);
     if (!is) {
