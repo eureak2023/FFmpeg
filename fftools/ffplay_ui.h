@@ -44,6 +44,7 @@ enum {
     UI_ACT_MAXIMIZE,      /* toggle maximize/restore */
     UI_ACT_CLOSE,
     UI_ACT_SET_VOLUME,    /* set volume to *seek_frac (0..1) */
+    UI_ACT_OPEN,          /* open-file button pressed */
 };
 
 void ui_init(SDL_Renderer *renderer);
@@ -72,6 +73,14 @@ void ui_set_badges(const char *hw, const char *vcodec,
 
 /* Chapter start positions as 0..1 fractions of the duration. */
 void ui_set_chapters(const double *fracs, int n);
+
+/* Keep the overlay visible (counts as user activity); used by the
+ * idle "no file loaded" screen. */
+void ui_ping(void);
+
+/* Native "open media file" dialog (blocks). Returns an av_strdup'ed
+ * UTF-8 path, or NULL if cancelled/unavailable. */
+char *ui_open_file_dialog(void);
 
 /* Returns 1 once whenever visibility or hover changed since the last draw,
  * so a paused player knows to redraw. Poll from the refresh loop. */

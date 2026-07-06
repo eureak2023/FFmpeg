@@ -3800,8 +3800,83 @@ static void stream_seek_frac(VideoState *is, double frac)
     }
 }
 
+/* Close the current stream (if any) and start playing filename. */
+static VideoState *switch_input(VideoState *old, char *filename)
+{
+    VideoState *new_is;
+
+    if (old)
+        stream_close(old);
+    input_filename = filename;
+    ui_set_window(window, filename);
+    new_is = stream_open(filename, NULL);
+    if (!new_is) {
+        av_log(NULL, AV_LOG_FATAL, "Failed to initialize VideoState!\n");
+        do_exit(NULL);
+    }
+    return new_is;
+}
+
+/* Idle screen shown when ffplay starts without a file: an empty window
+ * with the controls, waiting for a drop or the open button. Returns the
+ * chosen file (av_strdup'ed); exits on quit. */
+static char *wait_for_input_file(void)
+{
+    SDL_ShowWindow(window);
+    for (;;) {
+        SDL_Event ev;
+        int w, h;
+        double frac = 0.0;
+
+        SDL_GetWindowSize(window, &w, &h);
+        while (SDL_PollEvent(&ev)) {
+            switch (ui_handle_event(&ev, w, h, &frac)) {
+            case UI_ACT_CLOSE:
+                do_exit(NULL);
+                break;
+            case UI_ACT_MINIMIZE:
+                SDL_MinimizeWindow(window);
+                break;
+            case UI_ACT_MAXIMIZE:
+                if (SDL_GetWindowFlags(window) & SDL_WINDOW_MAXIMIZED)
+                    SDL_RestoreWindow(window);
+                else
+                    SDL_MaximizeWindow(window);
+                break;
+            case UI_ACT_OPEN: {
+                char *f = ui_open_file_dialog();
+
+                if (f)
+                    return f;
+                break;
+            }
+            }
+            if (ev.type == SDL_QUIT ||
+                (ev.type == SDL_KEYDOWN && (ev.key.keysym.sym == SDLK_ESCAPE ||
+                                            ev.key.keysym.sym == SDLK_q)))
+                do_exit(NULL);
+            if (ev.type == SDL_DROPFILE) {
+                char *f = av_strdup(ev.drop.file);
+
+                SDL_free(ev.drop.file);
+                if (f)
+                    return f;
+            }
+        }
+        ui_ping(); /* keep the controls visible on the empty window */
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        SDL_RenderClear(renderer);
+        ui_draw(renderer, w, h, 0, 0, 1, startup_volume / 100.0);
+        fsr_toast_draw(renderer);
+        SDL_RenderPresent(renderer);
+        SDL_Delay(33);
+    }
+    return NULL;
+}
+
 /* Route mouse events through the on-screen controls; returns nonzero when
- * the event was consumed (default handling must be skipped). */
+ * the event was consumed (default handling must be skipped), 2 when the
+ * open-file dialog was requested. */
 static int handle_ui_event(VideoState *cur_stream, const SDL_Event *event)
 {
     double seek_frac = 0.0;
@@ -3851,6 +3926,8 @@ static int handle_ui_event(VideoState *cur_stream, const SDL_Event *event)
         cur_stream->audio_volume = av_clip((int)lrint(seek_frac * SDL_MIX_MAXVOLUME),
                                            0, SDL_MIX_MAXVOLUME);
         break;
+    case UI_ACT_OPEN:
+        return 2; /* caller runs the dialog and switches the input */
     case UI_ACT_CONSUMED:
         break;
     default:
@@ -3868,8 +3945,17 @@ static void event_loop(VideoState *cur_stream)
     for (;;) {
         double x;
         refresh_loop_wait_event(cur_stream, &event);
-        if (handle_ui_event(cur_stream, &event))
+        switch (handle_ui_event(cur_stream, &event)) {
+        case 2: { /* open-file dialog */
+            char *f = ui_open_file_dialog();
+
+            if (f)
+                cur_stream = switch_input(cur_stream, f);
             continue;
+        }
+        case 1:
+            continue;
+        }
         switch (event.type) {
         case SDL_KEYDOWN:
             if (exit_on_keydown || event.key.keysym.sym == SDLK_ESCAPE || event.key.keysym.sym == SDLK_q) {
@@ -4068,6 +4154,14 @@ static void event_loop(VideoState *cur_stream)
                 break;
             }
             break;
+        case SDL_DROPFILE: {
+            char *f = av_strdup(event.drop.file);
+
+            SDL_free(event.drop.file);
+            if (f)
+                cur_stream = switch_input(cur_stream, f);
+            break;
+        }
         case SDL_MOUSEWHEEL:
             if (event.wheel.y) {
                 char toast[12];
@@ -4418,7 +4512,7 @@ int main(int argc, char **argv)
         exit(1);
     }
 
-    if (!input_filename) {
+    if (!input_filename && display_disable) {
         show_usage();
         av_log(NULL, AV_LOG_FATAL, "An input file must be specified\n");
         av_log(NULL, AV_LOG_FATAL,
@@ -4540,6 +4634,12 @@ int main(int argc, char **argv)
      * and the vulkan renderer keep their own configuration. */
     if (!hwaccel && !enable_vulkan)
         hwaccel = "d3d11va";
+
+    SDL_EventState(SDL_DROPFILE, SDL_ENABLE);
+
+    /* started without a file: empty window until one is opened/dropped */
+    if (!input_filename)
+        input_filename = wait_for_input_file();
 
     is = stream_open(input_filename, file_iformat);
     if (!is) {

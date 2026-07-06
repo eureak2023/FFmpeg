@@ -28,8 +28,11 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <commdlg.h>
+#include <SDL_syswm.h>
 #endif
 
+#include "libavutil/mem.h"
 #include "libavutil/time.h"
 
 #include "ffplay_fsr.h"
@@ -54,6 +57,7 @@ enum {
     EL_STOP,
     EL_BACK,
     EL_FWD,
+    EL_OPEN,       /* open file */
     EL_BAR,        /* control bar background (dead area) */
     EL_TITLE,      /* title bar drag area */
     EL_MIN,
@@ -239,7 +243,60 @@ void ui_set_window(SDL_Window *win, const char *title)
         if (*p == '/' || *p == '\\')
             base = p + 1;
     snprintf(ui.title, sizeof(ui.title), "%s", base);
+    if (ui.title_tex) { /* re-render on the next draw (file switched) */
+        SDL_DestroyTexture(ui.title_tex);
+        ui.title_tex = NULL;
+    }
+    for (int i = 0; i < NBADGE; i++)
+        ui.badge_str[i][0] = 0;
+    ui.badges_dirty = 1;
+    ui.nb_chapters  = 0;
     SDL_SetWindowHitTest(win, hit_test, NULL);
+}
+
+void ui_ping(void)
+{
+    ui.last_activity = av_gettime_relative();
+}
+
+/* Native "open file" dialog; returns an av_strdup'ed UTF-8 path or NULL. */
+char *ui_open_file_dialog(void)
+{
+#ifdef _WIN32
+    typedef BOOL (WINAPI *gofn_fn)(LPOPENFILENAMEW);
+    static const wchar_t filter[] =
+        L"Media files\0*.mp4;*.mkv;*.avi;*.webm;*.mov;*.ts;*.m2ts;*.wmv;"
+        L"*.flv;*.mpg;*.vob;*.mp3;*.flac;*.aac;*.m4a;*.wav;*.ogg\0"
+        L"All files\0*.*\0";
+    HMODULE dlg = LoadLibraryA("comdlg32.dll");
+    gofn_fn gofn;
+    OPENFILENAMEW ofn = { 0 };
+    wchar_t path[MAX_PATH] = L"";
+    char utf8[MAX_PATH * 3];
+    SDL_SysWMinfo wm;
+
+    if (!dlg)
+        return NULL;
+    gofn = (gofn_fn)GetProcAddress(dlg, "GetOpenFileNameW");
+    if (!gofn)
+        return NULL;
+    ofn.lStructSize = sizeof(ofn);
+    SDL_VERSION(&wm.version);
+    if (ui.window && SDL_GetWindowWMInfo(ui.window, &wm))
+        ofn.hwndOwner = wm.info.win.window;
+    ofn.lpstrFile   = path;
+    ofn.nMaxFile    = MAX_PATH;
+    ofn.lpstrFilter = filter;
+    ofn.Flags       = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
+    if (!gofn(&ofn))
+        return NULL;
+    if (!WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, sizeof(utf8),
+                             NULL, NULL))
+        return NULL;
+    return av_strdup(utf8);
+#else
+    return NULL;
+#endif
 }
 
 void ui_set_badges(const char *hw, const char *vcodec,
@@ -315,6 +372,7 @@ static int element_at(int x, int y)
         case 1:  return EL_STOP;
         case 2:  return EL_BACK;
         case 3:  return EL_FWD;
+        case 4:  return EL_OPEN;
         default: return EL_BAR;
         }
     }
@@ -433,6 +491,7 @@ int ui_handle_event(const SDL_Event *event, int win_w, int win_h,
         case EL_STOP:  return UI_ACT_STOP;
         case EL_BACK:  return UI_ACT_SEEK_BACK;
         case EL_FWD:   return UI_ACT_SEEK_FWD;
+        case EL_OPEN:  return UI_ACT_OPEN;
         case EL_BAR:   return UI_ACT_CONSUMED;
         case EL_MIN:   return UI_ACT_MINIMIZE;
         case EL_MAX:   return UI_ACT_MAXIMIZE;
@@ -663,6 +722,13 @@ void ui_draw(SDL_Renderer *renderer, int win_w, int win_h,
                   3 * BTN_W + BTN_W / 2 + 4.f, (float)cy, c);
     fill(renderer, 3 * BTN_W + BTN_W / 2 + 6, cy - 8, 3, 16, c.r, c.g, c.b, 255);
 
+    /* open file: eject-style triangle over a bar */
+    c = icon_color(EL_OPEN);
+    tri(renderer, 4 * BTN_W + BTN_W / 2 - 9.f, cy + 2.f,
+                  4 * BTN_W + BTN_W / 2 + 9.f, cy + 2.f,
+                  4 * BTN_W + BTN_W / 2, cy - 9.f, c);
+    fill(renderer, 4 * BTN_W + BTN_W / 2 - 9, cy + 6, 19, 3, c.r, c.g, c.b, 255);
+
     /* ---- title bar (hidden in fullscreen: video only + bottom controls) */
     if (ui_fullscreen())
         goto controls;
@@ -721,7 +787,7 @@ void ui_draw(SDL_Renderer *renderer, int win_w, int win_h,
 
 controls:
     /* separator + time text "cur / total" */
-    fill(renderer, 4 * BTN_W + 6, bar_top + 10, 1, BAR_H - 20, 70, 70, 70, 255);
+    fill(renderer, 5 * BTN_W + 6, bar_top + 10, 1, BAR_H - 20, 70, 70, 70, 255);
     {
         int ps = pos < 0 || isnan(pos) ? 0 : (int)pos;
         int ts = dur < 0 ? 0 : (int)dur;
@@ -732,7 +798,7 @@ controls:
     }
     text_update(renderer, buf);
     if (ui.text_tex) {
-        SDL_Rect dst = { 4 * BTN_W + 18, cy - ui.text_h,
+        SDL_Rect dst = { 5 * BTN_W + 18, cy - ui.text_h,
                          ui.text_w * 2, ui.text_h * 2 };
 
         SDL_RenderCopy(renderer, ui.text_tex, NULL, &dst);
