@@ -4791,9 +4791,18 @@ int main(int argc, char **argv)
     /* started without a file: empty window until one is opened/dropped */
     if (!input_filename)
         input_filename = wait_for_input_file();
-    else if (window)
-        SDL_ShowWindow(window); /* immediate feedback for double-click
-                                   launches; sized properly on first frame */
+    else if (window && renderer) {
+        /* Immediate feedback for double-click launches: show the window
+         * and paint it black right away (an unpainted window flashes its
+         * outline/leftover pixels); it is resized on the first frame. */
+        SDL_ShowWindow(window);
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        SDL_RenderClear(renderer);
+        SDL_RenderPresent(renderer);
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        SDL_RenderClear(renderer);
+        SDL_RenderPresent(renderer); /* both buffers of the swap chain */
+    }
 
     is = stream_open(input_filename, file_iformat);
     if (!is) {
