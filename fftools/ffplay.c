@@ -1380,8 +1380,65 @@ static void stream_close(VideoState *is)
     av_free(is);
 }
 
+/* ---- persisted settings: last (non-maximized) window size and volume */
+static int last_normal_w, last_normal_h; /* latest windowed (not maximized/
+                                            fullscreen) client size */
+
+static char *settings_path(char *buf, size_t n)
+{
+    const char *base = getenv("APPDATA");
+
+    if (!base)
+        return NULL;
+    snprintf(buf, n, "%s\\ffplay.ini", base);
+    return buf;
+}
+
+static void load_settings(void)
+{
+    char path[1024], line[128];
+    FILE *f;
+
+    if (!settings_path(path, sizeof(path)) || !(f = fopen(path, "r")))
+        return;
+    while (fgets(line, sizeof(line), f)) {
+        int v;
+
+        if (sscanf(line, "width=%d", &v) == 1 && v >= 160 && v <= 7680)
+            default_width = screen_width = last_normal_w = v;
+        else if (sscanf(line, "height=%d", &v) == 1 && v >= 90 && v <= 4320)
+            default_height = screen_height = last_normal_h = v;
+        else if (sscanf(line, "volume=%d", &v) == 1 && v >= 0 && v <= 100)
+            startup_volume = v;
+    }
+    fclose(f);
+}
+
+static void save_settings(VideoState *is)
+{
+    char path[1024];
+    FILE *f;
+    int w = last_normal_w, h = last_normal_h;
+    int vol = is ? (int)lrint(is->audio_volume * 100.0 / SDL_MIX_MAXVOLUME)
+                 : startup_volume;
+
+    if (!settings_path(path, sizeof(path)))
+        return;
+    if (window && !(SDL_GetWindowFlags(window) &
+                    (SDL_WINDOW_MAXIMIZED | SDL_WINDOW_FULLSCREEN |
+                     SDL_WINDOW_MINIMIZED)))
+        SDL_GetWindowSize(window, &w, &h);
+    if (!(f = fopen(path, "w")))
+        return;
+    if (w > 0 && h > 0)
+        fprintf(f, "width=%d\nheight=%d\n", w, h);
+    fprintf(f, "volume=%d\n", av_clip(vol, 0, 100));
+    fclose(f);
+}
+
 static void do_exit(VideoState *is)
 {
+    save_settings(is);
     if (is) {
         stream_close(is);
     }
@@ -4407,6 +4464,11 @@ static void event_loop(VideoState *cur_stream)
                 case SDL_WINDOWEVENT_SIZE_CHANGED:
                     screen_width  = cur_stream->width  = event.window.data1;
                     screen_height = cur_stream->height = event.window.data2;
+                    if (!(SDL_GetWindowFlags(window) &
+                          (SDL_WINDOW_MAXIMIZED | SDL_WINDOW_FULLSCREEN))) {
+                        last_normal_w = event.window.data1;
+                        last_normal_h = event.window.data2;
+                    }
                     if (cur_stream->vis_texture) {
                         SDL_DestroyTexture(cur_stream->vis_texture);
                         cur_stream->vis_texture = NULL;
@@ -4652,6 +4714,7 @@ int main(int argc, char **argv)
 
     av_log_set_flags(AV_LOG_SKIP_REPEATED);
     parse_loglevel(argc, argv, options);
+    load_settings(); /* remembered window size/volume; CLI options override */
 
     /* register all codecs, demux and protocols */
 #if CONFIG_AVDEVICE
