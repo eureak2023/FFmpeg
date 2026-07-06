@@ -1451,6 +1451,7 @@ static int video_open(VideoState *is)
 
 static int    hud_src_w, hud_src_h;   /* source video dimensions */
 static double hud_src_fps;            /* source frame rate */
+static int    hud_hw;                 /* hardware decoding in use */
 
 /* Refresh the TAB-toggled status overlay: source resolution, source ->
  * presented frame rate (incl. generated frames) and the current
@@ -1473,12 +1474,15 @@ static void status_hud_update(int fps)
                       (int)lrint(hud_src_fps), last_fps);
     else
         n += snprintf(buf + n, sizeof(buf) - n, "%d FPS\n", last_fps);
+    /* show FG's effective state for this file: it only runs on the
+     * hardware zero-copy path and for sub-50fps sources */
     snprintf(buf + n, sizeof(buf) - n,
              "FSR %s\nSHARP %d\nNR %s\nFG %s",
              fsr ? "ON" : "OFF",
              (int)lrint((2.0f - fsr_sharpness) / 2.0f * 100.0f),
              fsr_denoise ? "ON" : "OFF",
-             fsr_fg ? "ON" : "OFF");
+             fsr_fg && hud_hw && (hud_src_fps <= 0 || hud_src_fps < 50.0)
+                 ? "ON" : "OFF");
     fsr_hud_set(renderer, buf);
 }
 
@@ -3288,6 +3292,7 @@ static int stream_component_open(VideoState *is, int stream_index)
             hud_src_w   = avctx->width;
             hud_src_h   = avctx->height;
             hud_src_fps = fr.num && fr.den ? av_q2d(fr) : 0.0;
+            hud_hw      = !!avctx->hw_device_ctx;
             if (fsr_fg && hud_src_fps >= 50.0)
                 av_log(NULL, AV_LOG_INFO,
                        "FG: %.0f fps source, frame generation not needed\n",
