@@ -1195,20 +1195,34 @@ static const char *fg_src =
     "uniform isampler2D flowBwd;\n" /* cur->prev */
     "uniform float phase;\n"        /* interpolation position, 0=prev 1=cur */
     "out vec4 fragColor;\n"
+    /* Bilinearly sample the 4x4-grid flow field (integer texture, so the
+     * filtering is done by hand); smooths out block-shaped artifacts. */
+    "vec2 sampleFlow(isampler2D t, vec2 pg) {\n"
+    "    vec2 fs = vec2(textureSize(t, 0));\n"
+    "    vec2 g  = clamp(pg - 0.5, vec2(0.0), fs - 1.0);\n"
+    "    ivec2 g0 = ivec2(floor(g));\n"
+    "    ivec2 g1 = min(g0 + 1, ivec2(fs) - 1);\n"
+    "    vec2 f = g - vec2(g0);\n"
+    "    vec2 a = vec2(texelFetch(t, g0, 0).xy);\n"
+    "    vec2 b = vec2(texelFetch(t, ivec2(g1.x, g0.y), 0).xy);\n"
+    "    vec2 c = vec2(texelFetch(t, ivec2(g0.x, g1.y), 0).xy);\n"
+    "    vec2 d = vec2(texelFetch(t, g1, 0).xy);\n"
+    "    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y) / 32.0;\n"
+    "}\n"
     "void main() {\n"
-    "    ivec2 p  = ivec2(gl_FragCoord.xy);\n"
-    "    ivec2 fs = textureSize(flowFwd, 0);\n"
-    "    ivec2 gp = clamp(p / 4, ivec2(0), fs - 1);\n"
-    "    vec2 ts  = vec2(textureSize(curTex, 0));\n"
-    "    vec2 uv  = gl_FragCoord.xy / ts;\n"
-    "    vec2 F = vec2(texelFetch(flowFwd, gp, 0).xy) / 32.0;\n"
-    "    vec2 B = vec2(texelFetch(flowBwd, gp, 0).xy) / 32.0;\n"
+    "    vec2 ts = vec2(textureSize(curTex, 0));\n"
+    "    vec2 uv = gl_FragCoord.xy / ts;\n"
+    "    vec2 pg = gl_FragCoord.xy / 4.0;\n"
+    "    vec2 F = sampleFlow(flowFwd, pg);\n"
+    "    vec2 B = sampleFlow(flowBwd, pg);\n"
     "    vec3 cPrev = texture(prevTex, uv - phase * F / ts).rgb;\n"
     "    vec3 cCur  = texture(curTex,  uv - (1.0 - phase) * B / ts).rgb;\n"
-    /* Where forward/backward flow disagree (occlusions, flow errors) fall
-     * back to the unwarped temporally-nearer frame instead of ghosting. */
+    /* Confidence from forward/backward consistency, relative to the motion
+     * magnitude; where flow disagrees (occlusions, errors) fall back to the
+     * unwarped temporally-nearer frame instead of ghosting. */
     "    float err = length(F + B);\n"
-    "    float w = clamp(1.0 - err / 8.0, 0.0, 1.0);\n"
+    "    float mag = length(F) + length(B);\n"
+    "    float w = clamp(1.0 - err / (3.0 + 0.25 * mag), 0.0, 1.0);\n"
     "    vec3 fallback = phase < 0.5 ? texture(prevTex, uv).rgb\n"
     "                                : texture(curTex, uv).rgb;\n"
     "    vec3 mid = mix(fallback, mix(cPrev, cCur, phase), w);\n"
@@ -1432,7 +1446,7 @@ static int fg_init_body(void)
     ip.height      = fg.h;
     ip.outGridSize = NV_OF_OUTPUT_VECTOR_GRID_SIZE_4;
     ip.mode        = NV_OF_MODE_OPTICALFLOW;
-    ip.perfLevel   = NV_OF_PERF_LEVEL_MEDIUM;
+    ip.perfLevel   = NV_OF_PERF_LEVEL_SLOW;
     if (fg.of.nvOFInit(fg.hof, &ip) != NV_OF_SUCCESS) {
         last_err_sz = sizeof(last_err);
         last_err[0] = 0;
