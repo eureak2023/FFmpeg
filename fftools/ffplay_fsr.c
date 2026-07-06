@@ -38,6 +38,7 @@
 #if CONFIG_D3D11VA
 #define COBJMACROS
 #include <d3d11.h>
+#include <d3d11_1.h>
 #include <dxgi.h>
 #include "libavutil/frame.h"
 #include "libavutil/hwcontext.h"
@@ -778,6 +779,8 @@ static struct {
     ID3D11DeviceContext *dcontext;
     ID3D11VideoDevice *vdevice;
     ID3D11VideoContext *vcontext;
+    ID3D11VideoContext1 *vcontext1; /* for DXGI color spaces (HDR input) */
+    int cs_dxgi;                    /* DXGI input color space currently set */
     void (*lock)(void *ctx);
     void (*unlock)(void *ctx);
     void *lock_ctx;
@@ -809,6 +812,8 @@ static const GUID iid_IDXGIFactory =
     { 0x7b7166ec, 0x21c7, 0x44ae, { 0xb2, 0x1a, 0xc9, 0xae, 0x32, 0x1a, 0xe3, 0x69 } };
 static const GUID iid_IDXGIDevice =
     { 0x54ec77fa, 0x1377, 0x44e6, { 0x8c, 0x32, 0x88, 0xfd, 0x5f, 0x44, 0xc8, 0x4c } };
+static const GUID iid_ID3D11VideoContext1 =
+    { 0xa7f026da, 0xa5f8, 0x4487, { 0xa5, 0x64, 0x15, 0xe3, 0x43, 0x57, 0x65, 0x1e } };
 
 /* ASCII-fold a DXGI adapter description for matching against GL_RENDERER. */
 static void adapter_desc_to_ascii(const WCHAR *src, char *dst, size_t dst_size)
@@ -957,6 +962,12 @@ static void hwgl_destroy(void)
     hwgl.dcontext = NULL;
     hwgl.vdevice  = NULL;
     hwgl.vcontext = NULL;
+    if (hwgl.vcontext1) {
+        if (!hwgl_exiting)
+            ID3D11VideoContext1_Release(hwgl.vcontext1);
+        hwgl.vcontext1 = NULL;
+    }
+    hwgl.cs_dxgi = -1;
     av_buffer_unref(&hwgl.device_ref);
     if (hwgl.state == 1)
         hwgl.state = 0;
@@ -1028,6 +1039,13 @@ static int hwgl_init(AVFrame *frame)
     hwgl.lock     = d3d->lock;
     hwgl.unlock   = d3d->unlock;
     hwgl.lock_ctx = d3d->lock_ctx;
+    /* DXGI color spaces (BT.2020/PQ aware, Win10+); NULL falls back to the
+     * legacy matrix-only API */
+    hwgl.cs_dxgi = -1;
+    if (FAILED(ID3D11VideoContext_QueryInterface(hwgl.vcontext,
+                                                 &iid_ID3D11VideoContext1,
+                                                 (void **)&hwgl.vcontext1)))
+        hwgl.vcontext1 = NULL;
     return 0;
 }
 
@@ -1146,6 +1164,44 @@ static int hwgl_convert(AVFrame *frame, int slot)
     int matrix, range;
     HRESULT hr;
 
+    if (hwgl.vcontext1) {
+        /* Full DXGI color spaces: BT.2020 + PQ/HLG inputs get tone-mapped
+         * to SDR BT.709 by the video processor (washed-out HDR fix). */
+        int full = frame->color_range == AVCOL_RANGE_JPEG;
+        int cs;
+
+        if (frame->color_trc == AVCOL_TRC_SMPTE2084)
+            cs = DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020;
+        else if (frame->color_trc == AVCOL_TRC_ARIB_STD_B67)
+            cs = DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020;
+        else if (frame->colorspace == AVCOL_SPC_BT2020_NCL)
+            cs = full ? DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P2020
+                      : DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P2020;
+        else if (frame->colorspace == AVCOL_SPC_BT709 ||
+                 (frame->colorspace == AVCOL_SPC_UNSPECIFIED && frame->height >= 720))
+            cs = full ? DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709
+                      : DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P709;
+        else
+            cs = full ? DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P601
+                      : DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P601;
+        if (cs != hwgl.cs_dxgi) {
+            if (hwgl.lock)
+                hwgl.lock(hwgl.lock_ctx);
+            ID3D11VideoContext1_VideoProcessorSetStreamColorSpace1(hwgl.vcontext1,
+                hwgl.vp, 0, cs);
+            ID3D11VideoContext1_VideoProcessorSetOutputColorSpace1(hwgl.vcontext1,
+                hwgl.vp, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+            if (hwgl.unlock)
+                hwgl.unlock(hwgl.lock_ctx);
+            hwgl.cs_dxgi = cs;
+            if (frame->color_trc == AVCOL_TRC_SMPTE2084 ||
+                frame->color_trc == AVCOL_TRC_ARIB_STD_B67)
+                av_log(NULL, AV_LOG_INFO,
+                       "FSR: HDR input, tone mapping to SDR via the video processor\n");
+        }
+        goto colorspace_done;
+    }
+
     matrix = frame->colorspace == AVCOL_SPC_BT709 ||
              (frame->colorspace == AVCOL_SPC_UNSPECIFIED && frame->height >= 720) ? 1 : 0;
     range  = frame->color_range == AVCOL_RANGE_JPEG
@@ -1166,6 +1222,7 @@ static int hwgl_convert(AVFrame *frame, int slot)
         hwgl.cs_matrix = matrix;
         hwgl.cs_range  = range;
     }
+colorspace_done:
 
     idesc.FourCC               = 0;
     idesc.ViewDimension        = D3D11_VPIV_DIMENSION_TEXTURE2D;
