@@ -2019,9 +2019,12 @@ static int fg_compute_flow_body(int sp, int sn)
         if (n) {
             double mag = sum_mag / n, err = sum_err / n;
 
-            /* inconsistency is the real tear signal; consistent motion
-             * (smooth pans) stays interpolated up to a generous bound */
-            fg.pair_skip = err > 8.0 || mag > 80.0;
+            /* Inconsistency is the tear signal; consistent motion (smooth
+             * pans) stays interpolated up to a generous bound. Hand-held
+             * footage sits around 10-14 px of inconsistency and still
+             * interpolates fine (the per-pixel fallback covers it), so
+             * only reject genuinely torn pairs. */
+            fg.pair_skip = err > 20.0 || mag > 80.0;
             if (fg.pair_skip)
                 av_log(NULL, AV_LOG_VERBOSE,
                        "FG: shaky pair skipped (flow %.1f px, inconsistency %.1f px)\n",
