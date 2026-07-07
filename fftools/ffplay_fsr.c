@@ -1585,7 +1585,9 @@ static const char *fg_src =
      * unwarped temporally-nearer frame instead of ghosting. */
     "    float err = length(F + B);\n"
     "    float mag = length(F) + length(B);\n"
-    "    float w = clamp(1.0 - err / (3.0 + 0.25 * mag), 0.0, 1.0);\n"
+    /* tolerance grows with motion but is capped: unlimited slack let large
+     * shaky motion pass garbage through (image tearing) */
+    "    float w = clamp(1.0 - err / (3.0 + 0.25 * min(mag, 32.0)), 0.0, 1.0);\n"
     "    vec3 fallback = phase < 0.5 ? texture(prevTex, uv).rgb\n"
     "                                : texture(curTex, uv).rgb;\n"
     "    vec3 mid = mix(fallback, mix(cPrev, cCur, phase), w);\n"
@@ -1604,6 +1606,8 @@ static struct {
     NvOFGPUBufferHandle in_buf[2];
     NvOFGPUBufferHandle flow_buf[2];      /* [0] = forward, [1] = backward */
     NV_OF_CUDA_BUFFER_STRIDE_INFO flow_stride[2];
+    int16_t *flow_host[2];   /* host copy (every 2nd row) for shake stats */
+    int pair_skip;           /* current pair too shaky to interpolate */
     /* CUDA-registered staging texture. The VideoProcessor writes with the
      * GPU video engine, which must never touch a CUDA-registered resource
      * (driver crash); a 3D-engine CopyResource feeds this one instead. */
@@ -1638,6 +1642,7 @@ static void fg_destroy(void)
                 fg.of.nvOFDestroyGPUBufferCuda(fg.in_buf[i]);
             if (fg.flow_buf[i])
                 fg.of.nvOFDestroyGPUBufferCuda(fg.flow_buf[i]);
+            av_freep(&fg.flow_host[i]);
         }
         if (fg.vp_res)
             fg.cu->cuGraphicsUnregisterResource(fg.vp_res);
@@ -1842,6 +1847,7 @@ static int fg_init_body(void)
                                           &fg.flow_buf[i]) != NV_OF_SUCCESS)
             return -1;
         fg.of.nvOFGPUBufferGetStrideInfo(fg.flow_buf[i], &fg.flow_stride[i]);
+        fg.flow_host[i] = av_malloc((size_t)fg.gw * 4 * (fg.gh / 2 + 1));
     }
 
     {
@@ -1972,6 +1978,57 @@ static int fg_compute_flow_body(int sp, int sn)
         fg.cu->cuMemcpy2D(&cp);
     }
     fg.cu->cuGraphicsUnmapResources(2, fg.flow_res, 0);
+
+    /* Shake detector: pull both flow fields to the host (every 2nd grid
+     * row) and measure the average motion magnitude and forward/backward
+     * inconsistency. Violent shake produces huge, inconsistent flow - the
+     * warp would tear the image apart, and interpolation buys nothing
+     * there anyway, so such pairs are flagged and skipped. */
+    fg.pair_skip = 0;
+    if (fg.flow_host[0] && fg.flow_host[1]) {
+        double sum_mag = 0, sum_err = 0;
+        int rows = fg.gh / 2, n = 0;
+
+        for (int i = 0; i < 2; i++) {
+            CUDA_MEMCPY2D cp = { 0 };
+
+            cp.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+            cp.srcDevice     = fg.of.nvOFGPUBufferGetCUdeviceptr(fg.flow_buf[i]);
+            cp.srcPitch      = fg.flow_stride[i].strideInfo[0].strideXInBytes * 2;
+            cp.dstMemoryType = CU_MEMORYTYPE_HOST;
+            cp.dstHost       = fg.flow_host[i];
+            cp.dstPitch      = (size_t)fg.gw * 4;
+            cp.WidthInBytes  = (size_t)fg.gw * 4;
+            cp.Height        = rows;
+            if (fg.cu->cuMemcpy2D(&cp) != CUDA_SUCCESS)
+                goto stats_done;
+        }
+        for (int y = 0; y < rows; y++) {
+            const int16_t *f = fg.flow_host[0] + (size_t)y * fg.gw * 2;
+            const int16_t *b = fg.flow_host[1] + (size_t)y * fg.gw * 2;
+
+            for (int x = 0; x < fg.gw * 2; x += 4) { /* every 2nd cell */
+                double fx = f[x] / 32.0, fy = f[x + 1] / 32.0;
+                double bx = b[x] / 32.0, by = b[x + 1] / 32.0;
+
+                sum_mag += fabs(fx) + fabs(fy);
+                sum_err += fabs(fx + bx) + fabs(fy + by);
+                n++;
+            }
+        }
+        if (n) {
+            double mag = sum_mag / n, err = sum_err / n;
+
+            /* inconsistency is the real tear signal; consistent motion
+             * (smooth pans) stays interpolated up to a generous bound */
+            fg.pair_skip = err > 8.0 || mag > 80.0;
+            if (fg.pair_skip)
+                av_log(NULL, AV_LOG_VERBOSE,
+                       "FG: shaky pair skipped (flow %.1f px, inconsistency %.1f px)\n",
+                       mag, err);
+        }
+    }
+stats_done:
     return 0;
 }
 
@@ -2121,6 +2178,9 @@ static int fg_prepare_pair(SDL_Renderer *renderer, AVFrame *prev, AVFrame *next,
         fg.pair_b    = next;
         fg.pair_bpts = next->pts;
     }
+
+    if (fg.pair_skip)
+        return -1; /* too shaky: show the real frames only */
 
     *out_sp = sp;
     *out_sn = sn;
