@@ -1837,41 +1837,44 @@ static void video_fg_display(VideoState *is, double phase)
     Frame *vp = frame_queue_peek_last(&is->pictq);
     Frame *nextvp = frame_queue_peek(&is->pictq);
     SDL_Rect *rect = &is->render_params.target_rect;
+    int drew = 0;
 
-    if (!is->width || vp->serial != nextvp->serial) {
-        av_log(NULL, AV_LOG_VERBOSE, "FG: skip (w=%d serial %d/%d)\n",
-               is->width, vp->serial, nextvp->serial);
+    /* Only the D3D11 zero-copy path can be interpolated; if this pair is not
+     * eligible, produce nothing (software content keeps its source rate). */
+    if (!is->width || vp->serial != nextvp->serial ||
+        vp->frame->format != AV_PIX_FMT_D3D11 ||
+        nextvp->frame->format != AV_PIX_FMT_D3D11)
         return;
-    }
-    if (vp->frame->format != AV_PIX_FMT_D3D11 ||
-        nextvp->frame->format != AV_PIX_FMT_D3D11) {
-        av_log(NULL, AV_LOG_VERBOSE, "FG: skip (formats %d/%d, want %d)\n",
-               vp->frame->format, nextvp->frame->format, AV_PIX_FMT_D3D11);
-        return;
-    }
+
     calculate_display_rect(rect, is->xleft, is->ytop, is->width, is->height,
                            vp->width, vp->height, vp->sar);
     SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
     SDL_RenderClear(renderer);
     draw_video_background(is);
-    if (!fsr_fg_draw(renderer, vp->frame, nextvp->frame, rect, fsr, fsr_sharpness,
-                     (float)phase))
-        return;
-    /* Re-composite the currently shown (bitmap) subtitle, if any; it was
-     * uploaded by the regular display path. */
-    if (is->subtitle_st && frame_queue_nb_remaining(&is->subpq) > 0) {
-        Frame *sp = frame_queue_peek(&is->subpq);
+    drew = fsr_fg_draw(renderer, vp->frame, nextvp->frame, rect, fsr,
+                       fsr_sharpness, (float)phase);
+    if (drew) {
+        /* Re-composite the currently shown (bitmap) subtitle, if any; it was
+         * uploaded by the regular display path. */
+        if (is->subtitle_st && frame_queue_nb_remaining(&is->subpq) > 0) {
+            Frame *sp = frame_queue_peek(&is->subpq);
 
-        if (sp->uploaded &&
-            vp->pts >= sp->pts + ((float)sp->sub.start_display_time / 1000))
-            SDL_RenderCopy(renderer, is->sub_texture, NULL, rect);
+            if (sp->uploaded &&
+                vp->pts >= sp->pts + ((float)sp->sub.start_display_time / 1000))
+                SDL_RenderCopy(renderer, is->sub_texture, NULL, rect);
+        }
+        av_log(NULL, AV_LOG_VERBOSE, "FG: interpolated frame presented\n");
+    } else {
+        /* Interpolation skipped for this pair (shake detector, etc.): repeat
+         * the current real frame so the output cadence stays fixed at the
+         * display rate instead of dropping to the source frame rate. */
+        video_image_display(is);
     }
     ui_draw_overlay(is);
     fsr_toast_draw(renderer);
     fsr_hud_draw(renderer);
     SDL_RenderPresent(renderer);
     fps_tick();
-    av_log(NULL, AV_LOG_VERBOSE, "FG: interpolated frame presented\n");
 }
 
 static void video_refresh(void *opaque, double *remaining_time)
@@ -1943,12 +1946,14 @@ retry:
                             is->fg_next += fg_refresh;
                         } else {
                             /* Pay the flow cost now, while waiting for the
-                             * slot; recheck the clock afterwards. */
+                             * slot. */
                             video_fg_prepare(is);
-                            time = av_gettime_relative() / 1000000.0;
-                            *remaining_time = FFMIN(FFMAX(is->fg_next - time, 0.0),
-                                                    *remaining_time);
                         }
+                        /* Sleep only until the next slot, not the whole
+                         * real-frame interval, so every 60fps slot fires. */
+                        time = av_gettime_relative() / 1000000.0;
+                        *remaining_time = FFMIN(FFMAX(is->fg_next - time, 0.0),
+                                                *remaining_time);
                     }
                 }
                 goto display;
