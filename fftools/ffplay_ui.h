@@ -84,9 +84,10 @@ char *ui_open_file_dialog(void);
 
 /* Right-click context menu. Shown asynchronously so playback keeps
  * running; the selection arrives as an SDL user event, decode it with
- * ui_menu_result() (returns -1 for unrelated events, 0 for dismissed). */
-enum { UI_MENU_OPEN = 1, UI_MENU_CLOSE = 2 };
-void ui_context_menu(void);
+ * ui_menu_result() (returns -1 for unrelated events, 0 for dismissed).
+ * The fsr/nr/fg flags set the checkmarks on the video-effects submenu. */
+enum { UI_MENU_OPEN = 1, UI_MENU_CLOSE, UI_MENU_FSR, UI_MENU_NR, UI_MENU_FG };
+void ui_context_menu(int fsr_on, int nr_on, int fg_on);
 int  ui_menu_result(const SDL_Event *event);
 
 /* Text subtitles (SRT/SMI/ASS), rendered bottom-center with the system

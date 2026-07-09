@@ -33,6 +33,7 @@
 #endif
 
 #include "libavutil/avstring.h"
+#include "libavutil/log.h"
 #include "libavutil/mem.h"
 #include "libavutil/time.h"
 
@@ -456,29 +457,52 @@ void ui_ping(void)
  * owner window) so playback keeps running behind it. The chosen command
  * arrives back as an SDL user event; see ui_menu_result(). */
 #ifdef _WIN32
+static int menu_fx[3]; /* current FSR / NR / FG state for the checkmarks */
+
 static int menu_thread(void *arg)
 {
-    HWND owner;
-    HMENU menu;
+    SDL_SysWMinfo wm;
+    HWND owner = NULL;
+    HMENU menu, fx;
     POINT pt;
     int cmd = 0;
 
-    owner = CreateWindowExW(WS_EX_TOOLWINDOW, L"STATIC", L"", WS_POPUP,
-                            0, 0, 0, 0, NULL, NULL, NULL, NULL);
+    /* Own the menu with the real (already-foreground) player window: a
+     * hidden helper window cannot hold activation and the menu would be
+     * dismissed instantly. TrackPopupMenu still runs its modal loop on this
+     * worker thread, so playback keeps going. */
+    SDL_VERSION(&wm.version);
+    if (ui.window && SDL_GetWindowWMInfo(ui.window, &wm))
+        owner = wm.info.win.window;
     menu = CreatePopupMenu();
-    if (owner && menu) {
+    fx   = CreatePopupMenu();
+    if (owner && menu && fx) {
+        DWORD owner_tid = GetWindowThreadProcessId(owner, NULL);
+        DWORD my_tid = GetCurrentThreadId();
+
         AppendMenuW(menu, MF_STRING, UI_MENU_OPEN, L"파일 열기(&O)...");
+        AppendMenuW(fx, MF_STRING | (menu_fx[0] ? MF_CHECKED : 0),
+                    UI_MENU_FSR, L"FSR 업스케일");
+        AppendMenuW(fx, MF_STRING | (menu_fx[1] ? MF_CHECKED : 0),
+                    UI_MENU_NR, L"NR 노이즈 제거");
+        AppendMenuW(fx, MF_STRING | (menu_fx[2] ? MF_CHECKED : 0),
+                    UI_MENU_FG, L"FG 프레임 생성");
+        AppendMenuW(menu, MF_POPUP, (UINT_PTR)fx, L"영상 효과(&E)");
         AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
         AppendMenuW(menu, MF_STRING, UI_MENU_CLOSE, L"닫기(&X)");
         GetCursorPos(&pt);
+        /* Share the owner thread's input queue so the menu on this thread
+         * displays and receives mouse/keyboard. */
+        AttachThreadInput(my_tid, owner_tid, TRUE);
         SetForegroundWindow(owner);
         cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
                              pt.x, pt.y, 0, owner, NULL);
+        AttachThreadInput(my_tid, owner_tid, FALSE);
     }
     if (menu)
-        DestroyMenu(menu);
-    if (owner)
-        DestroyWindow(owner);
+        DestroyMenu(menu); /* also destroys the attached submenu */
+    else if (fx)
+        DestroyMenu(fx);
     {
         SDL_Event ev = { 0 };
 
@@ -491,13 +515,16 @@ static int menu_thread(void *arg)
 }
 #endif
 
-void ui_context_menu(void)
+void ui_context_menu(int fsr_on, int nr_on, int fg_on)
 {
 #ifdef _WIN32
     SDL_Thread *t;
 
     if (!ui_event_type || SDL_AtomicCAS(&menu_active, 0, 1) == SDL_FALSE)
         return;
+    menu_fx[0] = fsr_on; /* set before the thread reads them */
+    menu_fx[1] = nr_on;
+    menu_fx[2] = fg_on;
     t = SDL_CreateThread(menu_thread, "ctxmenu", NULL);
     if (t)
         SDL_DetachThread(t);

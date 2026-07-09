@@ -4080,7 +4080,7 @@ static char *wait_for_input_file(void)
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_MOUSEBUTTONDOWN &&
                 ev.button.button == SDL_BUTTON_RIGHT)
-                ui_context_menu();
+                ui_context_menu(fsr, fsr_denoise, fsr_fg);
             switch (ui_menu_result(&ev)) {
             case UI_MENU_OPEN: {
                 char *f = ui_open_file_dialog();
@@ -4091,6 +4091,10 @@ static char *wait_for_input_file(void)
             }
             case UI_MENU_CLOSE:
                 do_exit(NULL);
+                break;
+            case UI_MENU_FSR: fsr = !fsr; break; /* no video yet: flip only */
+            case UI_MENU_NR:  fsr_denoise = !fsr_denoise; break;
+            case UI_MENU_FG:  fsr_fg = !fsr_fg; break;
             }
             switch (ui_handle_event(&ev, w, h, &frac)) {
             case UI_ACT_CLOSE:
@@ -4151,7 +4155,7 @@ static int handle_ui_event(VideoState *cur_stream, const SDL_Event *event)
         return 0;
     if (event->type == SDL_MOUSEBUTTONDOWN &&
         event->button.button == SDL_BUTTON_RIGHT) {
-        ui_context_menu(); /* async; result arrives as a user event */
+        ui_context_menu(fsr, fsr_denoise, fsr_fg); /* result via user event */
         return 1;
     }
     act = ui_handle_event(event, cur_stream->width, cur_stream->height,
@@ -4224,6 +4228,19 @@ static void event_loop(VideoState *cur_stream)
         }
         case UI_MENU_CLOSE:
             do_exit(cur_stream); /* does not return */
+        case UI_MENU_FSR:
+        case UI_MENU_NR:
+        case UI_MENU_FG: {
+            /* reuse the x/d/g key toggles (toast + refresh) */
+            SDL_Event kev = { 0 };
+            int r = ui_menu_result(&event);
+
+            kev.type = SDL_KEYDOWN;
+            kev.key.keysym.sym = r == UI_MENU_FSR ? SDLK_x :
+                                 r == UI_MENU_NR  ? SDLK_d : SDLK_g;
+            SDL_PushEvent(&kev);
+            continue;
+        }
         case 0:
             continue; /* menu dismissed */
         }
