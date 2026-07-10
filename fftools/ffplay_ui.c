@@ -658,7 +658,11 @@ static int element_at(int x, int y)
 /* Start tracking a potential window-move drag from a left-button press. */
 static void wdrag_arm(void)
 {
-    if (!ui.window || ui_fullscreen())
+    /* No grab-drag while fullscreen or maximized: a maximized window sits at
+     * a negative origin, so moving it would un-maximize and jump it to a
+     * weird position under the cursor. */
+    if (!ui.window || ui_fullscreen() ||
+        (SDL_GetWindowFlags(ui.window) & SDL_WINDOW_MAXIMIZED))
         return;
     ui.wdrag_armed  = 1;
     ui.wdrag_moving = 0;
