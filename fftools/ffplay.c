@@ -3964,8 +3964,29 @@ static void stream_cycle_channel(VideoState *is, int codec_type)
 
 static void toggle_full_screen(VideoState *is)
 {
+    static int saved_x, saved_y, saved_w, saved_h, have_saved, was_maximized;
+
+    if (!is_full_screen) {
+        /* Entering fullscreen: remember the windowed geometry. SDL drops it
+         * for borderless windows and restores at the monitor's top-left. */
+        was_maximized = (SDL_GetWindowFlags(window) & SDL_WINDOW_MAXIMIZED) != 0;
+        if (was_maximized)
+            SDL_RestoreWindow(window); /* capture the pre-maximize rect */
+        SDL_GetWindowPosition(window, &saved_x, &saved_y);
+        SDL_GetWindowSize(window, &saved_w, &saved_h);
+        have_saved = 1;
+    }
     is_full_screen = !is_full_screen;
     SDL_SetWindowFullscreen(window, is_full_screen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+    if (!is_full_screen && have_saved) {
+        /* Returning to windowed: restore the saved geometry explicitly. */
+        if (was_maximized) {
+            SDL_MaximizeWindow(window);
+        } else {
+            SDL_SetWindowSize(window, saved_w, saved_h);
+            SDL_SetWindowPosition(window, saved_x, saved_y);
+        }
+    }
 }
 
 static void toggle_audio_display(VideoState *is)
