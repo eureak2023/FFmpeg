@@ -4082,7 +4082,7 @@ static char *wait_for_input_file(void)
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_MOUSEBUTTONDOWN &&
                 ev.button.button == SDL_BUTTON_RIGHT) {
-                switch (ui_context_menu(fsr, fsr_denoise, fsr_fg)) {
+                switch (ui_context_menu(fsr, fsr_denoise, fsr_fg, NULL, NULL)) {
                 case UI_MENU_OPEN: {
                     char *f = ui_open_file_dialog();
 
@@ -4143,6 +4143,15 @@ static char *wait_for_input_file(void)
     return NULL;
 }
 
+/* Present one video frame; called on a timer while the context menu's modal
+ * loop is open so playback keeps advancing behind it. */
+static void menu_idle_present(void *opaque)
+{
+    double remaining = 0.0;
+
+    video_refresh(opaque, &remaining);
+}
+
 /* Route mouse events through the on-screen controls; returns nonzero when
  * the event was consumed (default handling must be skipped), 2 when the
  * open-file dialog was requested. */
@@ -4160,7 +4169,8 @@ static int handle_ui_event(VideoState *cur_stream, const SDL_Event *event)
         event->button.button == SDL_BUTTON_RIGHT) {
         int sym = 0;
 
-        switch (ui_context_menu(fsr, fsr_denoise, fsr_fg)) {
+        switch (ui_context_menu(fsr, fsr_denoise, fsr_fg,
+                                menu_idle_present, cur_stream)) {
         case UI_MENU_OPEN:
             return 2; /* caller runs the dialog and switches the input */
         case UI_MENU_CLOSE:

@@ -450,9 +450,32 @@ void ui_ping(void)
 
 /* Right-click context menu (blocks until dismissed). Owned by the real,
  * already-foreground player window and run on the calling (main) thread, so
- * it displays and takes input reliably; video pauses while it is open, as
- * with any modal menu. Returns the chosen UI_MENU_* command, or 0. */
-int ui_context_menu(int fsr_on, int nr_on, int fg_on)
+ * it displays and takes input reliably. To keep playback going while the
+ * menu's modal loop runs, the player window is temporarily subclassed and a
+ * timer drives on_idle (which presents a frame) roughly every 15ms.
+ * Returns the chosen UI_MENU_* command, or 0. */
+#ifdef _WIN32
+#define MENU_TIMER_ID 0xF5A1
+static WNDPROC     menu_prev_wndproc;
+static void      (*menu_idle_fn)(void *);
+static void       *menu_idle_ctx;
+
+static LRESULT CALLBACK menu_wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    /* Both fire while the menu's modal loop is idle: the timer keeps waking
+     * the loop, WM_ENTERIDLE / WM_TIMER let us present a frame. */
+    if ((msg == WM_TIMER && wp == MENU_TIMER_ID) || msg == WM_ENTERIDLE) {
+        if (menu_idle_fn)
+            menu_idle_fn(menu_idle_ctx); /* present a video frame */
+        if (msg == WM_TIMER)
+            return 0;
+    }
+    return CallWindowProcW(menu_prev_wndproc, h, msg, wp, lp);
+}
+#endif
+
+int ui_context_menu(int fsr_on, int nr_on, int fg_on,
+                    void (*on_idle)(void *), void *idle_ctx)
 {
 #ifdef _WIN32
     SDL_SysWMinfo wm;
@@ -478,9 +501,22 @@ int ui_context_menu(int fsr_on, int nr_on, int fg_on)
         AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
         AppendMenuW(menu, MF_STRING, UI_MENU_CLOSE, L"닫기(&X)");
         GetCursorPos(&pt);
+        /* Keep painting the video during the menu's modal loop. */
+        menu_idle_fn  = on_idle;
+        menu_idle_ctx = idle_ctx;
+        if (on_idle) {
+            menu_prev_wndproc = (WNDPROC)SetWindowLongPtrW(owner, GWLP_WNDPROC,
+                                    (LONG_PTR)menu_wndproc);
+            SetTimer(owner, MENU_TIMER_ID, 15, NULL);
+        }
         SetForegroundWindow(owner);
         cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
                              pt.x, pt.y, 0, owner, NULL);
+        if (on_idle) {
+            KillTimer(owner, MENU_TIMER_ID);
+            SetWindowLongPtrW(owner, GWLP_WNDPROC, (LONG_PTR)menu_prev_wndproc);
+        }
+        menu_idle_fn = NULL;
     }
     if (menu)
         DestroyMenu(menu); /* also destroys the attached submenu */

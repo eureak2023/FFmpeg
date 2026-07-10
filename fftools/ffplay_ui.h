@@ -84,9 +84,14 @@ char *ui_open_file_dialog(void);
 
 /* Right-click context menu (blocks until dismissed). The fsr/nr/fg flags
  * set the checkmarks on the video-effects submenu. Returns the chosen
- * UI_MENU_* command, or 0 if dismissed. Main thread only. */
+ * UI_MENU_* command, or 0 if dismissed. Main thread only.
+ *
+ * on_idle (may be NULL) is called ~every 15ms while the menu is open so
+ * the caller can keep presenting video frames — the menu runs a modal
+ * message loop that would otherwise freeze playback. */
 enum { UI_MENU_OPEN = 1, UI_MENU_CLOSE, UI_MENU_FSR, UI_MENU_NR, UI_MENU_FG };
-int  ui_context_menu(int fsr_on, int nr_on, int fg_on);
+int  ui_context_menu(int fsr_on, int nr_on, int fg_on,
+                     void (*on_idle)(void *), void *idle_ctx);
 
 /* Text subtitles (SRT/SMI/ASS), rendered bottom-center with the system
  * font. Events may be added from decode threads; drawing and clearing
