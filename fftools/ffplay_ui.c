@@ -115,10 +115,6 @@ static struct {
     int last_drawn_hover;
 } ui;
 
-/* SDL user event type for async results (context menu) */
-static Uint32       ui_event_type;
-static SDL_atomic_t menu_active;
-
 /* Rasterize UTF-8 text with the system font via GDI (handles Korean and
  * everything else the pixel font cannot). White glyphs, alpha from
  * coverage. Returns NULL on failure (caller falls back to the pixel font). */
@@ -391,7 +387,6 @@ void ui_init(SDL_Renderer *renderer)
     ui.renderer = renderer;
     ui.last_activity = av_gettime_relative();
     subs.lock = SDL_CreateMutex();
-    ui_event_type = SDL_RegisterEvents(1);
     /* Deliver the click that focuses the window too, so grabbing an
      * unfocused player and dragging it works in one motion. */
     SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
@@ -453,91 +448,48 @@ void ui_ping(void)
     ui.last_activity = av_gettime_relative();
 }
 
-/* Right-click context menu, shown on its own thread (with its own hidden
- * owner window) so playback keeps running behind it. The chosen command
- * arrives back as an SDL user event; see ui_menu_result(). */
-#ifdef _WIN32
-static int menu_fx[3]; /* current FSR / NR / FG state for the checkmarks */
-
-static int menu_thread(void *arg)
+/* Right-click context menu (blocks until dismissed). Owned by the real,
+ * already-foreground player window and run on the calling (main) thread, so
+ * it displays and takes input reliably; video pauses while it is open, as
+ * with any modal menu. Returns the chosen UI_MENU_* command, or 0. */
+int ui_context_menu(int fsr_on, int nr_on, int fg_on)
 {
+#ifdef _WIN32
     SDL_SysWMinfo wm;
     HWND owner = NULL;
     HMENU menu, fx;
     POINT pt;
     int cmd = 0;
 
-    /* Own the menu with the real (already-foreground) player window: a
-     * hidden helper window cannot hold activation and the menu would be
-     * dismissed instantly. TrackPopupMenu still runs its modal loop on this
-     * worker thread, so playback keeps going. */
     SDL_VERSION(&wm.version);
     if (ui.window && SDL_GetWindowWMInfo(ui.window, &wm))
         owner = wm.info.win.window;
     menu = CreatePopupMenu();
     fx   = CreatePopupMenu();
     if (owner && menu && fx) {
-        DWORD owner_tid = GetWindowThreadProcessId(owner, NULL);
-        DWORD my_tid = GetCurrentThreadId();
-
         AppendMenuW(menu, MF_STRING, UI_MENU_OPEN, L"파일 열기(&O)...");
-        AppendMenuW(fx, MF_STRING | (menu_fx[0] ? MF_CHECKED : 0),
+        AppendMenuW(fx, MF_STRING | (fsr_on ? MF_CHECKED : 0),
                     UI_MENU_FSR, L"FSR 업스케일");
-        AppendMenuW(fx, MF_STRING | (menu_fx[1] ? MF_CHECKED : 0),
+        AppendMenuW(fx, MF_STRING | (nr_on ? MF_CHECKED : 0),
                     UI_MENU_NR, L"NR 노이즈 제거");
-        AppendMenuW(fx, MF_STRING | (menu_fx[2] ? MF_CHECKED : 0),
+        AppendMenuW(fx, MF_STRING | (fg_on ? MF_CHECKED : 0),
                     UI_MENU_FG, L"FG 프레임 생성");
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)fx, L"영상 효과(&E)");
         AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
         AppendMenuW(menu, MF_STRING, UI_MENU_CLOSE, L"닫기(&X)");
         GetCursorPos(&pt);
-        /* Share the owner thread's input queue so the menu on this thread
-         * displays and receives mouse/keyboard. */
-        AttachThreadInput(my_tid, owner_tid, TRUE);
         SetForegroundWindow(owner);
         cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
                              pt.x, pt.y, 0, owner, NULL);
-        AttachThreadInput(my_tid, owner_tid, FALSE);
     }
     if (menu)
         DestroyMenu(menu); /* also destroys the attached submenu */
     else if (fx)
         DestroyMenu(fx);
-    {
-        SDL_Event ev = { 0 };
-
-        ev.type      = ui_event_type;
-        ev.user.code = cmd;
-        SDL_PushEvent(&ev);
-    }
-    SDL_AtomicSet(&menu_active, 0);
+    return cmd;
+#else
     return 0;
-}
 #endif
-
-void ui_context_menu(int fsr_on, int nr_on, int fg_on)
-{
-#ifdef _WIN32
-    SDL_Thread *t;
-
-    if (!ui_event_type || SDL_AtomicCAS(&menu_active, 0, 1) == SDL_FALSE)
-        return;
-    menu_fx[0] = fsr_on; /* set before the thread reads them */
-    menu_fx[1] = nr_on;
-    menu_fx[2] = fg_on;
-    t = SDL_CreateThread(menu_thread, "ctxmenu", NULL);
-    if (t)
-        SDL_DetachThread(t);
-    else
-        SDL_AtomicSet(&menu_active, 0);
-#endif
-}
-
-int ui_menu_result(const SDL_Event *event)
-{
-    if (!ui_event_type || event->type != ui_event_type)
-        return -1;
-    return event->user.code;
 }
 
 /* Native "open file" dialog; returns an av_strdup'ed UTF-8 path or NULL. */

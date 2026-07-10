@@ -337,7 +337,7 @@ static int decoder_reorder_pts = -1;
 static int autoexit;
 static int exit_on_keydown;
 static int exit_on_mousedown;
-static int loop = 1;
+static int loop = 0; /* 0 = repeat forever by default; -loop 1 plays once */
 static int framedrop = -1;
 static int infinite_buffer = -1;
 static enum ShowMode show_mode = SHOW_MODE_NONE;
@@ -3723,11 +3723,13 @@ static int read_thread(void *arg)
         if (!is->paused &&
             (!is->audio_st || (is->auddec.finished == is->audioq.serial && frame_queue_nb_remaining(&is->sampq) == 0)) &&
             (!is->video_st || (is->viddec.finished == is->videoq.serial && frame_queue_nb_remaining(&is->pictq) == 0))) {
-            if (loop != 1 && (!loop || --loop)) {
-                stream_seek(is, start_time != AV_NOPTS_VALUE ? start_time : 0, 0, 0);
-            } else if (autoexit) {
+            if (autoexit) {
+                /* -autoexit wins over the default repeat, so scripts and
+                 * -t/-autoexit runs still terminate at EOF. */
                 ret = AVERROR_EOF;
                 goto fail;
+            } else if (loop != 1 && (!loop || --loop)) {
+                stream_seek(is, start_time != AV_NOPTS_VALUE ? start_time : 0, 0, 0);
             }
         }
         ret = av_read_frame(ic, pkt);
@@ -4079,22 +4081,23 @@ static char *wait_for_input_file(void)
         SDL_GetWindowSize(window, &w, &h);
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_MOUSEBUTTONDOWN &&
-                ev.button.button == SDL_BUTTON_RIGHT)
-                ui_context_menu(fsr, fsr_denoise, fsr_fg);
-            switch (ui_menu_result(&ev)) {
-            case UI_MENU_OPEN: {
-                char *f = ui_open_file_dialog();
+                ev.button.button == SDL_BUTTON_RIGHT) {
+                switch (ui_context_menu(fsr, fsr_denoise, fsr_fg)) {
+                case UI_MENU_OPEN: {
+                    char *f = ui_open_file_dialog();
 
-                if (f)
-                    return f;
-                break;
-            }
-            case UI_MENU_CLOSE:
-                do_exit(NULL);
-                break;
-            case UI_MENU_FSR: fsr = !fsr; break; /* no video yet: flip only */
-            case UI_MENU_NR:  fsr_denoise = !fsr_denoise; break;
-            case UI_MENU_FG:  fsr_fg = !fsr_fg; break;
+                    if (f)
+                        return f;
+                    break;
+                }
+                case UI_MENU_CLOSE:
+                    do_exit(NULL);
+                    break;
+                case UI_MENU_FSR: fsr = !fsr; break; /* no video: flip only */
+                case UI_MENU_NR:  fsr_denoise = !fsr_denoise; break;
+                case UI_MENU_FG:  fsr_fg = !fsr_fg; break;
+                }
+                continue;
             }
             switch (ui_handle_event(&ev, w, h, &frac)) {
             case UI_ACT_CLOSE:
@@ -4155,7 +4158,25 @@ static int handle_ui_event(VideoState *cur_stream, const SDL_Event *event)
         return 0;
     if (event->type == SDL_MOUSEBUTTONDOWN &&
         event->button.button == SDL_BUTTON_RIGHT) {
-        ui_context_menu(fsr, fsr_denoise, fsr_fg); /* result via user event */
+        int sym = 0;
+
+        switch (ui_context_menu(fsr, fsr_denoise, fsr_fg)) {
+        case UI_MENU_OPEN:
+            return 2; /* caller runs the dialog and switches the input */
+        case UI_MENU_CLOSE:
+            do_exit(cur_stream); /* does not return */
+        case UI_MENU_FSR: sym = SDLK_x; break;
+        case UI_MENU_NR:  sym = SDLK_d; break;
+        case UI_MENU_FG:  sym = SDLK_g; break;
+        }
+        if (sym) { /* reuse the x/d/g key toggles (toast + refresh) */
+            SDL_Event kev = { 0 };
+
+            kev.type = SDL_KEYDOWN;
+            kev.key.keysym.sym = sym;
+            SDL_PushEvent(&kev);
+        }
+        cur_stream->force_refresh = 1; /* repaint after the modal menu */
         return 1;
     }
     act = ui_handle_event(event, cur_stream->width, cur_stream->height,
@@ -4218,32 +4239,6 @@ static void event_loop(VideoState *cur_stream)
     for (;;) {
         double x;
         refresh_loop_wait_event(cur_stream, &event);
-        switch (ui_menu_result(&event)) {
-        case UI_MENU_OPEN: {
-            char *f = ui_open_file_dialog();
-
-            if (f)
-                cur_stream = switch_input(cur_stream, f);
-            continue;
-        }
-        case UI_MENU_CLOSE:
-            do_exit(cur_stream); /* does not return */
-        case UI_MENU_FSR:
-        case UI_MENU_NR:
-        case UI_MENU_FG: {
-            /* reuse the x/d/g key toggles (toast + refresh) */
-            SDL_Event kev = { 0 };
-            int r = ui_menu_result(&event);
-
-            kev.type = SDL_KEYDOWN;
-            kev.key.keysym.sym = r == UI_MENU_FSR ? SDLK_x :
-                                 r == UI_MENU_NR  ? SDLK_d : SDLK_g;
-            SDL_PushEvent(&kev);
-            continue;
-        }
-        case 0:
-            continue; /* menu dismissed */
-        }
         switch (handle_ui_event(cur_stream, &event)) {
         case 2: { /* open-file dialog */
             char *f = ui_open_file_dialog();
@@ -4705,7 +4700,7 @@ static const OptionDef options[] = {
     { "autoexit",           OPT_TYPE_BOOL,   OPT_EXPERT, { &autoexit }, "exit at the end", "" },
     { "exitonkeydown",      OPT_TYPE_BOOL,   OPT_EXPERT, { &exit_on_keydown }, "exit on key down", "" },
     { "exitonmousedown",    OPT_TYPE_BOOL,   OPT_EXPERT, { &exit_on_mousedown }, "exit on mouse down", "" },
-    { "loop",               OPT_TYPE_INT,    OPT_EXPERT, { &loop }, "set number of times the playback shall be looped", "loop count" },
+    { "loop",               OPT_TYPE_INT,    OPT_EXPERT, { &loop }, "number of times to loop playback (0 = forever, the default; 1 = play once)", "loop count" },
     { "framedrop",          OPT_TYPE_BOOL,   OPT_EXPERT, { &framedrop }, "drop frames when cpu is too slow", "" },
     { "infbuf",             OPT_TYPE_BOOL,   OPT_EXPERT, { &infinite_buffer }, "don't limit the input buffer size (useful with realtime streams)", "" },
     { "window_title",       OPT_TYPE_STRING,          0, { &window_title }, "set window title", "window title" },
