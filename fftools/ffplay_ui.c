@@ -41,7 +41,7 @@
 #include "ffplay_ui.h"
 
 #define BAR_H          48       /* control bar height, px */
-#define SEEK_H         16       /* seek row hit-area height, px */
+#define SEEK_H         28       /* seek row hit-area height, px (taller = easier to click) */
 #define BTN_W          52       /* control button width, px */
 #define SEEK_PAD       10       /* seek track horizontal padding, px */
 #define TITLE_H        34       /* title bar height, px */
@@ -956,14 +956,14 @@ void ui_draw(SDL_Renderer *renderer, int win_w, int win_h,
     fill(renderer, 0, bar_top, win_w, BAR_H, 14, 14, 14, 235);
 
     /* seek track, chapter markers, played fill, handle */
-    fill(renderer, SEEK_PAD, track_y - 1, track_w, 3, 85, 85, 85, 255);
-    fill(renderer, SEEK_PAD, track_y - 1, fill_w, 3, 250, 200, 40, 255);
+    fill(renderer, SEEK_PAD, track_y - 2, track_w, 4, 85, 85, 85, 255);
+    fill(renderer, SEEK_PAD, track_y - 2, fill_w, 4, 250, 200, 40, 255);
     for (int i = 0; i < ui.nb_chapters; i++) {
         int cx = SEEK_PAD + (int)lrint(ui.chapters[i] * track_w);
 
-        fill(renderer, cx - 2, track_y - 4, 5, 9, 235, 235, 235, 255);
+        fill(renderer, cx - 2, track_y - 6, 5, 13, 235, 235, 235, 255);
     }
-    fill(renderer, SEEK_PAD + fill_w - 4, track_y - 6, 9, 12,
+    fill(renderer, SEEK_PAD + fill_w - 5, track_y - 9, 11, 18,
          ui.hover == EL_SEEK || ui.dragging ? 250 : 235,
          ui.hover == EL_SEEK || ui.dragging ? 200 : 235,
          ui.hover == EL_SEEK || ui.dragging ?  40 : 235, 255);
