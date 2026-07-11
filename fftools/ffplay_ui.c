@@ -475,12 +475,12 @@ static LRESULT CALLBACK menu_wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 #endif
 
 int ui_context_menu(int fsr_on, int nr_on, int fg_on, int stereo_on,
-                    void (*on_idle)(void *), void *idle_ctx)
+                    int scale_mode, void (*on_idle)(void *), void *idle_ctx)
 {
 #ifdef _WIN32
     SDL_SysWMinfo wm;
     HWND owner = NULL;
-    HMENU menu, fx, ao;
+    HMENU menu, fx, ao, sc;
     POINT pt;
     int cmd = 0;
 
@@ -490,7 +490,8 @@ int ui_context_menu(int fsr_on, int nr_on, int fg_on, int stereo_on,
     menu = CreatePopupMenu();
     fx   = CreatePopupMenu();
     ao   = CreatePopupMenu();
-    if (owner && menu && fx && ao) {
+    sc   = CreatePopupMenu();
+    if (owner && menu && fx && ao && sc) {
         AppendMenuW(menu, MF_STRING, UI_MENU_OPEN, L"파일 열기(&O)...");
         AppendMenuW(fx, MF_STRING | (fsr_on ? MF_CHECKED : 0),
                     UI_MENU_FSR, L"FSR 업스케일");
@@ -498,6 +499,14 @@ int ui_context_menu(int fsr_on, int nr_on, int fg_on, int stereo_on,
                     UI_MENU_NR, L"NR 노이즈 제거");
         AppendMenuW(fx, MF_STRING | (fg_on ? MF_CHECKED : 0),
                     UI_MENU_FG, L"FG 프레임 생성");
+        AppendMenuW(sc, MF_STRING | (scale_mode == 0 ? MF_CHECKED : 0),
+                    UI_MENU_SCALE_FIT, L"비율 유지");
+        AppendMenuW(sc, MF_STRING | (scale_mode == 1 ? MF_CHECKED : 0),
+                    UI_MENU_SCALE_FILL, L"비율 유지 꽉찬 화면");
+        AppendMenuW(sc, MF_STRING | (scale_mode == 2 ? MF_CHECKED : 0),
+                    UI_MENU_SCALE_STRETCH, L"비율 유지하지 않음");
+        AppendMenuW(fx, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(fx, MF_POPUP, (UINT_PTR)sc, L"화면 비율(&R)");
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)fx, L"영상 효과(&E)");
         AppendMenuW(ao, MF_STRING | (!stereo_on ? MF_CHECKED : 0),
                     UI_MENU_AOUT_ORIG, L"원본 그대로 출력");
@@ -531,6 +540,8 @@ int ui_context_menu(int fsr_on, int nr_on, int fg_on, int stereo_on,
             DestroyMenu(fx);
         if (ao)
             DestroyMenu(ao);
+        if (sc)
+            DestroyMenu(sc);
     }
     return cmd;
 #else

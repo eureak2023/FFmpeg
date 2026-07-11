@@ -330,6 +330,7 @@ static int borderless = 1; /* the on-screen UI provides its own title bar */
 static int alwaysontop;
 static int startup_volume = 100;
 static int audio_stereo = 0; /* 0 = original layout, 1 = downmix to 2.0 stereo */
+static int video_scaling = 0; /* 0 = keep aspect (fit), 1 = fill+crop, 2 = stretch */
 static int show_status = -1;
 static int av_sync_type = AV_SYNC_AUDIO_MASTER;
 static int64_t start_time = AV_NOPTS_VALUE;
@@ -887,16 +888,32 @@ static void calculate_display_rect(SDL_Rect *rect,
 
     aspect_ratio = av_mul_q(aspect_ratio, av_make_q(pic_width, pic_height));
 
+    if (video_scaling == 2) {
+        /* stretch: fill the window exactly, ignoring the aspect ratio */
+        rect->x = scr_xleft;
+        rect->y = scr_ytop;
+        rect->w = FFMAX(scr_width,  1);
+        rect->h = FFMAX(scr_height, 1);
+        return;
+    }
+
     /* XXX: we suppose the screen has a 1.0 pixel ratio */
     height = scr_height;
     width = av_rescale(height, aspect_ratio.num, aspect_ratio.den) & ~1;
-    if (width > scr_width) {
+    if (video_scaling == 1) {
+        /* fill: scale up to cover the window (aspect kept), crop overflow */
+        if (width < scr_width) {
+            width = scr_width;
+            height = av_rescale(width, aspect_ratio.den, aspect_ratio.num) & ~1;
+        }
+    } else if (width > scr_width) {
+        /* fit (default): letterbox/pillarbox inside the window */
         width = scr_width;
         height = av_rescale(width, aspect_ratio.den, aspect_ratio.num) & ~1;
     }
     x = (scr_width - width) / 2;
     y = (scr_height - height) / 2;
-    rect->x = scr_xleft + x;
+    rect->x = scr_xleft + x; /* negative in fill mode -> cropped by the window */
     rect->y = scr_ytop  + y;
     rect->w = FFMAX((int)width,  1);
     rect->h = FFMAX((int)height, 1);
@@ -1433,6 +1450,8 @@ static void load_settings(void)
             startup_volume = v;
         else if (sscanf(line, "audio_stereo=%d", &v) == 1)
             audio_stereo = !!v;
+        else if (sscanf(line, "video_scaling=%d", &v) == 1 && v >= 0 && v <= 2)
+            video_scaling = v;
     }
     fclose(f);
 }
@@ -1457,6 +1476,7 @@ static void save_settings(VideoState *is)
         fprintf(f, "width=%d\nheight=%d\n", w, h);
     fprintf(f, "volume=%d\n", av_clip(vol, 0, 100));
     fprintf(f, "audio_stereo=%d\n", audio_stereo);
+    fprintf(f, "video_scaling=%d\n", video_scaling);
     fclose(f);
 }
 
@@ -4032,6 +4052,20 @@ static void reopen_audio(VideoState *is)
 }
 
 
+/* Set the video scaling mode (0 keep-aspect / 1 fill+crop / 2 stretch),
+ * show a toast and force a redraw so the new display rect takes effect. */
+static void set_video_scaling(VideoState *is, int mode)
+{
+    video_scaling = mode;
+    if (renderer)
+        fsr_toast_show(renderer, mode == 0 ? "ASPECT" :
+                                 mode == 1 ? "FULL"   : "STRETCH");
+    av_log(NULL, AV_LOG_INFO, "Video scaling: %s\n",
+           mode == 0 ? "keep aspect" : mode == 1 ? "fill" : "stretch");
+    if (is)
+        is->force_refresh = 1;
+}
+
 static void toggle_full_screen(VideoState *is)
 {
     static int saved_x, saved_y, saved_w, saved_h, have_saved, was_maximized;
@@ -4174,7 +4208,7 @@ static char *wait_for_input_file(void)
             if (ev.type == SDL_MOUSEBUTTONDOWN &&
                 ev.button.button == SDL_BUTTON_RIGHT) {
                 switch (ui_context_menu(fsr, fsr_denoise, fsr_fg, audio_stereo,
-                                        NULL, NULL)) {
+                                        video_scaling, NULL, NULL)) {
                 case UI_MENU_OPEN: {
                     char *f = ui_open_file_dialog();
 
@@ -4190,6 +4224,9 @@ static char *wait_for_input_file(void)
                 case UI_MENU_FG:  fsr_fg = !fsr_fg; break;
                 case UI_MENU_AOUT_ORIG:   audio_stereo = 0; break;
                 case UI_MENU_AOUT_STEREO: audio_stereo = 1; break;
+                case UI_MENU_SCALE_FIT:     video_scaling = 0; break;
+                case UI_MENU_SCALE_FILL:    video_scaling = 1; break;
+                case UI_MENU_SCALE_STRETCH: video_scaling = 2; break;
                 }
                 continue;
             }
@@ -4264,7 +4301,7 @@ static int handle_ui_event(VideoState *cur_stream, const SDL_Event *event)
         int sym = 0;
 
         switch (ui_context_menu(fsr, fsr_denoise, fsr_fg, audio_stereo,
-                                menu_idle_present, cur_stream)) {
+                                video_scaling, menu_idle_present, cur_stream)) {
         case UI_MENU_OPEN:
             return 2; /* caller runs the dialog and switches the input */
         case UI_MENU_CLOSE:
@@ -4272,6 +4309,9 @@ static int handle_ui_event(VideoState *cur_stream, const SDL_Event *event)
         case UI_MENU_FSR: sym = SDLK_x; break;
         case UI_MENU_NR:  sym = SDLK_d; break;
         case UI_MENU_FG:  sym = SDLK_g; break;
+        case UI_MENU_SCALE_FIT:     set_video_scaling(cur_stream, 0); break;
+        case UI_MENU_SCALE_FILL:    set_video_scaling(cur_stream, 1); break;
+        case UI_MENU_SCALE_STRETCH: set_video_scaling(cur_stream, 2); break;
         case UI_MENU_AOUT_ORIG:
             if (audio_stereo) {
                 audio_stereo = 0;
@@ -4380,6 +4420,11 @@ static void event_loop(VideoState *cur_stream)
             if (!cur_stream->width)
                 continue;
             switch (event.key.keysym.sym) {
+            case SDLK_F5:
+                if (event.key.keysym.mod & KMOD_CTRL) {
+                    set_video_scaling(cur_stream, (video_scaling + 1) % 3);
+                }
+                break;
             case SDLK_f:
                 toggle_full_screen(cur_stream);
                 cur_stream->force_refresh = 1;

@@ -90,9 +90,10 @@ char *ui_open_file_dialog(void);
  * the caller can keep presenting video frames — the menu runs a modal
  * message loop that would otherwise freeze playback. */
 enum { UI_MENU_OPEN = 1, UI_MENU_CLOSE, UI_MENU_FSR, UI_MENU_NR, UI_MENU_FG,
-       UI_MENU_AOUT_ORIG, UI_MENU_AOUT_STEREO };
+       UI_MENU_AOUT_ORIG, UI_MENU_AOUT_STEREO,
+       UI_MENU_SCALE_FIT, UI_MENU_SCALE_FILL, UI_MENU_SCALE_STRETCH };
 int  ui_context_menu(int fsr_on, int nr_on, int fg_on, int stereo_on,
-                     void (*on_idle)(void *), void *idle_ctx);
+                     int scale_mode, void (*on_idle)(void *), void *idle_ctx);
 
 /* Text subtitles (SRT/SMI/ASS), rendered bottom-center with the system
  * font. Events may be added from decode threads; drawing and clearing
