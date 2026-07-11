@@ -2446,7 +2446,23 @@ static int configure_audio_filters(VideoState *is, const char *afilters, int for
     if (ret < 0)
         goto end;
 
-    if ((ret = configure_filtergraph(is->agraph, afilters, filt_asrc, filt_asink)) < 0)
+    if (audio_stereo) {
+        /* Downmix with a full-level (un-normalized) matrix via the pan
+         * filter. FFmpeg's default channel-layout conversion normalizes the
+         * downmix (~-7dB), which is why 5.1->2.0 sounds quiet compared with
+         * other players; this matches their louder level. Named channels not
+         * present in the source are ignored, so it is a no-op on stereo. */
+        char af_stereo[600];
+
+        snprintf(af_stereo, sizeof(af_stereo),
+                 "pan=stereo|"
+                 "FL=FL+0.707*FC+0.707*BL+0.707*SL|"
+                 "FR=FR+0.707*FC+0.707*BR+0.707*SR%s%s",
+                 afilters && *afilters ? "," : "",
+                 afilters && *afilters ? afilters : "");
+        if ((ret = configure_filtergraph(is->agraph, af_stereo, filt_asrc, filt_asink)) < 0)
+            goto end;
+    } else if ((ret = configure_filtergraph(is->agraph, afilters, filt_asrc, filt_asink)) < 0)
         goto end;
 
     is->in_audio_filter  = filt_asrc;
