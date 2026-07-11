@@ -860,6 +860,26 @@ static void fill(SDL_Renderer *r, int x, int y, int w, int h,
     SDL_RenderFillRect(r, &rc);
 }
 
+/* Vertical gradient rectangle: alpha a_top at the top edge fading to a_bot at
+ * the bottom. Used for the control-bar scrim so it reads as controls floating
+ * over full-bleed video (no hard black edge) instead of a black letterbox. */
+static void fill_vgrad(SDL_Renderer *r, int x, int y, int w, int h,
+                       Uint8 cr, Uint8 cg, Uint8 cb, Uint8 a_top, Uint8 a_bot)
+{
+    SDL_Color ct = { cr, cg, cb, a_top };
+    SDL_Color cb2 = { cr, cg, cb, a_bot };
+    float x0 = x, y0 = y, x1 = x + w, y1 = y + h;
+    SDL_Vertex v[4] = {
+        { { x0, y0 }, ct,  { 0, 0 } },   /* top-left */
+        { { x1, y0 }, ct,  { 0, 0 } },   /* top-right */
+        { { x1, y1 }, cb2, { 0, 0 } },   /* bottom-right */
+        { { x0, y1 }, cb2, { 0, 0 } },   /* bottom-left */
+    };
+    int idx[6] = { 0, 1, 2, 0, 2, 3 };
+
+    SDL_RenderGeometry(r, NULL, v, 4, idx, 6);
+}
+
 static void tri(SDL_Renderer *r, float x1, float y1, float x2, float y2,
                 float x3, float y3, SDL_Color c)
 {
@@ -962,9 +982,11 @@ void ui_draw(SDL_Renderer *renderer, int win_w, int win_h,
 
     SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
 
-    /* backgrounds */
-    fill(renderer, 0, seek_top, win_w, SEEK_H, 14, 14, 14, 200);
-    fill(renderer, 0, bar_top, win_w, BAR_H, 14, 14, 14, 235);
+    /* background scrim: a single vertical gradient over the whole overlay,
+     * transparent at the top of the seek row so the video shows through and
+     * fill mode still reads as full-screen, darkening toward the bottom where
+     * the buttons/timecode need contrast. */
+    fill_vgrad(renderer, 0, seek_top, win_w, SEEK_H + BAR_H, 14, 14, 14, 0, 220);
 
     /* seek track, chapter markers, played fill, handle */
     fill(renderer, SEEK_PAD, track_y - 2, track_w, 4, 85, 85, 85, 255);

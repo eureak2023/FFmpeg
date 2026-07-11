@@ -1361,6 +1361,16 @@ colorspace_done:
     stream.Enable        = TRUE;
     stream.pInputSurface = in_view;
     hwgl_lock();
+    /* Restrict the processor to the frame's valid display region. D3D11
+     * decode surfaces are coded-size textures whose height/width are padded up
+     * to a codec alignment (e.g. HEVC 1606 -> 1664); without a source rect the
+     * processor scales the whole padded surface into the output, so the black
+     * padding rows show up as a bar at the bottom (very visible in fill mode). */
+    {
+        RECT src_rect = { 0, 0, frame->width, frame->height };
+        ID3D11VideoContext_VideoProcessorSetStreamSourceRect(hwgl.vcontext, hwgl.vp,
+                                                             0, TRUE, &src_rect);
+    }
     hr = ID3D11VideoContext_VideoProcessorBlt(hwgl.vcontext, hwgl.vp, hwgl.out_view, 0, 1, &stream);
     if (SUCCEEDED(hr)) {
         ID3D11DeviceContext_CopyResource(hwgl.dcontext,

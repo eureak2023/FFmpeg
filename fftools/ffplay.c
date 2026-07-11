@@ -876,9 +876,15 @@ static int realloc_texture(SDL_Texture **texture, Uint32 new_format, int new_wid
     return 0;
 }
 
+/* scaling: 0 = keep aspect (fit), 1 = fill+crop, 2 = stretch. Passed
+ * explicitly (not read from the global) so window-size computation can force
+ * fit even while the user's display mode is fill/stretch — otherwise the
+ * INT_MAX "no limit" sentinel used for sizing would be treated as a real
+ * window to cover, blowing the size up to INT_MAX. */
 static void calculate_display_rect(SDL_Rect *rect,
                                    int scr_xleft, int scr_ytop, int scr_width, int scr_height,
-                                   int pic_width, int pic_height, AVRational pic_sar)
+                                   int pic_width, int pic_height, AVRational pic_sar,
+                                   int scaling)
 {
     AVRational aspect_ratio = pic_sar;
     int64_t width, height, x, y;
@@ -888,7 +894,7 @@ static void calculate_display_rect(SDL_Rect *rect,
 
     aspect_ratio = av_mul_q(aspect_ratio, av_make_q(pic_width, pic_height));
 
-    if (video_scaling == 2) {
+    if (scaling == 2) {
         /* stretch: fill the window exactly, ignoring the aspect ratio */
         rect->x = scr_xleft;
         rect->y = scr_ytop;
@@ -900,7 +906,7 @@ static void calculate_display_rect(SDL_Rect *rect,
     /* XXX: we suppose the screen has a 1.0 pixel ratio */
     height = scr_height;
     width = av_rescale(height, aspect_ratio.num, aspect_ratio.den) & ~1;
-    if (video_scaling == 1) {
+    if (scaling == 1) {
         /* fill: scale up to cover the window (aspect kept), crop overflow */
         if (width < scr_width) {
             width = scr_width;
@@ -1042,7 +1048,7 @@ static void video_image_display(VideoState *is)
     int hw_drawn = 0;
 
     vp = frame_queue_peek_last(&is->pictq);
-    calculate_display_rect(rect, is->xleft, is->ytop, is->width, is->height, vp->width, vp->height, vp->sar);
+    calculate_display_rect(rect, is->xleft, is->ytop, is->width, is->height, vp->width, vp->height, vp->sar, video_scaling);
     if (vk_renderer) {
         vk_renderer_display(vk_renderer, vp->frame, &is->render_params);
         return;
@@ -1522,7 +1528,9 @@ static void set_default_window_size(int width, int height, AVRational sar)
     int max_height = screen_height ? screen_height : INT_MAX;
     if (max_width == INT_MAX && max_height == INT_MAX)
         max_height = height;
-    calculate_display_rect(&rect, 0, 0, max_width, max_height, width, height, sar);
+    /* window sizing always uses fit; the fill/stretch display mode must not
+     * turn the INT_MAX sentinel into an INT_MAX-sized default window */
+    calculate_display_rect(&rect, 0, 0, max_width, max_height, width, height, sar, 0);
     default_width  = rect.w;
     default_height = rect.h;
 }
@@ -1874,7 +1882,7 @@ static void video_fg_display(VideoState *is, double phase)
         return;
 
     calculate_display_rect(rect, is->xleft, is->ytop, is->width, is->height,
-                           vp->width, vp->height, vp->sar);
+                           vp->width, vp->height, vp->sar, video_scaling);
     SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
     SDL_RenderClear(renderer);
     draw_video_background(is);
