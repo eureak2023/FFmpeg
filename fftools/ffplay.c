@@ -2487,6 +2487,15 @@ static int configure_audio_filters(VideoState *is, const char *afilters, int for
     if (ret < 0)
         goto end;
 
+    /* Batch the output into fixed-size frames. Some codecs (notably Dolby
+     * TrueHD) emit very small frames - 40 samples, i.e. 1200 frames/second -
+     * which flood ffplay's per-frame audio pipeline and tiny sample-frame
+     * queue faster than it can keep up, so the audio master clock steadily
+     * falls behind real time and the whole picture+sound judders. Re-framing
+     * to ~1024-sample chunks at the sink fixes the drift; it is a harmless
+     * no-op for normally-framed audio (AC-3, AAC, ...). */
+    #define AUDIO_BATCH_FILTER "asetnsamples=n=1024:p=0"
+
     if (audio_stereo) {
         /* Downmix with a full-level (un-normalized) matrix via the pan
          * filter. FFmpeg's default channel-layout conversion normalizes the
@@ -2499,13 +2508,23 @@ static int configure_audio_filters(VideoState *is, const char *afilters, int for
                  "pan=stereo|"
                  "FL=FL+0.707*FC+0.707*BL+0.707*SL|"
                  "FR=FR+0.707*FC+0.707*BR+0.707*SR"
-                 ",volume=2.0,alimiter=limit=0.97%s%s",
+                 ",volume=2.0,alimiter=limit=0.97%s%s,"
+                 AUDIO_BATCH_FILTER,
                  afilters && *afilters ? "," : "",
                  afilters && *afilters ? afilters : "");
         if ((ret = configure_filtergraph(is->agraph, af_stereo, filt_asrc, filt_asink)) < 0)
             goto end;
-    } else if ((ret = configure_filtergraph(is->agraph, afilters, filt_asrc, filt_asink)) < 0)
-        goto end;
+    } else {
+        char af_all[600];
+
+        snprintf(af_all, sizeof(af_all), "%s%s" AUDIO_BATCH_FILTER,
+                 afilters && *afilters ? afilters : "",
+                 afilters && *afilters ? "," : "");
+        if ((ret = configure_filtergraph(is->agraph, af_all, filt_asrc, filt_asink)) < 0)
+            goto end;
+    }
+
+    #undef AUDIO_BATCH_FILTER
 
     is->in_audio_filter  = filt_asrc;
     is->out_audio_filter = filt_asink;
