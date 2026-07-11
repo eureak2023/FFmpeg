@@ -214,6 +214,9 @@ typedef struct VideoState {
     int seek_flags;
     int64_t seek_pos;
     int64_t seek_rel;
+    int64_t accurate_seek_target; /* AV_TIME_BASE; drop a/v frames before it
+                                     after a seek so playback resumes at the
+                                     clicked point, not the earlier keyframe */
     int read_pause_return;
     AVFormatContext *ic;
     int realtime;
@@ -2154,6 +2157,16 @@ static int get_video_frame(VideoState *is, AVFrame *frame)
         if (frame->pts != AV_NOPTS_VALUE)
             dpts = av_q2d(is->video_st->time_base) * frame->pts;
 
+        /* Accurate seek: after a seek, drop frames before the requested time
+         * so playback resumes there instead of at the earlier keyframe. The
+         * target is left set (updated by each seek); frames past it in normal
+         * playback are always >= target, so nothing extra is dropped. */
+        if (is->accurate_seek_target != AV_NOPTS_VALUE && !isnan(dpts) &&
+            dpts < is->accurate_seek_target / (double)AV_TIME_BASE - 0.01) {
+            av_frame_unref(frame);
+            return 0;
+        }
+
         frame->sample_aspect_ratio = av_guess_sample_aspect_ratio(is->ic, is->video_st, frame);
 
         if (framedrop>0 || (framedrop && get_master_sync_type(is) != AV_SYNC_VIDEO_MASTER)) {
@@ -2457,7 +2470,8 @@ static int configure_audio_filters(VideoState *is, const char *afilters, int for
         snprintf(af_stereo, sizeof(af_stereo),
                  "pan=stereo|"
                  "FL=FL+0.707*FC+0.707*BL+0.707*SL|"
-                 "FR=FR+0.707*FC+0.707*BR+0.707*SR%s%s",
+                 "FR=FR+0.707*FC+0.707*BR+0.707*SR"
+                 ",volume=2.0,alimiter=limit=0.97%s%s",
                  afilters && *afilters ? "," : "",
                  afilters && *afilters ? afilters : "");
         if ((ret = configure_filtergraph(is->agraph, af_stereo, filt_asrc, filt_asink)) < 0)
@@ -2530,6 +2544,15 @@ static int audio_thread(void *arg)
             while ((ret = av_buffersink_get_frame_flags(is->out_audio_filter, frame, 0)) >= 0) {
                 FrameData *fd = frame->opaque_ref ? (FrameData*)frame->opaque_ref->data : NULL;
                 tb = av_buffersink_get_time_base(is->out_audio_filter);
+                /* accurate seek: drop audio before the requested time so it
+                 * starts together with the video, not at the keyframe */
+                if (is->accurate_seek_target != AV_NOPTS_VALUE &&
+                    frame->pts != AV_NOPTS_VALUE &&
+                    frame->pts * av_q2d(tb) <
+                        is->accurate_seek_target / (double)AV_TIME_BASE - 0.01) {
+                    av_frame_unref(frame);
+                    continue;
+                }
                 if (!(af = frame_queue_peek_writable(&is->sampq)))
                     goto the_end;
 
@@ -3719,8 +3742,11 @@ static int read_thread(void *arg)
                     packet_queue_flush(&is->videoq);
                 if (is->seek_flags & AVSEEK_FLAG_BYTE) {
                    set_clock(&is->extclk, NAN, 0);
+                   is->accurate_seek_target = AV_NOPTS_VALUE;
                 } else {
                    set_clock(&is->extclk, seek_target / (double)AV_TIME_BASE, 0);
+                   /* land at the requested time, not the keyframe before it */
+                   is->accurate_seek_target = seek_target;
                 }
             }
             is->seek_req = 0;
@@ -3855,6 +3881,7 @@ static VideoState *stream_open(const char *filename,
         return NULL;
     is->last_video_stream = is->video_stream = -1;
     is->last_audio_stream = is->audio_stream = -1;
+    is->accurate_seek_target = AV_NOPTS_VALUE;
     is->last_subtitle_stream = is->subtitle_stream = -1;
     is->filename = av_strdup(filename);
     if (!is->filename)
