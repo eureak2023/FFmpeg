@@ -326,6 +326,7 @@ static int display_disable;
 static int borderless = 1; /* the on-screen UI provides its own title bar */
 static int alwaysontop;
 static int startup_volume = 100;
+static int audio_stereo = 0; /* 0 = original layout, 1 = downmix to 2.0 stereo */
 static int show_status = -1;
 static int av_sync_type = AV_SYNC_AUDIO_MASTER;
 static int64_t start_time = AV_NOPTS_VALUE;
@@ -1427,6 +1428,8 @@ static void load_settings(void)
             default_height = screen_height = last_normal_h = v;
         else if (sscanf(line, "volume=%d", &v) == 1 && v >= 0 && v <= 100)
             startup_volume = v;
+        else if (sscanf(line, "audio_stereo=%d", &v) == 1)
+            audio_stereo = !!v;
     }
     fclose(f);
 }
@@ -1450,6 +1453,7 @@ static void save_settings(VideoState *is)
     if (w > 0 && h > 0)
         fprintf(f, "width=%d\nheight=%d\n", w, h);
     fprintf(f, "volume=%d\n", av_clip(vol, 0, 100));
+    fprintf(f, "audio_stereo=%d\n", audio_stereo);
     fclose(f);
 }
 
@@ -2418,7 +2422,18 @@ static int configure_audio_filters(VideoState *is, const char *afilters, int for
     if ((ret = av_opt_set(filt_asink, "sample_formats", "s16", AV_OPT_SEARCH_CHILDREN)) < 0)
         goto end;
 
-    if (force_output_format) {
+    if (audio_stereo) {
+        /* Downmix everything to 2.0 stereo at the sink. */
+        AVChannelLayout stereo = AV_CHANNEL_LAYOUT_STEREO;
+
+        if ((ret = av_opt_set_array(filt_asink, "channel_layouts", AV_OPT_SEARCH_CHILDREN,
+                                    0, 1, AV_OPT_TYPE_CHLAYOUT, &stereo)) < 0)
+            goto end;
+        if (force_output_format &&
+            (ret = av_opt_set_array(filt_asink, "samplerates", AV_OPT_SEARCH_CHILDREN,
+                                    0, 1, AV_OPT_TYPE_INT, &is->audio_tgt.freq)) < 0)
+            goto end;
+    } else if (force_output_format) {
         if ((ret = av_opt_set_array(filt_asink, "channel_layouts", AV_OPT_SEARCH_CHILDREN,
                                     0, 1, AV_OPT_TYPE_CHLAYOUT, &is->audio_tgt.ch_layout)) < 0)
             goto end;
@@ -3961,6 +3976,18 @@ static void stream_cycle_channel(VideoState *is, int codec_type)
     stream_component_open(is, stream_index);
 }
 
+/* Re-open the current audio stream so a changed output layout (original vs
+ * 2.0 stereo downmix) takes effect immediately; video keeps playing. */
+static void reopen_audio(VideoState *is)
+{
+    int idx = is->audio_stream;
+
+    if (idx < 0)
+        return;
+    stream_component_close(is, idx);
+    stream_component_open(is, idx);
+}
+
 
 static void toggle_full_screen(VideoState *is)
 {
@@ -4103,7 +4130,8 @@ static char *wait_for_input_file(void)
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_MOUSEBUTTONDOWN &&
                 ev.button.button == SDL_BUTTON_RIGHT) {
-                switch (ui_context_menu(fsr, fsr_denoise, fsr_fg, NULL, NULL)) {
+                switch (ui_context_menu(fsr, fsr_denoise, fsr_fg, audio_stereo,
+                                        NULL, NULL)) {
                 case UI_MENU_OPEN: {
                     char *f = ui_open_file_dialog();
 
@@ -4117,6 +4145,8 @@ static char *wait_for_input_file(void)
                 case UI_MENU_FSR: fsr = !fsr; break; /* no video: flip only */
                 case UI_MENU_NR:  fsr_denoise = !fsr_denoise; break;
                 case UI_MENU_FG:  fsr_fg = !fsr_fg; break;
+                case UI_MENU_AOUT_ORIG:   audio_stereo = 0; break;
+                case UI_MENU_AOUT_STEREO: audio_stereo = 1; break;
                 }
                 continue;
             }
@@ -4190,7 +4220,7 @@ static int handle_ui_event(VideoState *cur_stream, const SDL_Event *event)
         event->button.button == SDL_BUTTON_RIGHT) {
         int sym = 0;
 
-        switch (ui_context_menu(fsr, fsr_denoise, fsr_fg,
+        switch (ui_context_menu(fsr, fsr_denoise, fsr_fg, audio_stereo,
                                 menu_idle_present, cur_stream)) {
         case UI_MENU_OPEN:
             return 2; /* caller runs the dialog and switches the input */
@@ -4199,6 +4229,22 @@ static int handle_ui_event(VideoState *cur_stream, const SDL_Event *event)
         case UI_MENU_FSR: sym = SDLK_x; break;
         case UI_MENU_NR:  sym = SDLK_d; break;
         case UI_MENU_FG:  sym = SDLK_g; break;
+        case UI_MENU_AOUT_ORIG:
+            if (audio_stereo) {
+                audio_stereo = 0;
+                reopen_audio(cur_stream);
+                if (renderer)
+                    fsr_toast_show(renderer, "SOURCE");
+            }
+            break;
+        case UI_MENU_AOUT_STEREO:
+            if (!audio_stereo) {
+                audio_stereo = 1;
+                reopen_audio(cur_stream);
+                if (renderer)
+                    fsr_toast_show(renderer, "STEREO 2.0");
+            }
+            break;
         }
         if (sym) { /* reuse the x/d/g key toggles (toast + refresh) */
             SDL_Event kev = { 0 };

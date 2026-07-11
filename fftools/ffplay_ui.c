@@ -474,13 +474,13 @@ static LRESULT CALLBACK menu_wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 }
 #endif
 
-int ui_context_menu(int fsr_on, int nr_on, int fg_on,
+int ui_context_menu(int fsr_on, int nr_on, int fg_on, int stereo_on,
                     void (*on_idle)(void *), void *idle_ctx)
 {
 #ifdef _WIN32
     SDL_SysWMinfo wm;
     HWND owner = NULL;
-    HMENU menu, fx;
+    HMENU menu, fx, ao;
     POINT pt;
     int cmd = 0;
 
@@ -489,7 +489,8 @@ int ui_context_menu(int fsr_on, int nr_on, int fg_on,
         owner = wm.info.win.window;
     menu = CreatePopupMenu();
     fx   = CreatePopupMenu();
-    if (owner && menu && fx) {
+    ao   = CreatePopupMenu();
+    if (owner && menu && fx && ao) {
         AppendMenuW(menu, MF_STRING, UI_MENU_OPEN, L"파일 열기(&O)...");
         AppendMenuW(fx, MF_STRING | (fsr_on ? MF_CHECKED : 0),
                     UI_MENU_FSR, L"FSR 업스케일");
@@ -498,6 +499,11 @@ int ui_context_menu(int fsr_on, int nr_on, int fg_on,
         AppendMenuW(fx, MF_STRING | (fg_on ? MF_CHECKED : 0),
                     UI_MENU_FG, L"FG 프레임 생성");
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)fx, L"영상 효과(&E)");
+        AppendMenuW(ao, MF_STRING | (!stereo_on ? MF_CHECKED : 0),
+                    UI_MENU_AOUT_ORIG, L"원본 그대로 출력");
+        AppendMenuW(ao, MF_STRING | (stereo_on ? MF_CHECKED : 0),
+                    UI_MENU_AOUT_STEREO, L"2.0 스테레오");
+        AppendMenuW(menu, MF_POPUP, (UINT_PTR)ao, L"소리 출력(&A)");
         AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
         AppendMenuW(menu, MF_STRING, UI_MENU_CLOSE, L"닫기(&X)");
         GetCursorPos(&pt);
@@ -518,10 +524,14 @@ int ui_context_menu(int fsr_on, int nr_on, int fg_on,
         }
         menu_idle_fn = NULL;
     }
-    if (menu)
-        DestroyMenu(menu); /* also destroys the attached submenu */
-    else if (fx)
-        DestroyMenu(fx);
+    if (menu) {
+        DestroyMenu(menu); /* also destroys attached submenus */
+    } else {                /* not attached: free them individually */
+        if (fx)
+            DestroyMenu(fx);
+        if (ao)
+            DestroyMenu(ao);
+    }
     return cmd;
 #else
     return 0;
