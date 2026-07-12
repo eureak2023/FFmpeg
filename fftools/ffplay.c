@@ -3222,24 +3222,50 @@ static int audio_open(void *opaque, AVChannelLayout *wanted_channel_layout, int 
     return spec.size;
 }
 
-static int create_hwaccel_type(enum AVHWDeviceType type, const AVCodec *codec,
-                               AVBufferRef **device_ctx)
+/* Does this decoder carry a hwaccel config for `type` (via hw_device_ctx)? */
+static int codec_supports_hwtype(const AVCodec *codec, enum AVHWDeviceType type)
 {
-    int ret, found = 0;
-
     for (int i = 0;; i++) {
         const AVCodecHWConfig *cfg = avcodec_get_hw_config(codec, i);
         if (!cfg)
-            break;
+            return 0;
         if (cfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX &&
-            cfg->device_type == type) {
-            found = 1;
-            break;
-        }
+            cfg->device_type == type)
+            return 1;
     }
-    if (!found) {
-        av_log(NULL, AV_LOG_VERBOSE, "Decoder %s does not support %s hardware decoding\n",
-               codec->name, av_hwdevice_get_type_name(type));
+}
+
+/* Find any decoder for codec_id that can use `type`. The default decoder for a
+ * codec is often a software wrapper (e.g. libdav1d for AV1, which has no hwaccel
+ * config); the *native* decoder is the one carrying the d3d11va/dxva2 configs.
+ * Returns NULL when nothing supports it. */
+static const AVCodec *find_hw_decoder(enum AVCodecID id, enum AVHWDeviceType type)
+{
+    void *it = NULL;
+    const AVCodec *c;
+
+    while ((c = av_codec_iterate(&it))) {
+        if (c->id == id && av_codec_is_decoder(c) &&
+            codec_supports_hwtype(c, type))
+            return c;
+    }
+    return NULL;
+}
+
+/* On success, *codecp may be swapped to a hw-capable decoder for the same codec
+ * (see find_hw_decoder). *codecp is only changed when a device is created. */
+static int create_hwaccel_type(enum AVHWDeviceType type, const AVCodec **codecp,
+                               AVBufferRef **device_ctx)
+{
+    const AVCodec *codec = *codecp;
+    const AVCodec *hwcodec;
+    int ret;
+
+    hwcodec = codec_supports_hwtype(codec, type) ? codec
+                                                 : find_hw_decoder(codec->id, type);
+    if (!hwcodec) {
+        av_log(NULL, AV_LOG_VERBOSE, "No decoder for %s supports %s hardware decoding\n",
+               avcodec_get_name(codec->id), av_hwdevice_get_type_name(type));
         return AVERROR(ENOTSUP);
     }
 
@@ -3250,8 +3276,10 @@ static int create_hwaccel_type(enum AVHWDeviceType type, const AVCodec *codec,
         if (ret < 0)
             return ret;
         ret = av_hwdevice_ctx_create_derived(device_ctx, type, vk_dev, 0);
-        if (!ret)
+        if (!ret) {
+            *codecp = hwcodec;
             return 0;
+        }
         if (ret != AVERROR(ENOSYS))
             return ret;
         av_log(NULL, AV_LOG_WARNING, "Derive %s from vulkan not supported.\n",
@@ -3267,15 +3295,22 @@ static int create_hwaccel_type(enum AVHWDeviceType type, const AVCodec *codec,
             char buf[16];
 
             snprintf(buf, sizeof(buf), "%d", idx);
-            if (av_hwdevice_ctx_create(device_ctx, type, buf, NULL, 0) >= 0)
+            if (av_hwdevice_ctx_create(device_ctx, type, buf, NULL, 0) >= 0) {
+                *codecp = hwcodec;
                 return 0;
+            }
         }
     }
-    return av_hwdevice_ctx_create(device_ctx, type, NULL, NULL, 0);
+    ret = av_hwdevice_ctx_create(device_ctx, type, NULL, NULL, 0);
+    if (ret >= 0)
+        *codecp = hwcodec;
+    return ret;
 }
 
-static int create_hwaccel(const AVCodec *codec, AVBufferRef **device_ctx)
+/* *codec may be swapped to a hw-capable decoder for the same codec on success. */
+static int create_hwaccel(const AVCodec **codec, AVBufferRef **device_ctx)
 {
+    const AVCodec *orig = *codec;
     enum AVHWDeviceType type;
     int ret;
 
@@ -3292,7 +3327,8 @@ static int create_hwaccel(const AVCodec *codec, AVBufferRef **device_ctx)
             if (type == AV_HWDEVICE_TYPE_NONE)
                 continue;
             if (create_hwaccel_type(type, codec, device_ctx) >= 0) {
-                av_log(NULL, AV_LOG_INFO, "Using %s hardware decoding\n", candidates[i]);
+                av_log(NULL, AV_LOG_INFO, "Using %s hardware decoding (%s decoder)\n",
+                       candidates[i], (*codec)->name);
                 return 0;
             }
         }
@@ -3316,9 +3352,11 @@ static int create_hwaccel(const AVCodec *codec, AVBufferRef **device_ctx)
         av_log(NULL, ret == AVERROR(ENOTSUP) ? AV_LOG_VERBOSE : AV_LOG_WARNING,
                "Cannot initialize %s hardware decoding, using software decoding\n", hwaccel);
         av_buffer_unref(device_ctx);
+        *codec = orig;
         return 0;
     }
-    av_log(NULL, AV_LOG_INFO, "Using %s hardware decoding\n", hwaccel);
+    av_log(NULL, AV_LOG_INFO, "Using %s hardware decoding (%s decoder)\n",
+           hwaccel, (*codec)->name);
     return 0;
 }
 
@@ -3398,7 +3436,7 @@ static int stream_component_open(VideoState *is, int stream_index)
                        "FSR upscaling default-off for %dx%d source (press 'x' to enable)\n",
                        avctx->width, avctx->height);
         }
-        ret = create_hwaccel(codec, &avctx->hw_device_ctx);
+        ret = create_hwaccel(&codec, &avctx->hw_device_ctx);
         if (ret < 0)
             goto fail;
     }
