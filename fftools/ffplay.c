@@ -1418,7 +1418,9 @@ static void stream_close(VideoState *is)
 }
 
 /* Query the display refresh rate for frame-generation pacing (remote
- * sessions switch it at runtime); generated output is capped at 60 fps. */
+ * sessions switch it at runtime); generated output is paced to the display
+ * refresh so a high-fps source (e.g. 60 fps on a 120/144 Hz panel) can still
+ * be interpolated. Bounded to keep the optical-flow cost sane at 4K. */
 static void update_fg_refresh(void)
 {
     SDL_DisplayMode mode;
@@ -1426,7 +1428,7 @@ static void update_fg_refresh(void)
     if (window &&
         !SDL_GetCurrentDisplayMode(SDL_GetWindowDisplayIndex(window), &mode) &&
         mode.refresh_rate > 0) {
-        int rate = FFMIN(mode.refresh_rate, 60);
+        int rate = FFMIN(mode.refresh_rate, 240);
 
         fg_refresh = 1.0 / rate;
         av_log(NULL, AV_LOG_INFO, "FG: display refresh %d Hz, pacing %d fps\n",
@@ -1596,14 +1598,16 @@ static void status_hud_update(int fps)
                       (int)lrint(hud_src_fps), last_fps);
     else
         n += snprintf(buf + n, sizeof(buf) - n, "%d FPS\n", last_fps);
-    /* show FG's effective state for this file: it only runs on the
-     * hardware zero-copy path and for sub-50fps sources */
+    /* show FG's effective state for this file: it only runs on the hardware
+     * zero-copy path and when the source interval leaves room before the next
+     * display refresh (mirrors the pacing gate in video_refresh). */
     snprintf(buf + n, sizeof(buf) - n,
              "FSR %s\nSHARP %d\nNR %s\nFG %s",
              fsr ? "ON" : "OFF",
              (int)lrint((2.0f - fsr_sharpness) / 2.0f * 100.0f),
              fsr_denoise ? "ON" : "OFF",
-             fsr_fg && hud_hw && (hud_src_fps <= 0 || hud_src_fps < 50.0)
+             fsr_fg && hud_hw &&
+             (hud_src_fps <= 0 || 1.0 / hud_src_fps > fg_refresh * 1.5)
                  ? "ON" : "OFF");
     fsr_hud_set(renderer, buf);
 }
@@ -1989,8 +1993,11 @@ retry:
                 /* Frame generation: fill the interval up to the display
                  * refresh rate with interpolated frames at refresh-aligned
                  * offsets (30fps -> 1 per interval, 24fps -> 2, ...). */
+                /* No source-fps ceiling: whether a frame gets generated is
+                 * decided purely by there being room before the next display
+                 * refresh slot (delay > fg_refresh * 1.5), so a 60 fps source
+                 * interpolates on a >60 Hz panel and does nothing on a 60 Hz one. */
                 if (fsr_fg && !is->paused &&
-                    (hud_src_fps <= 0 || hud_src_fps < 50.0) &&
                     is->show_mode == SHOW_MODE_VIDEO && is->pictq.rindex_shown &&
                     frame_queue_nb_remaining(&is->pictq) > 0 &&
                     delay > fg_refresh * 1.5) {
@@ -3536,10 +3543,6 @@ static int stream_component_open(VideoState *is, int stream_index)
             hud_src_h   = avctx->height;
             hud_src_fps = fr.num && fr.den ? av_q2d(fr) : 0.0;
             hud_hw      = !!avctx->hw_device_ctx;
-            if (fsr_fg && hud_src_fps >= 50.0)
-                av_log(NULL, AV_LOG_INFO,
-                       "FG: %.0f fps source, frame generation not needed\n",
-                       hud_src_fps);
         }
         break;
     case AVMEDIA_TYPE_SUBTITLE:
