@@ -59,6 +59,7 @@
 #include "ffplay_renderer.h"
 #include "ffplay_fsr.h"
 #include "ffplay_ui.h"
+#include "ffplay_thumb.h"
 #include "opt_common.h"
 
 const char program_name[] = "ffplay";
@@ -1383,6 +1384,8 @@ static void stream_close(VideoState *is)
     /* XXX: use a special url_shutdown call to abort parse cleanly */
     is->abort_request = 1;
     SDL_WaitThread(is->read_tid, NULL);
+
+    thumb_close();
 
     /* close each stream */
     if (is->audio_stream >= 0)
@@ -3823,6 +3826,13 @@ static int read_thread(void *arg)
 
     if (infinite_buffer < 0 && is->realtime)
         infinite_buffer = 1;
+
+    /* Seek-bar hover previews: a private software decoder on the same file.
+     * Only worthwhile with a real, seekable, non-realtime video stream. */
+    if (is->video_stream >= 0 && !display_disable && !is->realtime)
+        thumb_open(is->filename,
+                   ic->duration != AV_NOPTS_VALUE ?
+                   ic->duration / (double)AV_TIME_BASE : 0.0);
 
     for (;;) {
         if (is->abort_request)
