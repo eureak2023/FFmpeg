@@ -326,6 +326,10 @@ static int audio_disable;
 static int video_disable;
 static int subtitle_disable;
 static const char* wanted_stream_spec[AVMEDIA_TYPE_NB] = {0};
+/* Preferred subtitle language when a file has several and none is pinned with
+ * -sst. av_find_best_stream() only looks at disposition/codec, so without this
+ * a Korean track hides behind whatever comes first. "" disables the preference. */
+static const char *subtitle_lang = "kor";
 static int seek_by_bytes = -1;
 static float seek_interval = 10;
 static int display_disable;
@@ -3549,6 +3553,50 @@ static int is_realtime(AVFormatContext *s)
     return 0;
 }
 
+/* Does a stream's "language" tag name this language? Accepts the ISO 639-2/T,
+ * 639-2/B and 639-1 spellings so e.g. "kor"/"ko"/"korean" all match "kor". */
+static int stream_lang_matches(AVStream *st, const char *want)
+{
+    const AVDictionaryEntry *e = av_dict_get(st->metadata, "language", NULL, 0);
+    const char *tag = e ? e->value : NULL;
+
+    if (!tag || !want || !*want)
+        return 0;
+    if (!av_strcasecmp(tag, want))
+        return 1;
+    if ((!av_strcasecmp(want, "kor") || !av_strcasecmp(want, "ko")) &&
+        (!av_strcasecmp(tag, "kor") || !av_strcasecmp(tag, "ko") ||
+         !av_strcasecmp(tag, "korean")))
+        return 1;
+    return 0;
+}
+
+/* Pick the best stream of a type in the wanted language, or -1 if none. Among
+ * matches, prefer a full track over a FORCED (foreign-parts-only) one, then a
+ * DEFAULT-flagged one, then the lowest index. */
+static int find_stream_by_language(AVFormatContext *ic, enum AVMediaType type,
+                                   const char *want)
+{
+    int best = -1, best_score = -1;
+    unsigned i;
+
+    for (i = 0; i < ic->nb_streams; i++) {
+        AVStream *st = ic->streams[i];
+        int score;
+
+        if (st->codecpar->codec_type != type || !stream_lang_matches(st, want))
+            continue;
+        score = 0;
+        if (!(st->disposition & AV_DISPOSITION_FORCED))  score += 2;
+        if (st->disposition & AV_DISPOSITION_DEFAULT)    score += 1;
+        if (score > best_score) {
+            best_score = score;
+            best = i;
+        }
+    }
+    return best;
+}
+
 /* this thread gets the stream from the disk or the network */
 static int read_thread(void *arg)
 {
@@ -3720,7 +3768,18 @@ static int read_thread(void *arg)
                                 st_index[AVMEDIA_TYPE_AUDIO],
                                 st_index[AVMEDIA_TYPE_VIDEO],
                                 NULL, 0);
-    if (!video_disable && !subtitle_disable)
+    if (!video_disable && !subtitle_disable) {
+        /* When the user didn't pin a subtitle with -sst, prefer the wanted
+         * language (default Korean) among several tracks; av_find_best_stream
+         * would otherwise ignore language and pick by disposition/order. */
+        if (st_index[AVMEDIA_TYPE_SUBTITLE] < 0 && subtitle_lang && *subtitle_lang) {
+            int k = find_stream_by_language(ic, AVMEDIA_TYPE_SUBTITLE, subtitle_lang);
+            if (k >= 0) {
+                st_index[AVMEDIA_TYPE_SUBTITLE] = k;
+                av_log(NULL, AV_LOG_INFO,
+                       "Selecting '%s' subtitle stream #%d\n", subtitle_lang, k);
+            }
+        }
         st_index[AVMEDIA_TYPE_SUBTITLE] =
             av_find_best_stream(ic, AVMEDIA_TYPE_SUBTITLE,
                                 st_index[AVMEDIA_TYPE_SUBTITLE],
@@ -3728,6 +3787,7 @@ static int read_thread(void *arg)
                                  st_index[AVMEDIA_TYPE_AUDIO] :
                                  st_index[AVMEDIA_TYPE_VIDEO]),
                                 NULL, 0);
+    }
 
     is->show_mode = show_mode;
     if (st_index[AVMEDIA_TYPE_VIDEO] >= 0) {
@@ -4890,6 +4950,7 @@ static const OptionDef options[] = {
     { "ast",                OPT_TYPE_STRING, OPT_EXPERT, { &wanted_stream_spec[AVMEDIA_TYPE_AUDIO] }, "select desired audio stream", "stream_specifier" },
     { "vst",                OPT_TYPE_STRING, OPT_EXPERT, { &wanted_stream_spec[AVMEDIA_TYPE_VIDEO] }, "select desired video stream", "stream_specifier" },
     { "sst",                OPT_TYPE_STRING, OPT_EXPERT, { &wanted_stream_spec[AVMEDIA_TYPE_SUBTITLE] }, "select desired subtitle stream", "stream_specifier" },
+    { "slang",              OPT_TYPE_STRING,          0, { &subtitle_lang }, "preferred subtitle language when several exist (default kor; \"\" to disable)", "lang" },
     { "ss",                 OPT_TYPE_TIME,            0, { &start_time }, "seek to a given position in seconds", "pos" },
     { "t",                  OPT_TYPE_TIME,            0, { &duration }, "play  \"duration\" seconds of audio/video", "duration" },
     { "bytes",              OPT_TYPE_INT,             0, { &seek_by_bytes }, "seek by bytes 0=off 1=on -1=auto", "val" },
