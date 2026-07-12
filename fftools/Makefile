@@ -55,6 +55,7 @@ OBJS-ffmpeg += $(COMPAT_OBJS:%=compat/%)
 OBJS-ffplay += fftools/ffplay_renderer.o
 OBJS-ffplay += fftools/ffplay_fsr.o
 OBJS-ffplay += fftools/ffplay_ui.o
+OBJS-ffplay += fftools/ffplay_lada.o
 OBJS-ffplay-$(HAVE_GNU_WINDRES) += fftools/ffplay_res.o
 # GUI subsystem: no console window flashes on double-click launches;
 # fsr_detach_console() re-attaches to the parent console when run from one.

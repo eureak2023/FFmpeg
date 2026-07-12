@@ -2380,6 +2380,10 @@ static const uint8_t *toast_glyph(char c)
     static const uint8_t gE[8] = {0x7E,0x60,0x60,0x7C,0x60,0x60,0x7E,0x00};
     static const uint8_t gU[8] = {0x66,0x66,0x66,0x66,0x66,0x66,0x3C,0x00};
     static const uint8_t gC[8] = {0x3C,0x66,0x60,0x60,0x60,0x66,0x3C,0x00};
+    static const uint8_t gB[8] = {0x7C,0x66,0x66,0x7C,0x66,0x66,0x7C,0x00};
+    static const uint8_t gD[8] = {0x7C,0x66,0x66,0x66,0x66,0x66,0x7C,0x00};
+    static const uint8_t gI[8] = {0x7E,0x18,0x18,0x18,0x18,0x18,0x7E,0x00};
+    static const uint8_t gW[8] = {0x42,0x42,0x42,0x5A,0x5A,0x66,0x24,0x00};
     static const uint8_t gSl[8] = {0x02,0x06,0x0C,0x18,0x30,0x60,0x40,0x00};
     static const uint8_t gDigits[10][8] = {
         {0x3C,0x66,0x6E,0x76,0x66,0x66,0x3C,0x00},
@@ -2417,6 +2421,10 @@ static const uint8_t *toast_glyph(char c)
     case 'E': return gE;
     case 'U': return gU;
     case 'C': return gC;
+    case 'B': return gB;
+    case 'D': return gD;
+    case 'I': return gI;
+    case 'W': return gW;
     case '/': return gSl;
     case '.': return gDot;
     case ':': return gColon;
@@ -2545,6 +2553,39 @@ int fsr_hud_draw(SDL_Renderer *renderer)
     return 1;
 }
 
+/* Second persistent HUD, top-LEFT corner (used for the lada status line). */
+static SDL_Texture *hud_left_tex;
+static int          hud_left_w, hud_left_h;
+
+void fsr_hud_left_set(SDL_Renderer *renderer, const char *text)
+{
+    if (hud_left_tex) {
+        SDL_DestroyTexture(hud_left_tex);
+        hud_left_tex = NULL;
+    }
+    if (text && text[0])
+        hud_left_tex = toast_render(renderer, text, &hud_left_w, &hud_left_h);
+}
+
+int fsr_hud_left_draw(SDL_Renderer *renderer)
+{
+    int ow = 0, oh = 0, scale;
+    SDL_Rect dst;
+
+    if (!hud_left_tex)
+        return 0;
+    SDL_GetRendererOutputSize(renderer, &ow, &oh);
+    scale = oh / 300;
+    if (scale < 1)
+        scale = 1;
+    dst.w = hud_left_w * scale;
+    dst.h = hud_left_h * scale;
+    dst.x = 16;
+    dst.y = 50;   /* below the UI title bar (34px) so the status doesn't overlap it */
+    SDL_RenderCopy(renderer, hud_left_tex, NULL, &dst);
+    return 1;
+}
+
 int fsr_toast_active(void)
 {
     return toast_tex && av_gettime_relative() < toast_until;
@@ -2581,6 +2622,7 @@ void fsr_uninit(void)
 #endif
     if (toast_tex)  { SDL_DestroyTexture(toast_tex);  toast_tex  = NULL; }
     if (hud_tex)    { SDL_DestroyTexture(hud_tex);    hud_tex    = NULL; }
+    if (hud_left_tex) { SDL_DestroyTexture(hud_left_tex); hud_left_tex = NULL; }
     if (native_tex) { SDL_DestroyTexture(native_tex); native_tex = NULL; }
     if (easu_tex)   { SDL_DestroyTexture(easu_tex);   easu_tex   = NULL; }
     if (out_tex)    { SDL_DestroyTexture(out_tex);    out_tex    = NULL; }

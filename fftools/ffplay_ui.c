@@ -475,7 +475,7 @@ static LRESULT CALLBACK menu_wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 }
 #endif
 
-int ui_context_menu(int fsr_on, int nr_on, int fg_on, int stereo_on,
+int ui_context_menu(int fsr_on, int nr_on, int fg_on, int lada_on, int stereo_on,
                     int scale_mode, void (*on_idle)(void *), void *idle_ctx)
 {
 #ifdef _WIN32
@@ -500,6 +500,8 @@ int ui_context_menu(int fsr_on, int nr_on, int fg_on, int stereo_on,
                     UI_MENU_NR, L"NR 노이즈 제거");
         AppendMenuW(fx, MF_STRING | (fg_on ? MF_CHECKED : 0),
                     UI_MENU_FG, L"FG 프레임 생성");
+        AppendMenuW(fx, MF_STRING | (lada_on ? MF_CHECKED : 0),
+                    UI_MENU_LADA, L"Lada 적용");
         AppendMenuW(sc, MF_STRING | (scale_mode == 0 ? MF_CHECKED : 0),
                     UI_MENU_SCALE_FIT, L"비율 유지");
         AppendMenuW(sc, MF_STRING | (scale_mode == 1 ? MF_CHECKED : 0),

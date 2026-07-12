@@ -59,6 +59,7 @@
 #include "ffplay_renderer.h"
 #include "ffplay_fsr.h"
 #include "ffplay_ui.h"
+#include "ffplay_lada.h"
 #include "opt_common.h"
 
 const char program_name[] = "ffplay";
@@ -369,6 +370,9 @@ static int fsr = -1; /* -1 = auto: on up to 1080p sources, off above */
 static float fsr_sharpness = 0.0f; /* RCAS attenuation stops, 0 = maximum sharpness */
 static int fsr_denoise = 0;
 static int fsr_fg = 1;             /* 2x frame generation (hardware optical flow) */
+static int lada = 0;               /* real-time mosaic restoration via the lada sidecar, toggled with 'L' */
+static const char *lada_home = "D:/Source_AI/ffplay-fsr1/lada"; /* lada project root (.venv + lada_sidecar.py) */
+static SDL_Texture *lada_texture = NULL; /* upload target for restored RGB24 frames */
 static int show_fps = 0;           /* FPS overlay, toggled with TAB */
 static int install_assoc = 0;      /* register .mp4/.mkv associations and exit */
 static int uninstall_assoc = 0;
@@ -1104,6 +1108,23 @@ static void video_image_display(VideoState *is)
 
     draw_video_background(is);
 
+    /* lada: if a restored (de-mosaiced) frame for this pts is ready, display it in
+     * place of the original and let it flow through the same FSR passes. When it is
+     * not ready yet (buffering, or the sidecar is behind) we fall through to the
+     * normal path and show the original frame - playback never stalls. */
+    if (lada_active()) {
+        const uint8_t *lrgb;
+        int lw, lh;
+        if (lada_frame_for(vp->pts, vp->duration, &lrgb, &lw, &lh) &&
+            realloc_texture(&lada_texture, SDL_PIXELFORMAT_RGB24, lw, lh, SDL_BLENDMODE_NONE, 0) >= 0) {
+            SDL_UpdateTexture(lada_texture, NULL, lrgb, lw * 3);
+            if (!fsr || !fsr_draw(renderer, lada_texture, lw, lh, rect, 0, fsr_sharpness))
+                SDL_RenderCopyEx(renderer, lada_texture, NULL, rect, 0, NULL, 0);
+            hw_drawn = 1;   /* skip the original hardware/software draw below */
+            goto lada_done;
+        }
+    }
+
     if (vp->frame->format == AV_PIX_FMT_D3D11) {
         hw_drawn = fsr_hw_draw(renderer, vp->frame, rect, fsr, fsr_sharpness);
         if (!hw_drawn) {
@@ -1141,6 +1162,7 @@ static void video_image_display(VideoState *is)
             SDL_RenderCopyEx(renderer, is->vid_texture, NULL, rect, 0, NULL, vp->flip_v ? SDL_FLIP_VERTICAL : 0);
         set_sdl_yuv_conversion_mode(NULL);
     }
+lada_done:
     if (sp) {
 #if USE_ONEPASS_SUBTITLE_RENDER
         SDL_RenderCopy(renderer, is->sub_texture, NULL, rect);
@@ -1492,6 +1514,9 @@ static void save_settings(VideoState *is)
 static void do_exit(VideoState *is)
 {
     save_settings(is);
+    lada_stop();
+    if (lada_texture)
+        SDL_DestroyTexture(lada_texture);
     if (is) {
         stream_close(is);
     }
@@ -1599,6 +1624,11 @@ static void status_hud_update(int fps)
              fsr_fg && hud_hw && (hud_src_fps <= 0 || hud_src_fps < 50.0)
                  ? "ON" : "OFF");
     fsr_hud_set(renderer, buf);
+    {   /* lada status on the left (LADA OFF / LOADING / WAIT / ACTIVE / FAILED) */
+        char lbuf[24];
+        snprintf(lbuf, sizeof(lbuf), "LADA %s", lada_status());
+        fsr_hud_left_set(renderer, lbuf);
+    }
 }
 
 static void fps_tick(void)
@@ -1657,6 +1687,7 @@ static void video_display(VideoState *is)
     ui_draw_overlay(is);
     fsr_toast_draw(renderer);
     fsr_hud_draw(renderer);
+    fsr_hud_left_draw(renderer);
     SDL_RenderPresent(renderer);
     fps_tick();
 }
@@ -1789,10 +1820,48 @@ static void stream_toggle_pause(VideoState *is)
     is->paused = is->audclk.paused = is->vidclk.paused = is->extclk.paused = !is->paused;
 }
 
+static int lada_auto_paused;   /* nonzero while playback is paused by lada buffering */
+
 static void toggle_pause(VideoState *is)
 {
+    lada_auto_paused = 0;   /* a user pause/resume takes over from lada auto-buffering */
     stream_toggle_pause(is);
     is->step = 0;
+}
+
+/* Pause playback while the lada sidecar refills its restored-frame buffer, and resume
+ * once it has enough again. Only engages after restoration has started (see
+ * lada_should_buffer); during model loading / the initial lead, playback runs normally. */
+static void lada_buffer_gate(VideoState *is)
+{
+    double dpts;
+
+    if (!is || !lada_active()) {
+        if (lada_auto_paused) {
+            if (is && is->paused)
+                stream_toggle_pause(is);   /* undo our pause if lada turned off */
+            lada_auto_paused = 0;
+        }
+        return;
+    }
+    if (lada_auto_paused && !is->paused) {   /* user resumed our pause: hand back control */
+        lada_auto_paused = 0;
+        return;
+    }
+    dpts = get_master_clock(is);
+    if (isnan(dpts))
+        return;
+    if (lada_should_buffer(dpts)) {
+        if (!is->paused) {
+            stream_toggle_pause(is);
+            lada_auto_paused = 1;
+            av_log(NULL, AV_LOG_VERBOSE, "lada: buffering (pause) at %.2f\n", dpts);
+        }
+    } else if (lada_auto_paused && is->paused) {
+        stream_toggle_pause(is);
+        lada_auto_paused = 0;
+        av_log(NULL, AV_LOG_VERBOSE, "lada: buffered, resuming at %.2f\n", dpts);
+    }
 }
 
 static void toggle_mute(VideoState *is)
@@ -1923,6 +1992,7 @@ static void video_fg_display(VideoState *is, double phase)
     ui_draw_overlay(is);
     fsr_toast_draw(renderer);
     fsr_hud_draw(renderer);
+    fsr_hud_left_draw(renderer);
     SDL_RenderPresent(renderer);
     fps_tick();
 }
@@ -1982,7 +2052,7 @@ retry:
                 /* Frame generation: fill the interval up to the display
                  * refresh rate with interpolated frames at refresh-aligned
                  * offsets (30fps -> 1 per interval, 24fps -> 2, ...). */
-                if (fsr_fg && !is->paused &&
+                if (fsr_fg && !is->paused && !lada_active() &&
                     (hud_src_fps <= 0 || hud_src_fps < 50.0) &&
                     is->show_mode == SHOW_MODE_VIDEO && is->pictq.rindex_shown &&
                     frame_queue_nb_remaining(&is->pictq) > 0 &&
@@ -4159,6 +4229,21 @@ static void refresh_loop_wait_event(VideoState *is, SDL_Event *event) {
         if (remaining_time > 0.0)
             fsr_precise_sleep((int64_t)(remaining_time * 1000000.0));
         remaining_time = REFRESH_RATE;
+        {   /* surface lada status changes ("LADA ACTIVE" / "LADA FAILED") as toasts */
+            char lt[24];
+            if (lada_poll_toast(lt, sizeof(lt))) {
+                if (renderer)
+                    fsr_toast_show(renderer, lt);
+                if (!strcmp(lt, "LADA FAILED")) {
+                    lada_stop();
+                    lada = 0;
+                }
+                is->force_refresh = 1;
+            }
+        }
+        lada_buffer_gate(is);   /* pause/resume playback to keep the restored buffer full */
+        if (lada_auto_paused)
+            is->force_refresh = 1;   /* keep the frame + status overlay live while buffering */
         if (fsr_toast_active())
             is->force_refresh = 1;
         if (is->show_mode != SHOW_MODE_NONE && (!is->paused || is->force_refresh))
@@ -4218,9 +4303,12 @@ static VideoState *switch_input(VideoState *old, char *filename)
 
     if (old)
         stream_close(old);
+    lada_stop();                /* re-point the restoration sidecar at the new file */
     input_filename = filename;
     ui_set_window(window, filename);
     new_is = stream_open(filename, NULL);
+    if (lada && lada_start(filename, lada_home, "cuda") == 0)
+        lada_set_enabled(1);
     if (!new_is) {
         av_log(NULL, AV_LOG_FATAL, "Failed to initialize VideoState!\n");
         do_exit(NULL);
@@ -4250,7 +4338,7 @@ static char *wait_for_input_file(void)
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_MOUSEBUTTONDOWN &&
                 ev.button.button == SDL_BUTTON_RIGHT) {
-                switch (ui_context_menu(fsr, fsr_denoise, fsr_fg, audio_stereo,
+                switch (ui_context_menu(fsr, fsr_denoise, fsr_fg, lada_active(), audio_stereo,
                                         video_scaling, NULL, NULL)) {
                 case UI_MENU_OPEN: {
                     char *f = ui_open_file_dialog();
@@ -4265,6 +4353,7 @@ static char *wait_for_input_file(void)
                 case UI_MENU_FSR: fsr = !fsr; break; /* no video: flip only */
                 case UI_MENU_NR:  fsr_denoise = !fsr_denoise; break;
                 case UI_MENU_FG:  fsr_fg = !fsr_fg; break;
+                case UI_MENU_LADA: lada = !lada; break; /* no video: flip intent only */
                 case UI_MENU_AOUT_ORIG:   audio_stereo = 0; break;
                 case UI_MENU_AOUT_STEREO: audio_stereo = 1; break;
                 case UI_MENU_SCALE_FIT:     video_scaling = 0; break;
@@ -4343,7 +4432,7 @@ static int handle_ui_event(VideoState *cur_stream, const SDL_Event *event)
         event->button.button == SDL_BUTTON_RIGHT) {
         int sym = 0;
 
-        switch (ui_context_menu(fsr, fsr_denoise, fsr_fg, audio_stereo,
+        switch (ui_context_menu(fsr, fsr_denoise, fsr_fg, lada_active(), audio_stereo,
                                 video_scaling, menu_idle_present, cur_stream)) {
         case UI_MENU_OPEN:
             return 2; /* caller runs the dialog and switches the input */
@@ -4352,6 +4441,7 @@ static int handle_ui_event(VideoState *cur_stream, const SDL_Event *event)
         case UI_MENU_FSR: sym = SDLK_x; break;
         case UI_MENU_NR:  sym = SDLK_d; break;
         case UI_MENU_FG:  sym = SDLK_g; break;
+        case UI_MENU_LADA: sym = SDLK_l; break;
         case UI_MENU_SCALE_FIT:     set_video_scaling(cur_stream, 0); break;
         case UI_MENU_SCALE_FILL:    set_video_scaling(cur_stream, 1); break;
         case UI_MENU_SCALE_STRETCH: set_video_scaling(cur_stream, 2); break;
@@ -4521,6 +4611,24 @@ static void event_loop(VideoState *cur_stream)
                     fsr_toast_show(renderer, fsr_fg ? "FG ON" : "FG OFF");
                 cur_stream->force_refresh = 1;
                 break;
+            case SDLK_l:
+                if (!lada_active()) {
+                    /* Spawn the sidecar once (persistent, keeps models resident) and
+                     * enable streaming; re-enabling later is instant. */
+                    if (input_filename && lada_start(input_filename, lada_home, "cuda") == 0) {
+                        lada_set_enabled(1);
+                        lada = 1;
+                    }
+                } else {
+                    lada_set_enabled(0);   /* keep the process alive for instant re-enable */
+                    lada = 0;
+                }
+                av_log(NULL, AV_LOG_INFO, "lada mosaic restoration %s\n",
+                       lada_active() ? "enabled" : "disabled");
+                if (renderer)
+                    fsr_toast_show(renderer, lada_active() ? "LADA LOADING" : "LADA OFF");
+                cur_stream->force_refresh = 1;
+                break;
             case SDLK_d:
                 fsr_denoise = !fsr_denoise;
                 fsr_set_denoise(renderer, fsr_denoise);
@@ -4621,10 +4729,12 @@ static void event_loop(VideoState *cur_stream)
             case SDLK_TAB:
                 show_fps = !show_fps;
                 av_log(NULL, AV_LOG_INFO, "Status display %s\n", show_fps ? "on" : "off");
-                if (show_fps)
+                if (show_fps) {
                     status_hud_update(-1);
-                else
+                } else {
                     fsr_hud_set(renderer, NULL);
+                    fsr_hud_left_set(renderer, NULL);
+                }
                 cur_stream->force_refresh = 1;
                 break;
             do_seek:
@@ -4935,6 +5045,8 @@ static const OptionDef options[] = {
     { "fsr_sharpness",      OPT_TYPE_FLOAT, OPT_EXPERT, { &fsr_sharpness }, "FSR RCAS sharpness attenuation in stops (0=sharpest, adjust at runtime with +/-)", "stops" },
     { "fsr_denoise",        OPT_TYPE_BOOL,  OPT_EXPERT, { &fsr_denoise }, "reduce FSR sharpening of noise and film grain; toggle at runtime with 'd'" },
     { "fsr_fg",             OPT_TYPE_BOOL,  OPT_EXPERT, { &fsr_fg }, "2x frame generation via NVIDIA hardware optical flow, on by default (-nofsr_fg disables); toggle at runtime with 'g'" },
+    { "lada",               OPT_TYPE_BOOL,           0, { &lada }, "real-time mosaic (JAV) restoration via the lada sidecar; off by default, toggle at runtime with 'L'" },
+    { "lada_home",          OPT_TYPE_STRING, OPT_EXPERT, { &lada_home }, "path to the lada project root (contains .venv and lada_sidecar.py)", "dir" },
     { "install",            OPT_TYPE_BOOL,  OPT_EXPERT, { &install_assoc }, "register .mp4/.mkv file associations for the current user and exit" },
     { "uninstall",          OPT_TYPE_BOOL,  OPT_EXPERT, { &uninstall_assoc }, "remove the .mp4/.mkv file associations and exit" },
     { NULL, },
@@ -4996,6 +5108,7 @@ int main(int argc, char **argv)
     av_log_set_flags(AV_LOG_SKIP_REPEATED);
     parse_loglevel(argc, argv, options);
     load_settings(); /* remembered window size/volume; CLI options override */
+    lada = lada_default_on(); /* ffplay_lada.exe defaults lada ON; -nolada overrides */
 
     /* register all codecs, demux and protocols */
 #if CONFIG_AVDEVICE
@@ -5130,6 +5243,13 @@ int main(int argc, char **argv)
                 av_log(NULL, AV_LOG_WARNING,
                        "FG: hardware optical flow unavailable, frame generation disabled\n");
             update_fg_refresh();
+            if (lada && input_filename) {
+                if (lada_start(input_filename, lada_home, "cuda") < 0)
+                    av_log(NULL, AV_LOG_WARNING,
+                           "lada: sidecar unavailable, mosaic restoration disabled\n");
+                else
+                    lada_set_enabled(1);
+            }
         }
     }
 

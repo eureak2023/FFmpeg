@@ -105,6 +105,10 @@ int  fsr_toast_active(void);
 void fsr_hud_set(SDL_Renderer *renderer, const char *text);
 int  fsr_hud_draw(SDL_Renderer *renderer);
 
+/* Persistent top-left HUD (lada status). NULL/empty text hides it. */
+void fsr_hud_left_set(SDL_Renderer *renderer, const char *text);
+int  fsr_hud_left_draw(SDL_Renderer *renderer);
+
 /* 8x8 bitmap for a pixel-font character (uppercase letters, digits,
  * ':', '/', '.'), or NULL for characters rendered as blanks. */
 const uint8_t *fsr_glyph(char c);
