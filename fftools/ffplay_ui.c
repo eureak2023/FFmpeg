@@ -39,6 +39,7 @@
 
 #include "ffplay_fsr.h"
 #include "ffplay_ui.h"
+#include "ffplay_thumb.h"
 
 #define BAR_H          48       /* control bar height, px */
 #define SEEK_H         28       /* seek row hit-area height, px (taller = easier to click) */
@@ -108,6 +109,14 @@ static struct {
     SDL_Texture *text_tex; /* rendered time string */
     int          text_w, text_h;
     char         text_str[64];
+
+    /* seek-bar hover thumbnail preview */
+    SDL_Texture *thumb_tex;
+    int          thumb_tw, thumb_th;
+    int64_t      thumb_gen;
+    char         thumb_label[16];
+    SDL_Texture *thumb_label_tex;
+    int          thumb_label_w, thumb_label_h;
     SDL_Texture *title_tex;
     int          title_w, title_h, title_scale;
     SDL_Renderer *renderer;
@@ -621,6 +630,14 @@ void ui_uninit(void)
         SDL_DestroyTexture(ui.title_tex);
         ui.title_tex = NULL;
     }
+    if (ui.thumb_tex) {
+        SDL_DestroyTexture(ui.thumb_tex);
+        ui.thumb_tex = NULL;
+    }
+    if (ui.thumb_label_tex) {
+        SDL_DestroyTexture(ui.thumb_label_tex);
+        ui.thumb_label_tex = NULL;
+    }
     for (int i = 0; i < NBADGE; i++)
         if (ui.badge_tex[i]) {
             SDL_DestroyTexture(ui.badge_tex[i]);
@@ -860,6 +877,10 @@ int ui_wants_refresh(void)
 
     if (vis != ui.last_drawn_visible || ui.hover != ui.last_drawn_hover)
         return 1;
+    /* Keep redrawing while hovering the seek bar so an async preview frame
+     * shows up even when the cursor is still and the player is paused. */
+    if (vis && (ui.hover == EL_SEEK || ui.dragging) && thumb_available())
+        return 1;
     return 0;
 }
 
@@ -964,6 +985,85 @@ static SDL_Color icon_color(int el)
     SDL_Color off = { 225, 225, 225, 255 };
 
     return ui.hover == el ? on : off;
+}
+
+/* Preview popup: while the cursor is over the seek track, decode the frame at
+ * that time (in a background thread) and float a thumbnail above the bar with
+ * the timecode under it. No-op until the preview decoder produces something. */
+static void draw_seek_thumb(SDL_Renderer *r, int win_w, int seek_top,
+                            int track_w, double dur)
+{
+    const uint32_t *px;
+    int tw, th, bx, by, pad = 4, labelh = 20;
+    int64_t gen;
+    double frac, t;
+    char tc[16];
+
+    if (dur <= 0 || !(ui.hover == EL_SEEK || ui.dragging) || !thumb_available())
+        return;
+
+    frac = seek_frac_at(ui.mouse_x);
+    t    = frac * dur;
+    thumb_request(t);
+    if (!thumb_acquire(&tw, &th, &px, &gen))
+        return;
+
+    if (ui.thumb_tex && (ui.thumb_tw != tw || ui.thumb_th != th)) {
+        SDL_DestroyTexture(ui.thumb_tex);
+        ui.thumb_tex = NULL;
+    }
+    if (!ui.thumb_tex) {
+        ui.thumb_tex = SDL_CreateTexture(r, SDL_PIXELFORMAT_ARGB8888,
+                                         SDL_TEXTUREACCESS_STREAMING, tw, th);
+        ui.thumb_tw = tw;
+        ui.thumb_th = th;
+        ui.thumb_gen = -1;
+        if (!ui.thumb_tex)
+            return;
+    }
+    if (gen != ui.thumb_gen) {
+        SDL_UpdateTexture(ui.thumb_tex, NULL, px, tw * 4);
+        ui.thumb_gen = gen;
+    }
+
+    /* box centered on the cursor, clamped to the window, floating above the bar */
+    bx = ui.mouse_x - (tw + 2 * pad) / 2;
+    if (bx < 4)
+        bx = 4;
+    if (bx + tw + 2 * pad > win_w - 4)
+        bx = win_w - 4 - tw - 2 * pad;
+    by = seek_top - (th + 2 * pad + labelh) - 8;
+    if (by < 4)
+        by = 4;
+
+    fill(r, bx, by, tw + 2 * pad, th + 2 * pad + labelh, 20, 20, 20, 235);
+    {
+        SDL_Rect dst = { bx + pad, by + pad, tw, th };
+
+        SDL_RenderCopy(r, ui.thumb_tex, NULL, &dst);
+        SDL_SetRenderDrawColor(r, 90, 90, 90, 255);
+        SDL_RenderDrawRect(r, &dst);
+    }
+
+    {
+        int s = t < 0 ? 0 : (int)t;
+
+        snprintf(tc, sizeof(tc), "%02d:%02d:%02d", s / 3600, s % 3600 / 60, s % 60);
+    }
+    if (strcmp(tc, ui.thumb_label) || !ui.thumb_label_tex) {
+        if (ui.thumb_label_tex)
+            SDL_DestroyTexture(ui.thumb_label_tex);
+        ui.thumb_label_tex = render_text_sys(r, tc, 15,
+                                             &ui.thumb_label_w, &ui.thumb_label_h);
+        av_strlcpy(ui.thumb_label, tc, sizeof(ui.thumb_label));
+    }
+    if (ui.thumb_label_tex) {
+        SDL_Rect ld = { bx + (tw + 2 * pad - ui.thumb_label_w) / 2,
+                        by + th + 2 * pad + (labelh - ui.thumb_label_h) / 2,
+                        ui.thumb_label_w, ui.thumb_label_h };
+
+        SDL_RenderCopy(r, ui.thumb_label_tex, NULL, &ld);
+    }
 }
 
 void ui_draw(SDL_Renderer *renderer, int win_w, int win_h,
@@ -1181,4 +1281,7 @@ controls:
             SDL_RenderCopy(renderer, ui.badge_tex[i], NULL, &dst);
         }
     }
+
+    /* hover preview last, so it floats above the bar */
+    draw_seek_thumb(renderer, win_w, seek_top, track_w, dur);
 }
