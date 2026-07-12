@@ -735,6 +735,11 @@ static int wdrag_motion(void)
     return 0;
 }
 
+int ui_window_dragging(void)
+{
+    return ui.wdrag_moving;
+}
+
 static int seek_track_w(void)
 {
     return ui.win_w - 2 * SEEK_PAD - VOL_AREA;

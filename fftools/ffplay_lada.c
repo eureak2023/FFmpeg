@@ -583,18 +583,35 @@ int lada_frame_for(double pts_sec, double dur_sec, const uint8_t **rgb, int *w, 
         return 0;
     }
 
-    /* Detect a seek from the pts stream: a jump backward, or a large jump forward. */
-    if (!isnan(L.last_pts) &&
-        (pts_sec < L.last_pts - tol * 2.0 || pts_sec > L.last_pts + fwd)) {
-        char cmd[64];
-        L.gen++;
-        fifo_flush();
-        lada_frame_free(L.held); L.held = NULL;
-        snprintf(cmd, sizeof(cmd), "SEEK\t%.6f\t%u\n", pts_sec + LADA_LEAD_SEC, L.gen);
-        send_cmd(cmd);
-        L.last_pts = pts_sec;
-        SDL_UnlockMutex(L.mtx);
-        return 0;
+    /* Detect a seek from the pts stream: a jump backward, or a large jump forward.
+     *
+     * A backward jump is always a real seek. A large FORWARD jump, however, is often
+     * NOT a seek: dragging/moving the window starves the video refresh for a moment
+     * while the audio clock keeps running, so when it resumes the displayed pts leaps
+     * forward to catch up. Because the sidecar restores LADA_LEAD_SEC ahead, the frame
+     * for that new pts is usually ALREADY in the FIFO. Flushing + re-seeking there would
+     * throw away good buffered frames and force a slow rebuffer - the "LADA BUFFER"
+     * freeze the user sees when nudging the window. So on a forward jump we only treat it
+     * as a seek if the buffer does NOT already reach the new pts; otherwise we fall
+     * through and let the normal drop-stale-then-match logic below skip the gap. */
+    if (!isnan(L.last_pts)) {
+        int backward = pts_sec < L.last_pts - tol * 2.0;
+        int big_fwd  = pts_sec > L.last_pts + fwd;
+        int covered  = 0;
+        if (big_fwd && !backward)
+            for (f = L.head; f; f = f->next)
+                if (f->gen == L.gen && f->pts >= pts_sec - tol) { covered = 1; break; }
+        if (backward || (big_fwd && !covered)) {
+            char cmd[64];
+            L.gen++;
+            fifo_flush();
+            lada_frame_free(L.held); L.held = NULL;
+            snprintf(cmd, sizeof(cmd), "SEEK\t%.6f\t%u\n", pts_sec + LADA_LEAD_SEC, L.gen);
+            send_cmd(cmd);
+            L.last_pts = pts_sec;
+            SDL_UnlockMutex(L.mtx);
+            return 0;
+        }
     }
     L.last_pts = pts_sec;
 

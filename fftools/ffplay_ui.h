@@ -108,6 +108,11 @@ void ui_sub_draw(SDL_Renderer *renderer, int win_w, int win_h, double now);
  * so a paused player knows to redraw. Poll from the refresh loop. */
 int  ui_wants_refresh(void);
 
+/* Returns 1 while a grab-anywhere window move is in progress (the user is
+ * dragging the borderless window). Used to freeze playback during the drag so
+ * the lada restored-frame stream can't desync from the master clock. */
+int  ui_window_dragging(void);
+
 void ui_uninit(void);
 
 #endif /* FFTOOLS_FFPLAY_UI_H */

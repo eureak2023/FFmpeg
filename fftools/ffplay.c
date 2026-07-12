@@ -1828,12 +1828,44 @@ static void stream_toggle_pause(VideoState *is)
 }
 
 static int lada_auto_paused;   /* nonzero while playback is paused by lada buffering */
+static int lada_drag_paused;   /* nonzero while playback is paused for a window drag */
 
 static void toggle_pause(VideoState *is)
 {
     lada_auto_paused = 0;   /* a user pause/resume takes over from lada auto-buffering */
+    lada_drag_paused = 0;
     stream_toggle_pause(is);
     is->step = 0;
+}
+
+/* Freeze playback (audio+video together) while the user is dragging the borderless window.
+ * A window drag saturates the event loop moving the window, starving the video refresh while
+ * the audio clock keeps running - which desyncs lada's restored-frame stream from the master
+ * clock and, since the restored buffer only spans ~2-3 s at 4K, strands the buffer gate in a
+ * permanent "LADA BUFFER" pause that never recovers. Pausing for the drag keeps the clock put,
+ * so on release restoration stays locked on with no jump/rebuffer. Only relevant with lada on;
+ * a plain window drag without lada is harmless (stock ffplay just catches the video up). */
+static void lada_drag_gate(VideoState *is)
+{
+    int dragging;
+
+    if (!is || !lada_active()) {
+        if (lada_drag_paused) {
+            if (is && is->paused)
+                stream_toggle_pause(is);
+            lada_drag_paused = 0;
+        }
+        return;
+    }
+    dragging = ui_window_dragging();
+    if (dragging && !is->paused) {          /* drag started while playing: hold */
+        stream_toggle_pause(is);
+        lada_drag_paused = 1;
+    } else if (!dragging && lada_drag_paused) {   /* drag ended: resume our hold */
+        if (is->paused)
+            stream_toggle_pause(is);
+        lada_drag_paused = 0;
+    }
 }
 
 /* Pause playback while the lada sidecar refills its restored-frame buffer, and resume
@@ -4349,8 +4381,9 @@ static void refresh_loop_wait_event(VideoState *is, SDL_Event *event) {
                 is->force_refresh = 1;
             }
         }
+        lada_drag_gate(is);     /* freeze playback during a window drag (avoid lada desync) */
         lada_buffer_gate(is);   /* pause/resume playback to keep the restored buffer full */
-        if (lada_auto_paused)
+        if (lada_auto_paused || lada_drag_paused)
             is->force_refresh = 1;   /* keep the frame + status overlay live while buffering */
         if (fsr_toast_active())
             is->force_refresh = 1;
