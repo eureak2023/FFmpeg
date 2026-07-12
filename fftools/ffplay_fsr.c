@@ -2538,7 +2538,9 @@ int fsr_hud_draw(SDL_Renderer *renderer)
     dst.w = hud_w * scale;
     dst.h = hud_h * scale;
     dst.x = ow - dst.w - 16;
-    dst.y = 16;
+    /* Sit below the UI title bar (34px tall, window buttons on the right) so
+     * the TAB status readout does not overlap it. */
+    dst.y = 50;
     SDL_RenderCopy(renderer, hud_tex, NULL, &dst);
     return 1;
 }
