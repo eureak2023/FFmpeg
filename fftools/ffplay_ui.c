@@ -77,6 +77,7 @@ static struct {
     int     hover;         /* element under the cursor */
     int     dragging;      /* dragging the seek handle */
     double  drag_frac;
+    double  last_seek_frac; /* frac of the last emitted SEEK_FRAC (dedup clicks) */
     int64_t last_drag_seek;
     int     win_w, win_h;
 
@@ -757,6 +758,7 @@ int ui_handle_event(const SDL_Event *event, int win_w, int win_h,
             ui.drag_frac = seek_frac_at(x);
             if (now - ui.last_drag_seek >= DRAG_SEEK_US) {
                 ui.last_drag_seek = now;
+                ui.last_seek_frac = ui.drag_frac;
                 *seek_frac = ui.drag_frac;
                 return UI_ACT_SEEK_FRAC;
             }
@@ -784,6 +786,7 @@ int ui_handle_event(const SDL_Event *event, int win_w, int win_h,
             ui.dragging  = 1;
             ui.drag_frac = seek_frac_at(x);
             ui.last_drag_seek = av_gettime_relative();
+            ui.last_seek_frac = ui.drag_frac;
             *seek_frac = ui.drag_frac;
             return UI_ACT_SEEK_FRAC;
         case EL_VOL:
@@ -810,8 +813,17 @@ int ui_handle_event(const SDL_Event *event, int win_w, int win_h,
         if (event->button.button != SDL_BUTTON_LEFT)
             return UI_ACT_NONE;
         if (ui.dragging) {
+            double frac = seek_frac_at(event->button.x);
+
             ui.dragging = 0;
-            *seek_frac  = seek_frac_at(event->button.x);
+            /* A plain click already seeked on button-down (and drag motion
+             * seeks as it moves); only issue a final seek if the release
+             * landed somewhere we have not seeked to yet. Re-seeking to the
+             * same spot restarts the in-flight decode and doubles the latency. */
+            if (fabs(frac - ui.last_seek_frac) < 0.0015)
+                return UI_ACT_CONSUMED;
+            ui.last_seek_frac = frac;
+            *seek_frac = frac;
             return UI_ACT_SEEK_FRAC;
         }
         if (ui.vol_dragging) {

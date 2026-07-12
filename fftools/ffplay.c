@@ -217,6 +217,9 @@ typedef struct VideoState {
     int64_t accurate_seek_target; /* AV_TIME_BASE; drop a/v frames before it
                                      after a seek so playback resumes at the
                                      clicked point, not the earlier keyframe */
+    double seek_disp_ts;          /* seconds to pin on the seek bar while a seek
+                                     is in flight (master clock is briefly NAN
+                                     after the flush); NAN = show the live clock */
     int read_pause_return;
     AVFormatContext *ic;
     int realtime;
@@ -1623,6 +1626,15 @@ static void ui_draw_overlay(VideoState *is)
     double dur = is->ic && is->ic->duration != AV_NOPTS_VALUE ?
                  is->ic->duration / (double)AV_TIME_BASE : 0.0;
 
+    /* Right after a seek the master (audio) clock is NAN while the queues
+     * refill, which would snap the bar to 0 and then jump to the target.
+     * Hold it at the requested position until playback lands within ~0.5s. */
+    if (!isnan(is->seek_disp_ts)) {
+        if (isnan(pos) || fabs(pos - is->seek_disp_ts) > 0.5)
+            pos = is->seek_disp_ts;
+        else
+            is->seek_disp_ts = NAN;
+    }
     if (isnan(pos))
         pos = 0.0;
     ui_sub_draw(renderer, is->width, is->height, pos);
@@ -1756,6 +1768,9 @@ static void stream_seek(VideoState *is, int64_t pos, int64_t rel, int by_bytes)
         if (by_bytes)
             is->seek_flags |= AVSEEK_FLAG_BYTE;
         is->seek_req = 1;
+        /* Pin the requested time on the seek bar until playback actually lands
+         * there, so the bar doesn't flash back to 0 during the queue flush. */
+        is->seek_disp_ts = by_bytes ? NAN : pos / (double)AV_TIME_BASE;
         SDL_CondSignal(is->continue_read_thread);
     }
 }
@@ -3929,6 +3944,7 @@ static VideoState *stream_open(const char *filename,
     is->last_video_stream = is->video_stream = -1;
     is->last_audio_stream = is->audio_stream = -1;
     is->accurate_seek_target = AV_NOPTS_VALUE;
+    is->seek_disp_ts = NAN;
     is->last_subtitle_stream = is->subtitle_stream = -1;
     is->filename = av_strdup(filename);
     if (!is->filename)
