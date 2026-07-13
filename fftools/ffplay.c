@@ -371,7 +371,7 @@ static int enable_vulkan = 0;
 static char *vulkan_params = NULL;
 static char *video_background = NULL;
 static const char *hwaccel = NULL;
-static int fsr = -1; /* -1 = auto: on up to 1080p sources, off above */
+static int fsr = -1; /* -1 = auto: on for any source resolution */
 static float fsr_sharpness = 0.0f; /* RCAS attenuation stops, 0 = maximum sharpness */
 static int fsr_denoise = 0;
 static int fsr_fg = 1;             /* 2x frame generation (hardware optical flow) */
@@ -1440,7 +1440,9 @@ static void stream_close(VideoState *is)
 }
 
 /* Query the display refresh rate for frame-generation pacing (remote
- * sessions switch it at runtime); generated output is capped at 60 fps. */
+ * sessions switch it at runtime); generated output is paced to the display
+ * refresh so a high-fps source (e.g. 60 fps on a 120/144 Hz panel) can still
+ * be interpolated. Bounded to keep the optical-flow cost sane at 4K. */
 static void update_fg_refresh(void)
 {
     SDL_DisplayMode mode;
@@ -1448,7 +1450,7 @@ static void update_fg_refresh(void)
     if (window &&
         !SDL_GetCurrentDisplayMode(SDL_GetWindowDisplayIndex(window), &mode) &&
         mode.refresh_rate > 0) {
-        int rate = FFMIN(mode.refresh_rate, 60);
+        int rate = FFMIN(mode.refresh_rate, 240);
 
         fg_refresh = 1.0 / rate;
         av_log(NULL, AV_LOG_INFO, "FG: display refresh %d Hz, pacing %d fps\n",
@@ -1621,14 +1623,16 @@ static void status_hud_update(int fps)
                       (int)lrint(hud_src_fps), last_fps);
     else
         n += snprintf(buf + n, sizeof(buf) - n, "%d FPS\n", last_fps);
-    /* show FG's effective state for this file: it only runs on the
-     * hardware zero-copy path and for sub-50fps sources */
+    /* show FG's effective state for this file: it only runs on the hardware
+     * zero-copy path and when the source interval leaves room before the next
+     * display refresh (mirrors the pacing gate in video_refresh). */
     snprintf(buf + n, sizeof(buf) - n,
              "FSR %s\nSHARP %d\nNR %s\nFG %s",
              fsr ? "ON" : "OFF",
              (int)lrint((2.0f - fsr_sharpness) / 2.0f * 100.0f),
              fsr_denoise ? "ON" : "OFF",
-             fsr_fg && hud_hw && (hud_src_fps <= 0 || hud_src_fps < 50.0)
+             fsr_fg && hud_hw &&
+             (hud_src_fps <= 0 || 1.0 / hud_src_fps > fg_refresh * 1.5)
                  ? "ON" : "OFF");
     fsr_hud_set(renderer, buf);
     {   /* lada status on the left (LADA OFF / LOADING / WAIT / ACTIVE / FAILED) */
@@ -2091,8 +2095,11 @@ retry:
                 /* Frame generation: fill the interval up to the display
                  * refresh rate with interpolated frames at refresh-aligned
                  * offsets (30fps -> 1 per interval, 24fps -> 2, ...). */
+                /* No source-fps ceiling: whether a frame gets generated is
+                 * decided purely by there being room before the next display
+                 * refresh slot (delay > fg_refresh * 1.5), so a 60 fps source
+                 * interpolates on a >60 Hz panel and does nothing on a 60 Hz one. */
                 if (fsr_fg && !is->paused && !lada_active() &&
-                    (hud_src_fps <= 0 || hud_src_fps < 50.0) &&
                     is->show_mode == SHOW_MODE_VIDEO && is->pictq.rindex_shown &&
                     frame_queue_nb_remaining(&is->pictq) > 0 &&
                     delay > fg_refresh * 1.5) {
@@ -3356,6 +3363,27 @@ static const AVCodec *find_hw_decoder(enum AVCodecID id, enum AVHWDeviceType typ
 
 /* On success, *codecp may be swapped to a hw-capable decoder for the same codec
  * (see find_hw_decoder). *codecp is only changed when a device is created. */
+/* Commit a hardware decoder swap once a device is created. A created device
+ * does not prove the GPU can decode this codec: on GPUs without an AV1 decode
+ * block the D3D11 device is still created, but the swapped-in native (hw-only)
+ * AV1 decoder then fails every frame with no software fallback. Verify the
+ * device really supports the codec before committing; otherwise drop the
+ * device and report ENOTSUP so the original software decoder is kept. */
+static int commit_hwaccel(const AVCodec **codecp, const AVCodec *hwcodec,
+                          AVBufferRef **device_ctx)
+{
+    if (hwcodec != *codecp &&
+        !fsr_d3d11_supports_codec(*device_ctx, hwcodec->id)) {
+        av_log(NULL, AV_LOG_VERBOSE,
+               "Hardware cannot decode %s, keeping software decoder %s\n",
+               avcodec_get_name(hwcodec->id), (*codecp)->name);
+        av_buffer_unref(device_ctx);
+        return AVERROR(ENOTSUP);
+    }
+    *codecp = hwcodec;
+    return 0;
+}
+
 static int create_hwaccel_type(enum AVHWDeviceType type, const AVCodec **codecp,
                                AVBufferRef **device_ctx)
 {
@@ -3378,10 +3406,8 @@ static int create_hwaccel_type(enum AVHWDeviceType type, const AVCodec **codecp,
         if (ret < 0)
             return ret;
         ret = av_hwdevice_ctx_create_derived(device_ctx, type, vk_dev, 0);
-        if (!ret) {
-            *codecp = hwcodec;
-            return 0;
-        }
+        if (!ret)
+            return commit_hwaccel(codecp, hwcodec, device_ctx);
         if (ret != AVERROR(ENOSYS))
             return ret;
         av_log(NULL, AV_LOG_WARNING, "Derive %s from vulkan not supported.\n",
@@ -3397,15 +3423,13 @@ static int create_hwaccel_type(enum AVHWDeviceType type, const AVCodec **codecp,
             char buf[16];
 
             snprintf(buf, sizeof(buf), "%d", idx);
-            if (av_hwdevice_ctx_create(device_ctx, type, buf, NULL, 0) >= 0) {
-                *codecp = hwcodec;
-                return 0;
-            }
+            if (av_hwdevice_ctx_create(device_ctx, type, buf, NULL, 0) >= 0)
+                return commit_hwaccel(codecp, hwcodec, device_ctx);
         }
     }
     ret = av_hwdevice_ctx_create(device_ctx, type, NULL, NULL, 0);
     if (ret >= 0)
-        *codecp = hwcodec;
+        return commit_hwaccel(codecp, hwcodec, device_ctx);
     return ret;
 }
 
@@ -3529,15 +3553,11 @@ static int stream_component_open(VideoState *is, int stream_index)
     av_dict_set(&opts, "flags", "+copy_opaque", AV_DICT_MULTIKEY);
 
     if (avctx->codec_type == AVMEDIA_TYPE_VIDEO) {
-        /* Auto mode: upscaling gains little above 1080p sources and its GPU
-         * cost competes with frame generation, so default it off there. */
-        if (fsr < 0) {
-            fsr = avctx->width <= 1920 && avctx->height <= 1080;
-            if (!fsr)
-                av_log(NULL, AV_LOG_INFO,
-                       "FSR upscaling default-off for %dx%d source (press 'x' to enable)\n",
-                       avctx->width, avctx->height);
-        }
+        /* Auto mode: FSR is on by default for any source resolution (it only
+         * actually engages when the window is larger than the frame, so it
+         * stays a no-op otherwise); press 'x' to disable. */
+        if (fsr < 0)
+            fsr = 1;
         ret = create_hwaccel(&codec, &avctx->hw_device_ctx);
         if (ret < 0)
             goto fail;
@@ -3638,10 +3658,6 @@ static int stream_component_open(VideoState *is, int stream_index)
             hud_src_h   = avctx->height;
             hud_src_fps = fr.num && fr.den ? av_q2d(fr) : 0.0;
             hud_hw      = !!avctx->hw_device_ctx;
-            if (fsr_fg && hud_src_fps >= 50.0)
-                av_log(NULL, AV_LOG_INFO,
-                       "FG: %.0f fps source, frame generation not needed\n",
-                       hud_src_fps);
         }
         break;
     case AVMEDIA_TYPE_SUBTITLE:

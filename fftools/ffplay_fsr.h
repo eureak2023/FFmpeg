@@ -80,6 +80,13 @@ int  fsr_hw_interop_failed(void);
  * device can be created on the same adapter), or -1 if unknown. */
 int  fsr_d3d11_adapter_index(void);
 
+/* Nonzero if the D3D11 device inside hw_device_ctx can hardware-decode
+ * codec_id. Only AV1 is actually probed (its native hw decoder has no
+ * software fallback); all other codecs return 1. Used to avoid swapping to a
+ * hardware-only decoder on a GPU that cannot decode the codec. */
+struct AVBufferRef;
+int  fsr_d3d11_supports_codec(struct AVBufferRef *hw_device_ctx, int codec_id);
+
 /* Frame generation: draw an interpolated midpoint frame between two
  * consecutive D3D11 hardware frames using NVIDIA hardware optical flow.
  * Returns 1 if the frame was drawn (present it), 0 otherwise. */
