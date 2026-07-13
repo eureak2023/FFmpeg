@@ -370,7 +370,7 @@ static int enable_vulkan = 0;
 static char *vulkan_params = NULL;
 static char *video_background = NULL;
 static const char *hwaccel = NULL;
-static int fsr = -1; /* -1 = auto: on up to 1080p sources, off above */
+static int fsr = -1; /* -1 = auto: on for any source resolution */
 static float fsr_sharpness = 0.0f; /* RCAS attenuation stops, 0 = maximum sharpness */
 static int fsr_denoise = 0;
 static int fsr_fg = 1;             /* 2x frame generation (hardware optical flow) */
@@ -3451,15 +3451,11 @@ static int stream_component_open(VideoState *is, int stream_index)
     av_dict_set(&opts, "flags", "+copy_opaque", AV_DICT_MULTIKEY);
 
     if (avctx->codec_type == AVMEDIA_TYPE_VIDEO) {
-        /* Auto mode: upscaling gains little above 1080p sources and its GPU
-         * cost competes with frame generation, so default it off there. */
-        if (fsr < 0) {
-            fsr = avctx->width <= 1920 && avctx->height <= 1080;
-            if (!fsr)
-                av_log(NULL, AV_LOG_INFO,
-                       "FSR upscaling default-off for %dx%d source (press 'x' to enable)\n",
-                       avctx->width, avctx->height);
-        }
+        /* Auto mode: FSR is on by default for any source resolution (it only
+         * actually engages when the window is larger than the frame, so it
+         * stays a no-op otherwise); press 'x' to disable. */
+        if (fsr < 0)
+            fsr = 1;
         ret = create_hwaccel(&codec, &avctx->hw_device_ctx);
         if (ret < 0)
             goto fail;
