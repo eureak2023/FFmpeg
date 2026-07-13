@@ -3261,6 +3261,27 @@ static const AVCodec *find_hw_decoder(enum AVCodecID id, enum AVHWDeviceType typ
 
 /* On success, *codecp may be swapped to a hw-capable decoder for the same codec
  * (see find_hw_decoder). *codecp is only changed when a device is created. */
+/* Commit a hardware decoder swap once a device is created. A created device
+ * does not prove the GPU can decode this codec: on GPUs without an AV1 decode
+ * block the D3D11 device is still created, but the swapped-in native (hw-only)
+ * AV1 decoder then fails every frame with no software fallback. Verify the
+ * device really supports the codec before committing; otherwise drop the
+ * device and report ENOTSUP so the original software decoder is kept. */
+static int commit_hwaccel(const AVCodec **codecp, const AVCodec *hwcodec,
+                          AVBufferRef **device_ctx)
+{
+    if (hwcodec != *codecp &&
+        !fsr_d3d11_supports_codec(*device_ctx, hwcodec->id)) {
+        av_log(NULL, AV_LOG_VERBOSE,
+               "Hardware cannot decode %s, keeping software decoder %s\n",
+               avcodec_get_name(hwcodec->id), (*codecp)->name);
+        av_buffer_unref(device_ctx);
+        return AVERROR(ENOTSUP);
+    }
+    *codecp = hwcodec;
+    return 0;
+}
+
 static int create_hwaccel_type(enum AVHWDeviceType type, const AVCodec **codecp,
                                AVBufferRef **device_ctx)
 {
@@ -3283,10 +3304,8 @@ static int create_hwaccel_type(enum AVHWDeviceType type, const AVCodec **codecp,
         if (ret < 0)
             return ret;
         ret = av_hwdevice_ctx_create_derived(device_ctx, type, vk_dev, 0);
-        if (!ret) {
-            *codecp = hwcodec;
-            return 0;
-        }
+        if (!ret)
+            return commit_hwaccel(codecp, hwcodec, device_ctx);
         if (ret != AVERROR(ENOSYS))
             return ret;
         av_log(NULL, AV_LOG_WARNING, "Derive %s from vulkan not supported.\n",
@@ -3302,15 +3321,13 @@ static int create_hwaccel_type(enum AVHWDeviceType type, const AVCodec **codecp,
             char buf[16];
 
             snprintf(buf, sizeof(buf), "%d", idx);
-            if (av_hwdevice_ctx_create(device_ctx, type, buf, NULL, 0) >= 0) {
-                *codecp = hwcodec;
-                return 0;
-            }
+            if (av_hwdevice_ctx_create(device_ctx, type, buf, NULL, 0) >= 0)
+                return commit_hwaccel(codecp, hwcodec, device_ctx);
         }
     }
     ret = av_hwdevice_ctx_create(device_ctx, type, NULL, NULL, 0);
     if (ret >= 0)
-        *codecp = hwcodec;
+        return commit_hwaccel(codecp, hwcodec, device_ctx);
     return ret;
 }
 

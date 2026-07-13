@@ -47,6 +47,7 @@
 #include "libavutil/mastering_display_metadata.h"
 #include "libavutil/hwcontext_d3d11va.h"
 #include "libavutil/pixfmt.h"
+#include "libavcodec/codec_id.h"
 #endif
 
 #ifdef _WIN32
@@ -953,6 +954,57 @@ int fsr_d3d11_adapter_index(void)
     av_log(NULL, AV_LOG_INFO, "FSR: GL runs on '%s' -> DXGI adapter %d\n",
            gl_renderer_str, found);
     return found;
+}
+
+/* Can the D3D11 device inside hw_device_ctx actually hardware-decode codec_id?
+ *
+ * Only AV1 is gated: FFmpeg's default AV1 decoder (libdav1d) is a separate
+ * software-only wrapper, while the native "av1" decoder that carries the
+ * d3d11va config is hardware-ONLY (no software fallback). Creating a D3D11
+ * device always succeeds, so a decoder swap based on device creation alone
+ * commits us to a decoder that fails every frame on GPUs without an AV1
+ * decode block (e.g. GTX 1660 Ti). Verify the actual decoder profile GUID so
+ * such GPUs keep libdav1d and play in software. Native h264/hevc/vp9 decoders
+ * can decode in software, so they are never gated (return 1). */
+int fsr_d3d11_supports_codec(struct AVBufferRef *hw_device_ctx, int codec_id)
+{
+    /* DXVA_ModeAV1_VLD_Profile0 (not defined by the mingw d3d11.h headers). */
+    static const GUID av1_vld_profile0 =
+        { 0xb8be4cce, 0xcf65, 0x4682,
+          { 0x8b, 0xe8, 0x9c, 0x8b, 0x25, 0x6f, 0xa3, 0xd3 } };
+    AVHWDeviceContext *devctx;
+    AVD3D11VADeviceContext *d3d;
+    ID3D11VideoDevice *vdev;
+    UINT count, i;
+    int supported = 0;
+
+    if (codec_id != AV_CODEC_ID_AV1)
+        return 1;                       /* not gated */
+    if (!hw_device_ctx)
+        return 0;
+    devctx = (AVHWDeviceContext *)hw_device_ctx->data;
+    /* Only the D3D11 profile GUID can be probed here; for any other hw type we
+     * cannot confirm AV1 support, so stay on the software decoder. */
+    if (devctx->type != AV_HWDEVICE_TYPE_D3D11VA)
+        return 0;
+    d3d  = devctx->hwctx;
+    vdev = d3d->video_device;
+    if (!vdev)
+        return 0;
+
+    count = ID3D11VideoDevice_GetVideoDecoderProfileCount(vdev);
+    for (i = 0; i < count; i++) {
+        GUID g;
+        if (SUCCEEDED(ID3D11VideoDevice_GetVideoDecoderProfile(vdev, i, &g)) &&
+            IsEqualGUID(&g, &av1_vld_profile0)) {
+            supported = 1;
+            break;
+        }
+    }
+    av_log(NULL, AV_LOG_INFO,
+           "FSR: D3D11 AV1 hardware decode profile %s (%u decoder profiles)\n",
+           supported ? "present" : "absent", count);
+    return supported;
 }
 
 static void hwgl_lock(void)
@@ -2265,6 +2317,11 @@ fail:
 int fsr_d3d11_adapter_index(void)
 {
     return -1;
+}
+
+int fsr_d3d11_supports_codec(struct AVBufferRef *hw_device_ctx, int codec_id)
+{
+    return 1;
 }
 
 int fsr_hw_interop_failed(void)
