@@ -2797,7 +2797,10 @@ static int buf_is_utf8(const uint8_t *b, int n)
  * .srt/.smi/.ass/.ssa), decode all cues up front and hand them to the UI
  * renderer. Korean subtitle files are frequently CP949 - fall back to it
  * when the file is not valid UTF-8. */
-static void load_external_subs(const char *media)
+/* Load sidecar subtitles (same basename, .srt/.smi/.ass/.ssa) into the UI
+ * subtitle overlay. Returns 1 if at least one cue was loaded, so the caller
+ * can suppress the embedded subtitle track in favour of the external file. */
+static int load_external_subs(const char *media)
 {
     static const char *const exts[] = { ".srt", ".smi", ".ass", ".ssa" };
     AVFormatContext *sic = NULL;
@@ -2810,7 +2813,7 @@ static void load_external_subs(const char *media)
     int si, count = 0;
 
     if (!dot || strchr(dot, '/') || strchr(dot, '\\'))
-        return;
+        return 0;
     for (int e = 0; e < (int)FF_ARRAY_ELEMS(exts); e++) {
         snprintf(path, sizeof(path), "%.*s%s", (int)(dot - media), media, exts[e]);
         if (avformat_open_input(&sic, path, NULL, NULL) == 0)
@@ -2818,7 +2821,7 @@ static void load_external_subs(const char *media)
         sic = NULL;
     }
     if (!sic)
-        return;
+        return 0;
     if (avformat_find_stream_info(sic, NULL) < 0)
         goto done;
     si = av_find_best_stream(sic, AVMEDIA_TYPE_SUBTITLE, -1, -1, NULL, 0);
@@ -2881,6 +2884,7 @@ done:
     avcodec_free_context(&dec_ctx);
     av_dict_free(&opts);
     avformat_close_input(&sic);
+    return count > 0;
 }
 
 static int subtitle_thread(void *arg)
@@ -3669,6 +3673,7 @@ static int read_thread(void *arg)
     SDL_mutex *wait_mutex = SDL_CreateMutex();
     int scan_all_pmts_set = 0;
     int64_t pkt_ts;
+    int have_external_subs = 0;
 
     if (!wait_mutex) {
         av_log(NULL, AV_LOG_FATAL, "SDL_CreateMutex(): %s\n", SDL_GetError());
@@ -3769,7 +3774,7 @@ static int read_thread(void *arg)
         ui_set_chapters(fracs, n);
     }
 
-    load_external_subs(is->filename);
+    have_external_subs = load_external_subs(is->filename);
 
     if (!window_title && (t = av_dict_get(ic->metadata, "title", NULL, 0)))
         window_title = av_asprintf("%s - %s", t->value, input_filename);
@@ -3825,7 +3830,13 @@ static int read_thread(void *arg)
                                 st_index[AVMEDIA_TYPE_AUDIO],
                                 st_index[AVMEDIA_TYPE_VIDEO],
                                 NULL, 0);
-    if (!video_disable && !subtitle_disable) {
+    /* An external .srt/.smi/.ass/.ssa sidecar takes priority: when one was
+     * loaded, don't auto-select an embedded subtitle track so the embedded
+     * subtitles stay hidden (a track explicitly pinned with -sst still opens). */
+    if (have_external_subs && st_index[AVMEDIA_TYPE_SUBTITLE] < 0)
+        av_log(NULL, AV_LOG_INFO,
+               "External subtitles present; embedded subtitle track disabled\n");
+    if (!video_disable && !subtitle_disable && !have_external_subs) {
         /* When the user didn't pin a subtitle with -sst, prefer the wanted
          * language (default Korean) among several tracks; av_find_best_stream
          * would otherwise ignore language and pick by disposition/order. */
