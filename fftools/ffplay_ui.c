@@ -72,7 +72,9 @@ enum {
 #define VOL_AREA   150  /* right end of the seek row: icon + slider */
 #define VOL_TRACK  100  /* slider track width */
 #define MAX_CHAPTERS 128
-#define NBADGE 4
+#define NBADGE 5
+#define BADGE_HW  0     /* highlighted (PotPlayer yellow) */
+#define BADGE_HDR 2     /* highlighted unless it reads "SDR" */
 
 static struct {
     int64_t last_activity;
@@ -620,10 +622,10 @@ char *ui_open_file_dialog(void)
 #endif
 }
 
-void ui_set_badges(const char *hw, const char *vcodec,
+void ui_set_badges(const char *hw, const char *vcodec, const char *hdr,
                    const char *acodec, const char *chans)
 {
-    const char *s[NBADGE] = { hw, vcodec, acodec, chans };
+    const char *s[NBADGE] = { hw, vcodec, hdr, acodec, chans };
 
     for (int i = 0; i < NBADGE; i++)
         if (s[i])
@@ -1270,7 +1272,7 @@ controls:
         SDL_RenderCopy(renderer, ui.text_tex, NULL, &dst);
     }
 
-    /* stream info badges, right-aligned: [H/W] [VCODEC] [ACODEC] [CH] */
+    /* stream info badges, right-aligned: [H/W] [VCODEC] [HDR] [ACODEC] [CH] */
     if (ui.badges_dirty) {
         for (int i = 0; i < NBADGE; i++) {
             if (ui.badge_tex[i]) {
@@ -1297,8 +1299,13 @@ controls:
             dst.y = cy - ui.badge_h[i] / 2;
             dst.w = ui.badge_w[i];
             dst.h = ui.badge_h[i];
-            if (i == 0) /* hardware decode: PotPlayer yellow */
+            if (i == BADGE_HW) /* hardware decode: PotPlayer yellow */
                 SDL_SetTextureColorMod(ui.badge_tex[i], 250, 200, 40);
+            else if (i == BADGE_HDR && strcmp(ui.badge_str[i], "SDR"))
+                /* an actual HDR flavour (HDR10/HLG/DV) is worth spotting at
+                 * a glance; plain SDR stays a normal grey badge */
+                fill(renderer, bx, cy - 11, ui.badge_w[i] + 12, 22,
+                     150, 90, 200, 255);
             else
                 fill(renderer, bx, cy - 11, ui.badge_w[i] + 12, 22,
                      45, 45, 45, 255);
