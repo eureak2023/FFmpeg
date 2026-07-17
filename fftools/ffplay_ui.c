@@ -33,6 +33,7 @@
 #endif
 
 #include "libavutil/avstring.h"
+#include "libavutil/common.h"
 #include "libavutil/log.h"
 #include "libavutil/mem.h"
 #include "libavutil/time.h"
@@ -485,12 +486,13 @@ static LRESULT CALLBACK menu_wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 #endif
 
 int ui_context_menu(int fsr_on, int nr_on, int fg_on, int stereo_on,
-                    int scale_mode, void (*on_idle)(void *), void *idle_ctx)
+                    int scale_mode, const UIAudioTracks *atracks,
+                    void (*on_idle)(void *), void *idle_ctx)
 {
 #ifdef _WIN32
     SDL_SysWMinfo wm;
     HWND owner = NULL;
-    HMENU menu, fx, ao, sc;
+    HMENU menu, fx, ao, sc, at = NULL;
     POINT pt;
     int cmd = 0;
 
@@ -522,6 +524,23 @@ int ui_context_menu(int fsr_on, int nr_on, int fg_on, int stereo_on,
                     UI_MENU_AOUT_ORIG, L"원본 그대로 출력");
         AppendMenuW(ao, MF_STRING | (stereo_on ? MF_CHECKED : 0),
                     UI_MENU_AOUT_STEREO, L"2.0 스테레오");
+        /* Only worth showing when the file actually has something to choose
+         * between; a single-track file gets the plain 소리 출력 menu. */
+        if (atracks && atracks->nb > 1 && (at = CreatePopupMenu())) {
+            int n = FFMIN(atracks->nb, UI_MAX_ATRACKS);
+
+            for (int i = 0; i < n; i++) {
+                wchar_t w[128];
+
+                if (!MultiByteToWideChar(CP_UTF8, 0, atracks->name[i], -1,
+                                         w, FF_ARRAY_ELEMS(w)))
+                    continue;
+                AppendMenuW(at, MF_STRING | (i == atracks->cur ? MF_CHECKED : 0),
+                            UI_MENU_ATRACK_BASE + i, w);
+            }
+            AppendMenuW(ao, MF_SEPARATOR, 0, NULL);
+            AppendMenuW(ao, MF_POPUP, (UINT_PTR)at, L"소리 선택(&T)");
+        }
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)ao, L"소리 출력(&A)");
         AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
         AppendMenuW(menu, MF_STRING, UI_MENU_CLOSE, L"닫기(&X)");

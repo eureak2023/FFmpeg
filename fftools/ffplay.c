@@ -4229,6 +4229,54 @@ static void reopen_audio(VideoState *is)
     stream_component_open(is, idx);
 }
 
+/* Describe every audio stream of the current file for the "소리 선택"
+ * submenu, marking the one being played. map[i] receives the AVFormatContext
+ * stream index of entry i, so a UI_MENU_ATRACK_BASE + i command can be
+ * turned back into a stream to open. */
+static void build_audio_tracks(VideoState *is, UIAudioTracks *t, int *map)
+{
+    t->nb  = 0;
+    t->cur = -1;
+    if (!is || !is->ic)
+        return;
+    for (unsigned i = 0; i < is->ic->nb_streams && t->nb < UI_MAX_ATRACKS; i++) {
+        AVStream *st = is->ic->streams[i];
+        const AVDictionaryEntry *lang, *title;
+        char chans[64] = "";
+        int n = t->nb;
+
+        if (st->codecpar->codec_type != AVMEDIA_TYPE_AUDIO)
+            continue;
+        lang  = av_dict_get(st->metadata, "language", NULL, 0);
+        /* Matroska stores the track name under "title"; MP4 maps it to the
+         * track header's "name" instead. */
+        title = av_dict_get(st->metadata, "title", NULL, 0);
+        if (!title)
+            title = av_dict_get(st->metadata, "name", NULL, 0);
+        av_channel_layout_describe(&st->codecpar->ch_layout, chans, sizeof(chans));
+        snprintf(t->name[n], sizeof(t->name[n]), "%d. %s%s%s [%s %s]", n + 1,
+                 lang  ? lang->value  : "und",
+                 title ? " - " : "",
+                 title ? title->value : "",
+                 avcodec_get_name(st->codecpar->codec_id), chans);
+        if ((int)i == is->audio_stream)
+            t->cur = n;
+        map[n] = i;
+        t->nb++;
+    }
+}
+
+/* Switch playback to audio stream `idx` (an AVFormatContext stream index).
+ * Video keeps playing; the clock re-syncs from the new stream. */
+static void select_audio_track(VideoState *is, int idx)
+{
+    if (!is || idx < 0 || idx == is->audio_stream)
+        return;
+    if (is->audio_stream >= 0)
+        stream_component_close(is, is->audio_stream);
+    stream_component_open(is, idx);
+}
+
 
 /* Set the video scaling mode (0 keep-aspect / 1 fill+crop / 2 stretch),
  * show a toast and force a redraw so the new display rect takes effect. */
@@ -4385,8 +4433,9 @@ static char *wait_for_input_file(void)
         while (SDL_PollEvent(&ev)) {
             if (ev.type == SDL_MOUSEBUTTONDOWN &&
                 ev.button.button == SDL_BUTTON_RIGHT) {
+                /* No file open yet: no audio tracks to offer. */
                 switch (ui_context_menu(fsr, fsr_denoise, fsr_fg, audio_stereo,
-                                        video_scaling, NULL, NULL)) {
+                                        video_scaling, NULL, NULL, NULL)) {
                 case UI_MENU_OPEN: {
                     char *f = ui_open_file_dialog();
 
@@ -4476,10 +4525,15 @@ static int handle_ui_event(VideoState *cur_stream, const SDL_Event *event)
         return 0;
     if (event->type == SDL_MOUSEBUTTONDOWN &&
         event->button.button == SDL_BUTTON_RIGHT) {
-        int sym = 0;
+        UIAudioTracks atracks;
+        int amap[UI_MAX_ATRACKS];
+        int sym = 0, cmd;
 
-        switch (ui_context_menu(fsr, fsr_denoise, fsr_fg, audio_stereo,
-                                video_scaling, menu_idle_present, cur_stream)) {
+        build_audio_tracks(cur_stream, &atracks, amap);
+        cmd = ui_context_menu(fsr, fsr_denoise, fsr_fg, audio_stereo,
+                              video_scaling, &atracks, menu_idle_present,
+                              cur_stream);
+        switch (cmd) {
         case UI_MENU_OPEN:
             return 2; /* caller runs the dialog and switches the input */
         case UI_MENU_CLOSE:
@@ -4507,6 +4561,8 @@ static int handle_ui_event(VideoState *cur_stream, const SDL_Event *event)
             }
             break;
         }
+        if (cmd >= UI_MENU_ATRACK_BASE && cmd < UI_MENU_ATRACK_BASE + atracks.nb)
+            select_audio_track(cur_stream, amap[cmd - UI_MENU_ATRACK_BASE]);
         if (sym) { /* reuse the x/d/g key toggles (toast + refresh) */
             SDL_Event kev = { 0 };
 

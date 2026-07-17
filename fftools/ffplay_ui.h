@@ -82,18 +82,34 @@ void ui_ping(void);
  * UTF-8 path, or NULL if cancelled/unavailable. */
 char *ui_open_file_dialog(void);
 
+/* Audio tracks offered by the "소리 선택" submenu. name[] holds the UTF-8
+ * display labels, cur is the index of the track being played (-1 if none).
+ * A list with fewer than two entries hides the submenu, since there is
+ * nothing to choose between. */
+#define UI_MAX_ATRACKS 32
+typedef struct UIAudioTracks {
+    int  nb;
+    int  cur;
+    char name[UI_MAX_ATRACKS][96];
+} UIAudioTracks;
+
 /* Right-click context menu (blocks until dismissed). The fsr/nr/fg flags
- * set the checkmarks on the video-effects submenu. Returns the chosen
- * UI_MENU_* command, or 0 if dismissed. Main thread only.
+ * set the checkmarks on the video-effects submenu; atracks (may be NULL)
+ * fills the audio-track submenu. Returns the chosen UI_MENU_* command, or
+ * UI_MENU_ATRACK_BASE + i when audio track i was picked, or 0 if
+ * dismissed. Main thread only.
  *
  * on_idle (may be NULL) is called ~every 15ms while the menu is open so
  * the caller can keep presenting video frames — the menu runs a modal
  * message loop that would otherwise freeze playback. */
 enum { UI_MENU_OPEN = 1, UI_MENU_CLOSE, UI_MENU_FSR, UI_MENU_NR, UI_MENU_FG,
        UI_MENU_AOUT_ORIG, UI_MENU_AOUT_STEREO,
-       UI_MENU_SCALE_FIT, UI_MENU_SCALE_FILL, UI_MENU_SCALE_STRETCH };
+       UI_MENU_SCALE_FIT, UI_MENU_SCALE_FILL, UI_MENU_SCALE_STRETCH,
+       /* audio track i is UI_MENU_ATRACK_BASE + i */
+       UI_MENU_ATRACK_BASE = 100 };
 int  ui_context_menu(int fsr_on, int nr_on, int fg_on, int stereo_on,
-                     int scale_mode, void (*on_idle)(void *), void *idle_ctx);
+                     int scale_mode, const UIAudioTracks *atracks,
+                     void (*on_idle)(void *), void *idle_ctx);
 
 /* Text subtitles (SRT/SMI/ASS), rendered bottom-center with the system
  * font. Events may be added from decode threads; drawing and clearing
