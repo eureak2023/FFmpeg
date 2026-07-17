@@ -3535,7 +3535,7 @@ static int stream_component_open(VideoState *is, int stream_index)
             }
             snprintf(chans, sizeof(chans), "%d.%d",
                      ch > 2 ? ch - 1 : ch, ch > 2 ? 1 : 0);
-            ui_set_badges(NULL, NULL, aname, chans);
+            ui_set_badges(NULL, NULL, NULL, aname, chans);
         }
         break;
     case AVMEDIA_TYPE_VIDEO:
@@ -3549,12 +3549,27 @@ static int stream_component_open(VideoState *is, int stream_index)
         is->queue_attachments_req = 1;
         {
             char vname[16];
+            const char *hdr;
             AVRational fr = av_guess_frame_rate(ic, is->video_st, NULL);
 
             snprintf(vname, sizeof(vname), "%s", avcodec_get_name(avctx->codec_id));
             for (char *p = vname; *p; p++)
                 *p = av_toupper(*p);
-            ui_set_badges(avctx->hw_device_ctx ? "H/W" : "S/W", vname,
+            /* Dolby Vision brings its own transfer function, so the
+             * configuration record has to be checked before the color_trc
+             * tags: a profile 5 stream leaves color_trc unset and would
+             * otherwise be reported as SDR. */
+            if (av_packet_side_data_get(is->video_st->codecpar->coded_side_data,
+                                        is->video_st->codecpar->nb_coded_side_data,
+                                        AV_PKT_DATA_DOVI_CONF))
+                hdr = "DV";
+            else if (avctx->color_trc == AVCOL_TRC_SMPTE2084)
+                hdr = "HDR10";
+            else if (avctx->color_trc == AVCOL_TRC_ARIB_STD_B67)
+                hdr = "HLG";
+            else
+                hdr = "SDR";
+            ui_set_badges(avctx->hw_device_ctx ? "H/W" : "S/W", vname, hdr,
                           NULL, NULL);
             hud_src_w   = avctx->width;
             hud_src_h   = avctx->height;

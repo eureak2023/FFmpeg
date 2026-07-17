@@ -65,10 +65,11 @@ void ui_draw(SDL_Renderer *renderer, int win_w, int win_h,
              double pos, double dur, int paused, double volume);
 
 /* Stream info badges shown at the right of the control bar. hw is the
- * highlighted decode badge ("H/W"), the rest are boxed labels; NULL keeps
- * a slot unchanged. Callable from the stream-open thread (textures are
- * built lazily on the render thread). */
-void ui_set_badges(const char *hw, const char *vcodec,
+ * highlighted decode badge ("H/W"), hdr the dynamic-range badge ("SDR",
+ * "HDR10", "HLG", "DV" — tinted unless it is "SDR"), the rest are boxed
+ * labels; NULL keeps a slot unchanged. Callable from the stream-open
+ * thread (textures are built lazily on the render thread). */
+void ui_set_badges(const char *hw, const char *vcodec, const char *hdr,
                    const char *acodec, const char *chans);
 
 /* Chapter start positions as 0..1 fractions of the duration. */
