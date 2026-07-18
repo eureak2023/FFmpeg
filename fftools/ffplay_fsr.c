@@ -446,9 +446,27 @@ static const char *easu_src =
     "    lin = mat3(1.6605, -0.1246, -0.0182,\n" \
     "               -0.5876, 1.1329, -0.1006,\n" \
     "               -0.0728, -0.0083, 1.1187) * lin;\n" \
-    "    vec3 n = max(lin, vec3(0.0)) / 230.0;\n" /* SDR reference white */ \
+    /* Hue-preserving gamut compression. A BT.2020 colour outside the smaller \
+     * BT.709 gamut converts to a negative channel here; hard-clipping that to \
+     * zero (the old max(lin,0)) leaves the other channels untouched, which \
+     * over-saturates the colour and shifts its hue - deep reds and blues come \
+     * out far too heavy on an SDR display. Instead desaturate toward the \
+     * equal-luminance grey just enough to bring the colour back to the gamut \
+     * boundary. In-gamut colours (no negative channel) are left untouched. */ \
+    "    float luma = dot(max(lin, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));\n" \
+    "    float mn = min(lin.r, min(lin.g, lin.b));\n" \
+    "    if (mn < 0.0)\n" \
+    "        lin = mix(lin, vec3(luma), -mn / (luma - mn + 1e-4));\n" \
+    /* Normalise by the 100-nit SDR reference white and tone-map against the \
+     * real content peak (MaxCLL). The old code divided by 230 and forced the \
+     * peak up to at least 400 nits; on the many titles graded to a low peak \
+     * (e.g. MaxCLL ~200) that squeezed the whole image into the bottom of the \
+     * range, so it came out dark and, with the saturation preserved, heavy on \
+     * reds and blues. Matching the 100-nit white keeps diffuse white bright \
+     * while highlights above it roll off toward the peak. */ \
+    "    vec3 n = max(lin, vec3(0.0)) / 100.0;\n" \
     "    float L = max(max(n.r, n.g), n.b);\n" \
-    "    float Lp = max(hdrPeak, 400.0) / 230.0;\n" \
+    "    float Lp = max(hdrPeak, 100.0) / 100.0;\n" \
     "    float Lt = L * (1.0 + L / (Lp * Lp)) / (1.0 + L);\n" \
     "    n *= L > 1e-6 ? Lt / L : 0.0;\n" \
     "    return pow(clamp(n, 0.0, 1.0), vec3(1.0 / 2.2));\n" \

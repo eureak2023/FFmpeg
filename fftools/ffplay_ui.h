@@ -95,10 +95,11 @@ typedef struct UIAudioTracks {
 } UIAudioTracks;
 
 /* Right-click context menu (blocks until dismissed). The fsr/nr/fg flags
- * set the checkmarks on the video-effects submenu; atracks (may be NULL)
- * fills the audio-track submenu. Returns the chosen UI_MENU_* command, or
- * UI_MENU_ATRACK_BASE + i when audio track i was picked, or 0 if
- * dismissed. Main thread only.
+ * set the checkmarks on the video-effects submenu; fg_mult (2/3/4) checks the
+ * matching "FG 프레임 생성 배수" item; sub_on checks the "자막 보이기" item;
+ * atracks (may be NULL) fills the audio-track submenu. Returns the chosen
+ * UI_MENU_* command, or UI_MENU_ATRACK_BASE + i when audio track i was picked,
+ * or 0 if dismissed. Main thread only.
  *
  * on_idle (may be NULL) is called ~every 15ms while the menu is open so
  * the caller can keep presenting video frames — the menu runs a modal
@@ -107,10 +108,13 @@ enum { UI_MENU_OPEN = 1, UI_MENU_CLOSE, UI_MENU_FSR, UI_MENU_NR, UI_MENU_FG,
        UI_MENU_LADA,
        UI_MENU_AOUT_ORIG, UI_MENU_AOUT_STEREO,
        UI_MENU_SCALE_FIT, UI_MENU_SCALE_FILL, UI_MENU_SCALE_STRETCH,
+       UI_MENU_SUB_SHOW,
+       UI_MENU_FGMULT_2X, UI_MENU_FGMULT_3X, UI_MENU_FGMULT_4X,
        /* audio track i is UI_MENU_ATRACK_BASE + i */
        UI_MENU_ATRACK_BASE = 100 };
-int  ui_context_menu(int fsr_on, int nr_on, int fg_on, int lada_on, int stereo_on,
-                     int scale_mode, const UIAudioTracks *atracks,
+int  ui_context_menu(int fsr_on, int nr_on, int fg_on, int lada_on, int fg_mult,
+                     int stereo_on, int scale_mode, int sub_on,
+                     const UIAudioTracks *atracks,
                      void (*on_idle)(void *), void *idle_ctx);
 
 /* Text subtitles (SRT/SMI/ASS), rendered bottom-center with the system
