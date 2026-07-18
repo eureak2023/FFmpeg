@@ -231,10 +231,109 @@ static struct {
     int          nlines, font_px;
 } subs;
 
+/* Append Unicode code point cp to out (UTF-8), if it fits. */
+static size_t utf8_put(char *out, size_t o, size_t outsz, unsigned cp)
+{
+    if (cp < 0x80) {
+        if (o + 1 < outsz) out[o++] = (char)cp;
+    } else if (cp < 0x800) {
+        if (o + 2 < outsz) {
+            out[o++] = (char)(0xC0 | (cp >> 6));
+            out[o++] = (char)(0x80 | (cp & 0x3F));
+        }
+    } else if (cp < 0x10000) {
+        if (o + 3 < outsz) {
+            out[o++] = (char)(0xE0 | (cp >> 12));
+            out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            out[o++] = (char)(0x80 | (cp & 0x3F));
+        }
+    } else if (cp <= 0x10FFFF) {
+        if (o + 4 < outsz) {
+            out[o++] = (char)(0xF0 | (cp >> 18));
+            out[o++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+            out[o++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            out[o++] = (char)(0x80 | (cp & 0x3F));
+        }
+    }
+    return o;
+}
+
+/* Replace HTML/XML character references common in SRT/SAMI subtitles with the
+ * characters they stand for (&nbsp; &amp; &#233; &#xE9; ...). Without this the
+ * raw entity text shows on screen; a lone &nbsp; spacer line is the usual
+ * culprit. Unknown entities are left as-is. */
+static void sub_decode_entities(const char *in, char *out, size_t outsz)
+{
+    static const struct { const char *name; unsigned cp; } ents[] = {
+        { "nbsp;",   0x20   }, { "amp;",    '&'    }, { "lt;",     '<'    },
+        { "gt;",     '>'    }, { "quot;",   '"'    }, { "apos;",   '\''   },
+        { "mdash;",  0x2014 }, { "ndash;",  0x2013 }, { "hellip;", 0x2026 },
+        { "lsquo;",  0x2018 }, { "rsquo;",  0x2019 }, { "ldquo;",  0x201C },
+        { "rdquo;",  0x201D },
+    };
+    size_t o = 0;
+
+    while (*in && o + 4 < outsz) {
+        if (*in == '&') {
+            const char *s = in + 1;
+            unsigned cp = 0;
+            int ok = 0;
+
+            if (*s == '#') {                       /* numeric reference */
+                s++;
+                if (*s == 'x' || *s == 'X') {
+                    s++;
+                    while ((*s >= '0' && *s <= '9') ||
+                           (*s >= 'a' && *s <= 'f') ||
+                           (*s >= 'A' && *s <= 'F')) {
+                        int d = *s <= '9' ? *s - '0'
+                              : (*s | 0x20) - 'a' + 10;
+                        cp = cp * 16 + d; s++; ok = 1;
+                    }
+                } else {
+                    while (*s >= '0' && *s <= '9') { cp = cp * 10 + (*s - '0'); s++; ok = 1; }
+                }
+                if (ok && *s == ';') {
+                    o = utf8_put(out, o, outsz, cp);
+                    in = s + 1;
+                    continue;
+                }
+            } else {                               /* named reference */
+                for (size_t i = 0; i < FF_ARRAY_ELEMS(ents); i++) {
+                    size_t len = strlen(ents[i].name);
+                    if (!strncmp(s, ents[i].name, len)) {
+                        o = utf8_put(out, o, outsz, ents[i].cp);
+                        in = s + len;
+                        ok = 1;
+                        break;
+                    }
+                }
+                if (ok)
+                    continue;
+            }
+        }
+        out[o++] = *in++;
+    }
+    out[o] = 0;
+}
+
 void ui_sub_add(double start, double end, const char *text)
 {
+    char decoded[1024];
+
     if (!subs.lock || !text || !text[0])
         return;
+    sub_decode_entities(text, decoded, sizeof(decoded));
+    text = decoded;
+    /* A line that decoded to nothing but spaces (a &nbsp; spacer) would draw an
+     * empty caption box; treat it as blank. */
+    {
+        const char *t = text;
+        while (*t == ' ' || *t == '\n' || *t == '\t' || *t == '\r')
+            t++;
+        if (!*t)
+            return;
+    }
     SDL_LockMutex(subs.lock);
     for (int i = subs.n - 1; i >= 0; i--)  /* dedup (seek re-decodes) */
         if (subs.ev[i].start == start && !strcmp(subs.ev[i].text, text)) {
