@@ -487,14 +487,14 @@ static LRESULT CALLBACK menu_wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 }
 #endif
 
-int ui_context_menu(int fsr_on, int nr_on, int fg_on, int stereo_on,
-                    int scale_mode, const UIAudioTracks *atracks,
+int ui_context_menu(int fsr_on, int nr_on, int fg_on, int fg_mult, int stereo_on,
+                    int scale_mode, int sub_on, const UIAudioTracks *atracks,
                     void (*on_idle)(void *), void *idle_ctx)
 {
 #ifdef _WIN32
     SDL_SysWMinfo wm;
     HWND owner = NULL;
-    HMENU menu, fx, ao, sc, at = NULL;
+    HMENU menu, fx, ao, sc, su, fm, at = NULL;
     POINT pt;
     int cmd = 0;
 
@@ -505,7 +505,9 @@ int ui_context_menu(int fsr_on, int nr_on, int fg_on, int stereo_on,
     fx   = CreatePopupMenu();
     ao   = CreatePopupMenu();
     sc   = CreatePopupMenu();
-    if (owner && menu && fx && ao && sc) {
+    su   = CreatePopupMenu();
+    fm   = CreatePopupMenu();
+    if (owner && menu && fx && ao && sc && su && fm) {
         AppendMenuW(menu, MF_STRING, UI_MENU_OPEN, L"파일 열기(&O)...");
         AppendMenuW(fx, MF_STRING | (fsr_on ? MF_CHECKED : 0),
                     UI_MENU_FSR, L"FSR 업스케일");
@@ -513,6 +515,15 @@ int ui_context_menu(int fsr_on, int nr_on, int fg_on, int stereo_on,
                     UI_MENU_NR, L"NR 노이즈 제거");
         AppendMenuW(fx, MF_STRING | (fg_on ? MF_CHECKED : 0),
                     UI_MENU_FG, L"FG 프레임 생성");
+        AppendMenuW(fm, MF_STRING | (fg_mult == 2 ? MF_CHECKED : 0),
+                    UI_MENU_FGMULT_2X, L"2X");
+        AppendMenuW(fm, MF_STRING | (fg_mult == 3 ? MF_CHECKED : 0),
+                    UI_MENU_FGMULT_3X, L"3X");
+        AppendMenuW(fm, MF_STRING | (fg_mult == 4 ? MF_CHECKED : 0),
+                    UI_MENU_FGMULT_4X, L"4X");
+        /* Greyed out unless FG is on -- the multiplier only matters then. */
+        AppendMenuW(fx, MF_POPUP | (fg_on ? 0 : MF_GRAYED), (UINT_PTR)fm,
+                    L"FG 프레임 생성 배수");
         AppendMenuW(sc, MF_STRING | (scale_mode == 0 ? MF_CHECKED : 0),
                     UI_MENU_SCALE_FIT, L"비율 유지");
         AppendMenuW(sc, MF_STRING | (scale_mode == 1 ? MF_CHECKED : 0),
@@ -544,6 +555,9 @@ int ui_context_menu(int fsr_on, int nr_on, int fg_on, int stereo_on,
             AppendMenuW(ao, MF_POPUP, (UINT_PTR)at, L"소리 선택(&T)");
         }
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)ao, L"소리 출력(&A)");
+        AppendMenuW(su, MF_STRING | (sub_on ? MF_CHECKED : 0),
+                    UI_MENU_SUB_SHOW, L"자막 보이기");
+        AppendMenuW(menu, MF_POPUP, (UINT_PTR)su, L"자막(&S)");
         AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
         AppendMenuW(menu, MF_STRING, UI_MENU_CLOSE, L"닫기(&X)");
         GetCursorPos(&pt);
@@ -573,6 +587,10 @@ int ui_context_menu(int fsr_on, int nr_on, int fg_on, int stereo_on,
             DestroyMenu(ao);
         if (sc)
             DestroyMenu(sc);
+        if (su)
+            DestroyMenu(su);
+        if (fm)
+            DestroyMenu(fm);
     }
     return cmd;
 #else

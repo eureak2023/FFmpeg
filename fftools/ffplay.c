@@ -326,6 +326,10 @@ static int screen_top = SDL_WINDOWPOS_CENTERED;
 static int audio_disable;
 static int video_disable;
 static int subtitle_disable;
+/* Runtime "자막 보이기" toggle from the context menu. Unlike subtitle_disable
+ * (which stops the stream from being decoded at all), this only hides the
+ * rendered subtitle so it can be turned back on without reopening anything. */
+static int subtitle_shown = 1;
 static const char* wanted_stream_spec[AVMEDIA_TYPE_NB] = {0};
 /* Preferred subtitle language when a file has several and none is pinned with
  * -sst. av_find_best_stream() only looks at disposition/codec, so without this
@@ -373,7 +377,10 @@ static const char *hwaccel = NULL;
 static int fsr = -1; /* -1 = auto: on for any source resolution */
 static float fsr_sharpness = 0.0f; /* RCAS attenuation stops, 0 = maximum sharpness */
 static int fsr_denoise = 0;
-static int fsr_fg = 1;             /* 2x frame generation (hardware optical flow) */
+static int fsr_fg = 1;             /* frame generation (hardware optical flow) */
+static int fg_mult = 2;            /* interpolation factor: 2/3/4 -> source x2/x3/x4,
+                                    * capped by the display refresh (cannot present
+                                    * faster than the panel) */
 static int show_fps = 0;           /* FPS overlay, toggled with TAB */
 static int install_assoc = 0;      /* register .mp4/.mkv associations and exit */
 static int uninstall_assoc = 0;
@@ -1062,7 +1069,7 @@ static void video_image_display(VideoState *is)
         return;
     }
 
-    if (is->subtitle_st) {
+    if (is->subtitle_st && subtitle_shown) {
         if (frame_queue_nb_remaining(&is->subpq) > 0) {
             sp = frame_queue_peek(&is->subpq);
 
@@ -1600,15 +1607,25 @@ static void status_hud_update(int fps)
         n += snprintf(buf + n, sizeof(buf) - n, "%d FPS\n", last_fps);
     /* show FG's effective state for this file: it only runs on the hardware
      * zero-copy path and when the source interval leaves room before the next
-     * display refresh (mirrors the pacing gate in video_refresh). */
-    snprintf(buf + n, sizeof(buf) - n,
-             "FSR %s\nSHARP %d\nNR %s\nFG %s",
-             fsr ? "ON" : "OFF",
-             (int)lrint((2.0f - fsr_sharpness) / 2.0f * 100.0f),
-             fsr_denoise ? "ON" : "OFF",
-             fsr_fg && hud_hw &&
-             (hud_src_fps <= 0 || 1.0 / hud_src_fps > fg_refresh * 1.5)
-                 ? "ON" : "OFF");
+     * display refresh (mirrors the pacing gate in video_refresh). The multiplier
+     * is shown too, since the panel can cap the presented rate (a 4X of 30 fps
+     * still tops out at 60 on a 60 Hz panel, indistinguishable from 2X by the
+     * FPS reading alone). */
+    {
+        int fg_on = fsr_fg && hud_hw &&
+                    (hud_src_fps <= 0 || 1.0 / hud_src_fps > fg_refresh * 1.5);
+        char fg_state[16];
+
+        if (fg_on)
+            snprintf(fg_state, sizeof(fg_state), "ON %dX", av_clip(fg_mult, 2, 4));
+        else
+            snprintf(fg_state, sizeof(fg_state), "OFF");
+        snprintf(buf + n, sizeof(buf) - n,
+                 "FSR %s\nSHARP %d\nNR %s\nFG %s",
+                 fsr ? "ON" : "OFF",
+                 (int)lrint((2.0f - fsr_sharpness) / 2.0f * 100.0f),
+                 fsr_denoise ? "ON" : "OFF", fg_state);
+    }
     fsr_hud_set(renderer, buf);
 }
 
@@ -1648,7 +1665,8 @@ static void ui_draw_overlay(VideoState *is)
     }
     if (isnan(pos))
         pos = 0.0;
-    ui_sub_draw(renderer, is->width, is->height, pos);
+    if (subtitle_shown)
+        ui_sub_draw(renderer, is->width, is->height, pos);
     ui_draw(renderer, is->width, is->height, pos, dur, is->paused,
             is->audio_volume / (double)SDL_MIX_MAXVOLUME);
 }
@@ -2001,13 +2019,27 @@ retry:
                     is->show_mode == SHOW_MODE_VIDEO && is->pictq.rindex_shown &&
                     frame_queue_nb_remaining(&is->pictq) > 0 &&
                     delay > fg_refresh * 1.5) {
-                    if (is->fg_next < is->frame_timer + fg_refresh * 0.5 ||
-                        is->fg_next > is->frame_timer + delay)
-                        is->fg_next = is->frame_timer + fg_refresh;
-                    if (is->fg_next < is->frame_timer + delay - fg_refresh * 0.2) {
+                    /* Space the generated frames at delay/N (N = fg_mult) for an
+                     * exact x2/x3/x4 of the source, but never closer than one
+                     * display refresh, since the panel cannot show frames faster
+                     * than it refreshes. */
+                    double fg_interval = FFMAX(delay / av_clip(fg_mult, 2, 4),
+                                               fg_refresh);
+
+                    /* Re-arm fg_next at the interval start when it is stale
+                     * (0 after a real-frame advance, or left far behind/ahead by
+                     * a seek). The upper bound carries a full-interval of slack:
+                     * without it, an fg_interval that is not exact in binary
+                     * (delay/3) accumulates to a hair past frame_timer+delay after
+                     * the last slot, which would wrongly re-arm and replay the
+                     * same slots many times over within one interval. */
+                    if (is->fg_next < is->frame_timer + fg_interval * 0.5 ||
+                        is->fg_next > is->frame_timer + delay + fg_interval)
+                        is->fg_next = is->frame_timer + fg_interval;
+                    if (is->fg_next < is->frame_timer + delay - fg_interval * 0.2) {
                         if (time >= is->fg_next) {
                             video_fg_display(is, (is->fg_next - is->frame_timer) / delay);
-                            is->fg_next += fg_refresh;
+                            is->fg_next += fg_interval;
                         } else {
                             /* Pay the flow cost now, while waiting for the
                              * slot. */
@@ -4449,8 +4481,9 @@ static char *wait_for_input_file(void)
             if (ev.type == SDL_MOUSEBUTTONDOWN &&
                 ev.button.button == SDL_BUTTON_RIGHT) {
                 /* No file open yet: no audio tracks to offer. */
-                switch (ui_context_menu(fsr, fsr_denoise, fsr_fg, audio_stereo,
-                                        video_scaling, NULL, NULL, NULL)) {
+                switch (ui_context_menu(fsr, fsr_denoise, fsr_fg, fg_mult,
+                                        audio_stereo, video_scaling,
+                                        subtitle_shown, NULL, NULL, NULL)) {
                 case UI_MENU_OPEN: {
                     char *f = ui_open_file_dialog();
 
@@ -4469,6 +4502,10 @@ static char *wait_for_input_file(void)
                 case UI_MENU_SCALE_FIT:     video_scaling = 0; break;
                 case UI_MENU_SCALE_FILL:    video_scaling = 1; break;
                 case UI_MENU_SCALE_STRETCH: video_scaling = 2; break;
+                case UI_MENU_SUB_SHOW: subtitle_shown = !subtitle_shown; break;
+                case UI_MENU_FGMULT_2X: fg_mult = 2; break;
+                case UI_MENU_FGMULT_3X: fg_mult = 3; break;
+                case UI_MENU_FGMULT_4X: fg_mult = 4; break;
                 }
                 continue;
             }
@@ -4545,9 +4582,9 @@ static int handle_ui_event(VideoState *cur_stream, const SDL_Event *event)
         int sym = 0, cmd;
 
         build_audio_tracks(cur_stream, &atracks, amap);
-        cmd = ui_context_menu(fsr, fsr_denoise, fsr_fg, audio_stereo,
-                              video_scaling, &atracks, menu_idle_present,
-                              cur_stream);
+        cmd = ui_context_menu(fsr, fsr_denoise, fsr_fg, fg_mult, audio_stereo,
+                              video_scaling, subtitle_shown, &atracks,
+                              menu_idle_present, cur_stream);
         switch (cmd) {
         case UI_MENU_OPEN:
             return 2; /* caller runs the dialog and switches the input */
@@ -4574,6 +4611,22 @@ static int handle_ui_event(VideoState *cur_stream, const SDL_Event *event)
                 if (renderer)
                     fsr_toast_show(renderer, "STEREO 2.0");
             }
+            break;
+        case UI_MENU_SUB_SHOW:
+            subtitle_shown = !subtitle_shown;
+            if (renderer)
+                fsr_toast_show(renderer, subtitle_shown ? "SUBTITLE ON"
+                                                        : "SUBTITLE OFF");
+            break;
+        case UI_MENU_FGMULT_2X:
+        case UI_MENU_FGMULT_3X:
+        case UI_MENU_FGMULT_4X:
+            fg_mult = cmd == UI_MENU_FGMULT_2X ? 2 :
+                      cmd == UI_MENU_FGMULT_3X ? 3 : 4;
+            cur_stream->fg_next = 0; /* re-pace from the next real frame */
+            if (renderer)
+                fsr_toast_show(renderer, fg_mult == 2 ? "FG 2X" :
+                                         fg_mult == 3 ? "FG 3X" : "FG 4X");
             break;
         }
         if (cmd >= UI_MENU_ATRACK_BASE && cmd < UI_MENU_ATRACK_BASE + atracks.nb)
@@ -5141,7 +5194,8 @@ static const OptionDef options[] = {
     { "fsr",                OPT_TYPE_BOOL,            0, { &fsr }, "upscale video output with FSR1 (EASU+RCAS); default: on for sources up to 1080p, off above; toggle at runtime with 'x'" },
     { "fsr_sharpness",      OPT_TYPE_FLOAT, OPT_EXPERT, { &fsr_sharpness }, "FSR RCAS sharpness attenuation in stops (0=sharpest, adjust at runtime with +/-)", "stops" },
     { "fsr_denoise",        OPT_TYPE_BOOL,  OPT_EXPERT, { &fsr_denoise }, "reduce FSR sharpening of noise and film grain; toggle at runtime with 'd'" },
-    { "fsr_fg",             OPT_TYPE_BOOL,  OPT_EXPERT, { &fsr_fg }, "2x frame generation via NVIDIA hardware optical flow, on by default (-nofsr_fg disables); toggle at runtime with 'g'" },
+    { "fsr_fg",             OPT_TYPE_BOOL,  OPT_EXPERT, { &fsr_fg }, "frame generation via NVIDIA hardware optical flow, on by default (-nofsr_fg disables); toggle at runtime with 'g'" },
+    { "fg_mult",            OPT_TYPE_INT,   OPT_EXPERT, { &fg_mult }, "frame generation factor: 2, 3 or 4 (source x2/x3/x4, capped by display refresh); pick at runtime from the right-click menu", "N" },
     { "install",            OPT_TYPE_BOOL,  OPT_EXPERT, { &install_assoc }, "register .mp4/.mkv file associations for the current user and exit" },
     { "uninstall",          OPT_TYPE_BOOL,  OPT_EXPERT, { &uninstall_assoc }, "remove the .mp4/.mkv file associations and exit" },
     { NULL, },
