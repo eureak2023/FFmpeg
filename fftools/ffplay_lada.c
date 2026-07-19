@@ -59,6 +59,14 @@
  * show the original, then restoration is applied cleanly with no long catch-up. */
 #define LADA_LEAD_SEC 7.0
 
+/* Seek coalescing window. Dragging the seek bar fires a burst of seeks (one per
+ * intermediate position). Each SEEK makes the sidecar tear down and re-open the whole
+ * pipeline (~seconds, serialized), so acting on every one races the generation counter
+ * and backs the sidecar up until the FIFO is empty forever ("LADA WAIT" that never
+ * clears). Instead we record the latest seek target and only re-open once the position
+ * has stopped moving for this long. */
+#define LADA_SEEK_DEBOUNCE_MS 350
+
 typedef struct LadaFrame {
     uint32_t gen;
     double   pts;
@@ -99,6 +107,12 @@ static struct {
     int        toast_ready;
     int        announced;    /* "LADA ACTIVE" already toasted this enable session */
     int        buffering;    /* pause-to-buffer state (hysteresis for lada_should_buffer) */
+    int        warmed;       /* restoration for the current generation has started arriving
+                             * (or been applied) since the last OPEN/SEEK; gates pause-to-
+                             * buffer so it engages only once the restorer is actually live */
+    int        seek_pending; /* a seek was detected, waiting for the scrub to settle */
+    double     seek_pending_pts;
+    Uint32     seek_pending_at;
 } L;
 
 static int dbg_applying;   /* whether restored frames are currently being shown */
@@ -222,6 +236,15 @@ static int reader_thread(void *arg)
         L.tail = f;
         L.count++;
         L.bytes += len;
+        /* Arm the buffer gate the moment restoration for the CURRENT generation starts
+         * arriving - not only once a frame is successfully applied. After a seek the
+         * sidecar restores LADA_LEAD_SEC ahead and takes a few seconds to produce the
+         * first frame; by then playback may already have passed that pts, so the frame
+         * arrives "behind" and lada_frame_for drops it -> no apply -> warmed never set ->
+         * gate never engages -> playback outruns restoration forever (permanent WAIT).
+         * Setting warmed here lets the gate pause playback so restoration can catch up. */
+        if (f->gen == L.gen)
+            L.warmed = 1;
         SDL_UnlockMutex(L.mtx);
     }
     /* If the stream ended while we were still meant to be streaming, the sidecar died
@@ -493,6 +516,8 @@ void lada_set_enabled(int on)
         L.opened  = 0;             /* re-OPEN at the current pts on the next frame */
         L.last_pts = NAN;
         L.announced = 0;
+        L.warmed = 0;
+        L.seek_pending = 0;
     } else {
         L.enabled = 0;
         L.gen++;                   /* invalidate frames still in flight            */
@@ -502,6 +527,8 @@ void lada_set_enabled(int on)
         L.opened = 0;
         dbg_applying = 0;
         L.buffering = 0;
+        L.warmed = 0;
+        L.seek_pending = 0;
     }
     SDL_UnlockMutex(L.mtx);
 }
@@ -509,6 +536,23 @@ void lada_set_enabled(int on)
 int lada_active(void)
 {
     return L.running && L.enabled && !L.died;
+}
+
+/* Called from the seek path (stream_seek) the instant a seek is requested, off the
+ * display thread. Without it a forward seek can strand playback in a permanent
+ * "LADA BUFFER" pause: the buffer gate pauses because nothing is restored at the new
+ * position yet, but while paused the display path never runs, so lada_frame_for can
+ * never notice the seek and re-open the sidecar - a deadlock. Clearing `warmed` here
+ * disengages the gate immediately (it early-returns while !warmed), so playback resumes,
+ * the display path runs, and the seek is handled normally (debounced re-open). */
+void lada_notify_seek(void)
+{
+    if (!L.running)
+        return;
+    SDL_LockMutex(L.mtx);
+    L.warmed    = 0;
+    L.buffering = 0;
+    SDL_UnlockMutex(L.mtx);
 }
 
 const char *lada_status(void)
@@ -531,20 +575,46 @@ int lada_should_buffer(double display_pts)
     int ahead = 0, cap, high;
     LadaFrame *f;
 
-    if (!L.running || !L.enabled || L.died || !L.ready || !L.opened || !L.announced)
+    /* Gate on `warmed`, not `announced`: `announced` stays set for the whole enable
+     * session, so during the spin-up after an OPEN (nothing restored yet) it would see
+     * ahead==0 and pause immediately with nothing to wait for. `warmed` is reset on every
+     * OPEN/SEEK and set only once the restorer for the current generation is actually
+     * producing frames, so the gate engages when there is real restoration to buffer. */
+    if (!L.running || !L.enabled || L.died || !L.ready || !L.opened || !L.warmed)
         return 0;
 
     SDL_LockMutex(L.mtx);
+    /* Right after a seek the audio master clock jumps to the new position while the
+     * displayed video pts (last_pts, what lada_frame_for actually matches against) still
+     * lags at the old one. In that window the restored buffer legitimately can't cover
+     * the master pts - but pausing here freezes playback before the video can advance to
+     * the new region and let the seek be detected + the sidecar re-opened, a permanent
+     * "LADA BUFFER" hang (a stale old-position frame keeps re-arming `warmed`, and with
+     * the master pts ahead of the whole buffer `ahead` is stuck at 0 so it never resumes).
+     * So while the two clocks disagree, never pause; wait until they reconverge. */
+    if (isnan(L.last_pts) || fabs(display_pts - L.last_pts) > 1.0) {
+        L.buffering = 0;
+        SDL_UnlockMutex(L.mtx);
+        return 0;
+    }
     for (f = L.head; f; f = f->next)
         if (f->gen == L.gen && f->pts >= display_pts - 0.05)
             ahead++;
     cap  = L.max_count > 0 ? L.max_count : 60;
-    high = cap - cap / 4;            /* resume at ~75% full; always <= cap so reachable */
-    if (high < 1) high = 1;
+    high = 45;                       /* resume once ~1.5 s (@30fps) is buffered ahead;
+                                      * a fixed count, since the byte-budget cap can be
+                                      * hundreds of frames (a fraction of which would be a
+                                      * many-second pause). Override with LADA_RESUME_FRAMES. */
+    {
+        const char *e = getenv("LADA_RESUME_FRAMES");
+        if (e && atoi(e) > 0) high = atoi(e);
+    }
+    if (high > cap) high = cap;
+    if (high < 1)   high = 1;
     if (L.buffering) {
-        if (ahead >= high)  L.buffering = 0;   /* refilled -> resume */
+        if (ahead >= high) L.buffering = 0;   /* refilled -> resume */
     } else {
-        if (ahead <= 0)     L.buffering = 1;   /* drained -> pause (still on held frame) */
+        if (ahead <= 0)    L.buffering = 1;   /* drained -> pause (still on held frame) */
     }
     ahead = L.buffering;
     SDL_UnlockMutex(L.mtx);
@@ -578,6 +648,7 @@ int lada_frame_for(double pts_sec, double dur_sec, const uint8_t **rgb, int *w, 
         snprintf(cmd, sizeof(cmd), "OPEN\t%.6f\t%u\t%s\n", pts_sec + LADA_LEAD_SEC, L.gen, L.path);
         send_cmd(cmd);
         L.opened = 1;
+        L.warmed = 0;
         L.last_pts = pts_sec;
         SDL_UnlockMutex(L.mtx);
         return 0;
@@ -594,6 +665,31 @@ int lada_frame_for(double pts_sec, double dur_sec, const uint8_t **rgb, int *w, 
      * freeze the user sees when nudging the window. So on a forward jump we only treat it
      * as a seek if the buffer does NOT already reach the new pts; otherwise we fall
      * through and let the normal drop-stale-then-match logic below skip the gap. */
+    /* A seek is pending and the position has settled: re-open once, at the final target.
+     * This coalesces a whole seek-bar scrub into a single sidecar re-open (see
+     * LADA_SEEK_DEBOUNCE_MS) instead of one per intermediate position. */
+    if (L.seek_pending &&
+        (int)(SDL_GetTicks() - L.seek_pending_at) >= LADA_SEEK_DEBOUNCE_MS) {
+        char cmd[64];
+        /* Restore from the seek point itself, NOT seek_pos + LEAD. The lead is right for
+         * the initial open (show a little original while the restorer spins up), but wrong
+         * for a seek: re-opening the sidecar takes several seconds, during which - with the
+         * gate disengaged - playback races far past seek_pos+LEAD, so the restorer's output
+         * lands behind the display and is wasted, and it must then re-restore everything the
+         * viewer already skimmed (the multi-second "BUFFER" after a seek). Instead we target
+         * seek_pos and immediately engage the buffer gate to HOLD playback right here until
+         * restoration is ready, then resume with a cushion - no runaway, no wasted work. */
+        double target = L.seek_pending_pts;
+        L.gen++;
+        fifo_flush();
+        lada_frame_free(L.held); L.held = NULL;
+        snprintf(cmd, sizeof(cmd), "SEEK\t%.6f\t%u\n", target, L.gen);
+        send_cmd(cmd);
+        L.seek_pending = 0;
+        L.warmed    = 1;   /* engage the gate now... */
+        L.buffering = 1;   /* ...and hold playback at the seek point until it refills */
+    }
+
     if (!isnan(L.last_pts)) {
         int backward = pts_sec < L.last_pts - tol * 2.0;
         int big_fwd  = pts_sec > L.last_pts + fwd;
@@ -602,13 +698,15 @@ int lada_frame_for(double pts_sec, double dur_sec, const uint8_t **rgb, int *w, 
             for (f = L.head; f; f = f->next)
                 if (f->gen == L.gen && f->pts >= pts_sec - tol) { covered = 1; break; }
         if (backward || (big_fwd && !covered)) {
-            char cmd[64];
-            L.gen++;
-            fifo_flush();
-            lada_frame_free(L.held); L.held = NULL;
-            snprintf(cmd, sizeof(cmd), "SEEK\t%.6f\t%u\n", pts_sec + LADA_LEAD_SEC, L.gen);
-            send_cmd(cmd);
-            L.last_pts = pts_sec;
+            /* Record (or re-arm) the pending seek rather than acting now; the fire block
+             * above sends the SEEK once the position stops moving. Meanwhile keep showing
+             * the original frame and don't pause-to-buffer. */
+            L.seek_pending     = 1;
+            L.seek_pending_pts = pts_sec;
+            L.seek_pending_at  = SDL_GetTicks();
+            L.warmed    = 0;
+            L.buffering = 0;
+            L.last_pts  = pts_sec;
             SDL_UnlockMutex(L.mtx);
             return 0;
         }
@@ -633,6 +731,7 @@ int lada_frame_for(double pts_sec, double dur_sec, const uint8_t **rgb, int *w, 
     if (f && f->gen == L.gen && fabs(f->pts - pts_sec) <= tol) {
         L.held = fifo_pop();
         *rgb = L.held->rgb; *w = L.held->w; *h = L.held->h;
+        L.warmed = 1;         /* restoration is applied at this position - arm the buffer gate */
         if (!dbg_applying) {
             dbg_applying = 1;
             if (!L.announced) {   /* announce only the first time it kicks in per enable */
@@ -663,6 +762,7 @@ int  lada_start(const char *input_path, const char *lada_home, const char *devic
 void lada_stop(void) {}
 void lada_set_enabled(int on) { (void)on; }
 int  lada_active(void) { return 0; }
+void lada_notify_seek(void) {}
 const char *lada_status(void) { return "OFF"; }
 int  lada_should_buffer(double display_pts) { (void)display_pts; return 0; }
 int  lada_poll_toast(char *buf, int buflen) { (void)buf; (void)buflen; return 0; }

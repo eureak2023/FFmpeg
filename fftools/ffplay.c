@@ -1831,6 +1831,9 @@ static void stream_seek(VideoState *is, int64_t pos, int64_t rel, int by_bytes)
         /* Pin the requested time on the seek bar until playback actually lands
          * there, so the bar doesn't flash back to 0 during the queue flush. */
         is->seek_disp_ts = by_bytes ? NAN : pos / (double)AV_TIME_BASE;
+        /* Release any lada buffer-pause now, off the display thread, so the seek can't
+         * deadlock playback in a permanent "LADA BUFFER" state (see lada_notify_seek). */
+        lada_notify_seek();
         SDL_CondSignal(is->continue_read_thread);
     }
 }

@@ -55,6 +55,11 @@ void lada_set_enabled(int on);
 /* Nonzero while restoration is enabled and the sidecar is running (and hasn't died). */
 int  lada_active(void);
 
+/* Notify that a seek was just requested (call from the seek path, not the display
+ * thread). Disengages the pause-to-buffer gate immediately so a forward seek can't
+ * strand playback in a permanent "LADA BUFFER" pause. Safe when lada is off. */
+void lada_notify_seek(void);
+
 /* Short state word for the status overlay: "OFF", "LOADING" (models loading),
  * "WAIT" (ready, buffering the lead), "ACTIVE" (restored frames showing),
  * "BUFFER" (paused to refill), "FAILED". */
