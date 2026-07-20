@@ -469,6 +469,20 @@ static const char *easu_src =
     "    float Lp = max(hdrPeak, 100.0) / 100.0;\n" \
     "    float Lt = L * (1.0 + L / (Lp * Lp)) / (1.0 + L);\n" \
     "    n *= L > 1e-6 ? Lt / L : 0.0;\n" \
+    /* Midtone luminance lift. Compared crop-for-crop against a reference \
+     * render (PotPlayer) of the same frames, skin came out the right hue and \
+     * saturation but ~2x too dark - a dim, saturated orange face reads as \
+     * muddy "red", where the same colour lifted to full brightness reads as \
+     * natural skin. (The whole-frame average matched because this curve lifts \
+     * shadows and crushes midtones - flat contrast - so the darkened skin was \
+     * masked by brighter background; earlier saturation cuts chased the wrong \
+     * axis and only greyed things out.) Lift brightness with a gamma on the \
+     * luminance and rescale the channels by the same factor, so skin gets \
+     * brighter WITHOUT desaturating (a per-channel gamma would wash it out). \
+     * 0.80 matched the reference's skin (sRGB ~95,58,36 vs 97,57,33); Y=1 \
+     * white is untouched so highlights don't blow. */ \
+    "    float Y = dot(n, vec3(0.2126, 0.7152, 0.0722));\n" \
+    "    n *= Y > 1e-6 ? pow(Y, 0.80) / Y : 1.0;\n" \
     "    return pow(clamp(n, 0.0, 1.0), vec3(1.0 / 2.2));\n" \
     "}\n"
 
@@ -1272,6 +1286,17 @@ static int hwgl_ensure_size(int w, int h)
     if (FAILED(hr))
         goto fail;
 
+    /* Disable the driver's automatic video processing. With it on (the D3D11
+     * default) the NVIDIA driver applies its own "enhancement" - a saturation/
+     * contrast boost - on top of our colour conversion, which pumped skin into
+     * a clipped over-red orange (verified: an offline swscale replica of the
+     * exact same shader math produced natural skin, while the live VP path came
+     * out far redder and blown out; the VP was the only difference). We want the
+     * VP to do nothing but the YCbCr->RGB de-matrix we asked for, so the GL
+     * tone-map shader is the only thing shaping colour. */
+    ID3D11VideoContext_VideoProcessorSetStreamAutoProcessingMode(hwgl.vcontext,
+        hwgl.vp, 0, FALSE);
+
     /* The VideoProcessor writes with the GPU's video engine, whose writes
      * the NV_DX_interop path does not synchronize into GL (verified: 3D
      * clears arrive, Blt output does not). So the VP renders into its own
@@ -1342,13 +1367,20 @@ static int hwgl_convert(AVFrame *frame, int slot)
         int out_cs = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
 
         if (frame->color_trc == AVCOL_TRC_SMPTE2084) {
-            /* Keep PQ/BT.2020 through the VP and tone-map in the GL shaders
-             * (the driver's own PQ->G22 conversion is NOT a tone map and
-             * crushes everything dark). Tagging both sides as G22 makes the
-             * transfer function a no-op, so the VP only de-matrixes YCbCr
-             * and the PQ code values pass through untouched. */
-            cs = DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P2020;
-            out_cs = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020;
+            /* Keep the PQ code values intact through the VP (the driver's own
+             * PQ->SDR conversion is not a tone map and crushes darks) and tone-
+             * map in the GL shaders. Tag BOTH sides honestly as PQ (G2084) so
+             * the transfer is a no-op and the VP does only the BT.2020 YCbCr
+             * de-matrix + studio->full range expansion.
+             *
+             * This previously tagged both sides as G22 to fake the no-op, but on
+             * current NVIDIA drivers that lie makes the VP compute the studio->
+             * full expansion in the wrong space and over-saturates the output -
+             * skin railed into a clipped over-red orange (headless A/B confirmed
+             * the G22 tag gave forehead PQ RGB 0.273/0.162/0.079 vs swscale's
+             * correct 0.233/0.169/0.092; the G2084 tag reproduces swscale). */
+            cs = DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020;
+            out_cs = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
         } else if (frame->color_trc == AVCOL_TRC_ARIB_STD_B67)
             cs = DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020;
         else if (frame->colorspace == AVCOL_SPC_BT2020_NCL)
