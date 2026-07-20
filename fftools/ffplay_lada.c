@@ -255,8 +255,11 @@ static int reader_thread(void *arg)
     if (!L.quit) {
         SDL_LockMutex(L.mtx);
         L.died = 1;
-        if (L.enabled)
-            lada_set_toast("LADA FAILED");
+        if (L.enabled) {
+            char tmsg[24];
+            snprintf(tmsg, sizeof(tmsg), "%s FAILED", lada_engine_name());
+            lada_set_toast(tmsg);
+        }
         SDL_UnlockMutex(L.mtx);
         av_log(NULL, AV_LOG_WARNING, "lada: sidecar stream ended unexpectedly (see lada/lada_sidecar.log)\n");
     }
@@ -342,10 +345,42 @@ int lada_default_on(void)
  *   1. <ffplay.exe dir>\lada_sidecar\lada_sidecar.exe   (bundled next to the player)
  *   2. <lada_home>\dist\lada_sidecar\lada_sidecar.exe    (built in the source tree)
  *   3. <lada_home>\.venv\Scripts\python.exe lada_sidecar.py   (dev fallback) */
+/* Alternative "jasna" restoration engine (github.com/Kruk2/jasna): a from-source sidecar
+ * that restores with jasna's GPU/TensorRT pipeline and emits the SAME raw-RGB wire format
+ * as lada_sidecar, so the whole display path is reused. Enabled with -jasna. g_jasna_home
+ * is the jasna source checkout (holds .venv + model_weights + the importable jasna pkg). */
+#define JASNA_SIDECAR_PY "D:/Source_AI/ffplay-fsr1/jasna_sidecar.py"
+/* jasna is the only restoration engine (the older lada_sidecar path was removed). Default
+ * ON so restoration works without any extra flag; -jasna_home can relocate the checkout. */
+static int  g_use_jasna = 1;
+static char g_jasna_home[4096] = "D:/Source_AI/ffplay-fsr1/jasna";
+
+void lada_set_engine(int use_jasna, const char *jasna_home)
+{
+    g_use_jasna = use_jasna ? 1 : 0;
+    if (g_use_jasna)
+        av_strlcpy(g_jasna_home,
+                   jasna_home && *jasna_home ? jasna_home : "D:/Source_AI/ffplay-fsr1/jasna",
+                   sizeof(g_jasna_home));
+}
+
+void lada_set_jasna(const char *jasna_home) { lada_set_engine(1, jasna_home); }
+
+int lada_is_jasna(void) { return g_use_jasna; }
+
+/* Which restoration engine is active - for the status HUD / toasts, so the two are
+ * distinguishable on screen (both otherwise share the lada display machinery). */
+const char *lada_engine_name(void)
+{
+    return g_use_jasna ? "JASNA" : "LADA";
+}
+
 static void resolve_sidecar(char *cmdline, size_t cmdsz, char *workdir, size_t wdsz,
                             const char *lada_home, const char *device)
 {
     char exedir[4096] = {0}, cand[4096];
+    (void)lada_home; (void)device;   /* jasna is the only restoration engine now */
+
     DWORD n = GetModuleFileNameA(NULL, exedir, sizeof(exedir));
     if (n > 0 && n < sizeof(exedir)) {
         char *slash = strrchr(exedir, '\\');
@@ -354,24 +389,32 @@ static void resolve_sidecar(char *cmdline, size_t cmdsz, char *workdir, size_t w
         exedir[0] = 0;
     }
 
+    /* jasna sidecar: prefer the bundled onedir exe (portable, no venv) next to the player,
+     * else the dist build in the source tree, else the dev venv python + script. Its
+     * model_weights sits alongside each. Streams restored RGB frames over the pipe. */
     if (exedir[0]) {
-        snprintf(cand, sizeof(cand), "%s\\lada_sidecar\\lada_sidecar.exe", exedir);
+        snprintf(cand, sizeof(cand), "%s\\jasna_sidecar\\jasna_sidecar.exe", exedir);
         if (file_exists(cand)) {
-            snprintf(cmdline, cmdsz, "\"%s\" --device %s", cand, device);
+            snprintf(cmdline, cmdsz,
+                     "\"%s\" --model-weights \"%s\\jasna_sidecar\\model_weights\" "
+                     "--log \"%s\\jasna_sidecar.log\"", cand, exedir, exedir);
             av_strlcpy(workdir, exedir, wdsz);
             return;
         }
     }
-    snprintf(cand, sizeof(cand), "%s\\dist\\lada_sidecar\\lada_sidecar.exe", lada_home);
+    snprintf(cand, sizeof(cand), "%s\\dist\\jasna_sidecar\\jasna_sidecar.exe", g_jasna_home);
     if (file_exists(cand)) {
-        snprintf(cmdline, cmdsz, "\"%s\" --device %s", cand, device);
-        av_strlcpy(workdir, lada_home, wdsz);
+        snprintf(cmdline, cmdsz,
+                 "\"%s\" --model-weights \"%s\\dist\\jasna_sidecar\\model_weights\" "
+                 "--log \"%s\\jasna_sidecar.log\"", cand, g_jasna_home, g_jasna_home);
+        av_strlcpy(workdir, g_jasna_home, wdsz);
         return;
     }
     snprintf(cmdline, cmdsz,
-             "\"%s\\.venv\\Scripts\\python.exe\" \"%s\\lada_sidecar.py\" --device %s",
-             lada_home, lada_home, device);
-    av_strlcpy(workdir, lada_home, wdsz);
+             "\"%s\\.venv\\Scripts\\python.exe\" \"%s\" "
+             "--model-weights \"%s\\model_weights\" --log \"%s\\jasna_sidecar.log\"",
+             g_jasna_home, JASNA_SIDECAR_PY, g_jasna_home, g_jasna_home);
+    av_strlcpy(workdir, g_jasna_home, wdsz);
 }
 
 int lada_start(const char *input_path, const char *lada_home, const char *device)
@@ -735,8 +778,10 @@ int lada_frame_for(double pts_sec, double dur_sec, const uint8_t **rgb, int *w, 
         if (!dbg_applying) {
             dbg_applying = 1;
             if (!L.announced) {   /* announce only the first time it kicks in per enable */
+                char tmsg[24];
                 L.announced = 1;
-                lada_set_toast("LADA ACTIVE");
+                snprintf(tmsg, sizeof(tmsg), "%s ACTIVE", lada_engine_name());
+                lada_set_toast(tmsg);
             }
             av_log(NULL, AV_LOG_INFO, "lada: restored frames now applied\n");
         }
@@ -763,6 +808,10 @@ void lada_stop(void) {}
 void lada_set_enabled(int on) { (void)on; }
 int  lada_active(void) { return 0; }
 void lada_notify_seek(void) {}
+void lada_set_jasna(const char *jasna_home) { (void)jasna_home; }
+void lada_set_engine(int use_jasna, const char *jasna_home) { (void)use_jasna; (void)jasna_home; }
+int  lada_is_jasna(void) { return 0; }
+const char *lada_engine_name(void) { return "LADA"; }
 const char *lada_status(void) { return "OFF"; }
 int  lada_should_buffer(double display_pts) { (void)display_pts; return 0; }
 int  lada_poll_toast(char *buf, int buflen) { (void)buf; (void)buflen; return 0; }

@@ -60,6 +60,22 @@ int  lada_active(void);
  * strand playback in a permanent "LADA BUFFER" pause. Safe when lada is off. */
 void lada_notify_seek(void);
 
+/* Use the "jasna" restoration engine instead of lada_sidecar: lada_start then launches
+ * the from-source jasna sidecar (jasna_home holds .venv + model_weights). Same wire
+ * protocol, so everything else is unchanged. Call before lada_start (e.g. from -jasna). */
+void lada_set_jasna(const char *jasna_home);
+
+/* Select the restoration engine (0 = lada, 1 = jasna) before (re)starting the sidecar;
+ * for the runtime engine toggle. lada_set_jasna is the CLI shorthand for (1, home). */
+void lada_set_engine(int use_jasna, const char *jasna_home);
+
+/* 1 if the jasna engine is selected, 0 for lada. */
+int  lada_is_jasna(void);
+
+/* Uppercase name of the active restoration engine ("LADA" or "JASNA"), for the status
+ * overlay/toasts so the two are distinguishable on screen. */
+const char *lada_engine_name(void);
+
 /* Short state word for the status overlay: "OFF", "LOADING" (models loading),
  * "WAIT" (ready, buffering the lead), "ACTIVE" (restored frames showing),
  * "BUFFER" (paused to refill), "FAILED". */

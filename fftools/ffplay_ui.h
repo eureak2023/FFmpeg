@@ -105,14 +105,14 @@ typedef struct UIAudioTracks {
  * the caller can keep presenting video frames — the menu runs a modal
  * message loop that would otherwise freeze playback. */
 enum { UI_MENU_OPEN = 1, UI_MENU_CLOSE, UI_MENU_FSR, UI_MENU_NR, UI_MENU_FG,
-       UI_MENU_LADA,
+       UI_MENU_LADA, UI_MENU_JASNA,
        UI_MENU_AOUT_ORIG, UI_MENU_AOUT_STEREO,
        UI_MENU_SCALE_FIT, UI_MENU_SCALE_FILL, UI_MENU_SCALE_STRETCH,
        UI_MENU_SUB_SHOW,
        UI_MENU_FGMULT_2X, UI_MENU_FGMULT_3X, UI_MENU_FGMULT_4X,
        /* audio track i is UI_MENU_ATRACK_BASE + i */
        UI_MENU_ATRACK_BASE = 100 };
-int  ui_context_menu(int fsr_on, int nr_on, int fg_on, int lada_on, int fg_mult,
+int  ui_context_menu(int fsr_on, int nr_on, int fg_on, int lada_on, int jasna_on, int fg_mult,
                      int stereo_on, int scale_mode, int sub_on,
                      const UIAudioTracks *atracks,
                      void (*on_idle)(void *), void *idle_ctx);

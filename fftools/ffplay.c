@@ -384,6 +384,7 @@ static int fg_mult = 2;            /* interpolation factor: 2/3/4 -> source x2/x
                                     * faster than the panel) */
 static int lada = 0;               /* real-time mosaic restoration via the lada sidecar, toggled with 'L' */
 static const char *lada_home = "D:/Source_AI/ffplay-fsr1/lada"; /* lada project root (.venv + lada_sidecar.py) */
+static const char *jasna_home = "D:/Source_AI/ffplay-fsr1/jasna"; /* jasna source checkout (.venv + model_weights) */
 static SDL_Texture *lada_texture = NULL; /* upload target for restored RGB24 frames */
 static int show_fps = 0;           /* FPS overlay, toggled with TAB */
 static int install_assoc = 0;      /* register .mp4/.mkv associations and exit */
@@ -1652,9 +1653,9 @@ static void status_hud_update(int fps)
                  fsr_denoise ? "ON" : "OFF", fg_state);
     }
     fsr_hud_set(renderer, buf);
-    {   /* lada status on the left (LADA OFF / LOADING / WAIT / ACTIVE / FAILED) */
+    {   /* restore-engine status on the left (e.g. "JASNA ACTIVE" / "LADA WAIT") */
         char lbuf[24];
-        snprintf(lbuf, sizeof(lbuf), "LADA %s", lada_status());
+        snprintf(lbuf, sizeof(lbuf), "%s %s", lada_engine_name(), lada_status());
         fsr_hud_left_set(renderer, lbuf);
     }
 }
@@ -4499,7 +4500,7 @@ static void refresh_loop_wait_event(VideoState *is, SDL_Event *event) {
             if (lada_poll_toast(lt, sizeof(lt))) {
                 if (renderer)
                     fsr_toast_show(renderer, lt);
-                if (!strcmp(lt, "LADA FAILED")) {
+                if (strstr(lt, "FAILED")) {   /* "LADA FAILED" or "JASNA FAILED" */
                     lada_stop();
                     lada = 0;
                 }
@@ -4605,7 +4606,8 @@ static char *wait_for_input_file(void)
             if (ev.type == SDL_MOUSEBUTTONDOWN &&
                 ev.button.button == SDL_BUTTON_RIGHT) {
                 /* No file open yet: no audio tracks to offer. */
-                switch (ui_context_menu(fsr, fsr_denoise, fsr_fg, lada_active(),
+                switch (ui_context_menu(fsr, fsr_denoise, fsr_fg,
+                                        lada && !lada_is_jasna(), lada && lada_is_jasna(),
                                         fg_mult, audio_stereo, video_scaling,
                                         subtitle_shown, NULL, NULL, NULL)) {
                 case UI_MENU_OPEN: {
@@ -4621,7 +4623,7 @@ static char *wait_for_input_file(void)
                 case UI_MENU_FSR: fsr = !fsr; break; /* no video: flip only */
                 case UI_MENU_NR:  fsr_denoise = !fsr_denoise; break;
                 case UI_MENU_FG:  fsr_fg = !fsr_fg; break;
-                case UI_MENU_LADA: lada = !lada; break; /* no video: flip intent only */
+                case UI_MENU_JASNA: lada = !lada; break; /* no video: flip restoration intent */
                 case UI_MENU_AOUT_ORIG:   audio_stereo = 0; break;
                 case UI_MENU_AOUT_STEREO: audio_stereo = 1; break;
                 case UI_MENU_SCALE_FIT:     video_scaling = 0; break;
@@ -4687,6 +4689,36 @@ static void menu_idle_present(void *opaque)
     video_refresh(opaque, &remaining);
 }
 
+/* Runtime restoration-engine switch (lada <-> jasna) from the context menu. Clicking the
+ * engine that is already active turns restoration off; otherwise tear down any running
+ * sidecar and bring up the requested engine, enabled. Switching engines reloads models
+ * (~seconds) since they are separate sidecar processes. */
+static void apply_engine(VideoState *is, int to_jasna)
+{
+    if (lada_active() && lada_is_jasna() == to_jasna) {
+        lada_set_enabled(0);       /* same engine already on -> turn it off */
+        lada = 0;
+    } else {
+        if (lada_active())         /* different engine running -> tear it down first */
+            lada_stop();
+        lada_set_engine(to_jasna, jasna_home);
+        if (input_filename && lada_start(input_filename, lada_home, "cuda") == 0) {
+            lada_set_enabled(1);
+            lada = 1;
+        } else {
+            lada = 0;
+        }
+    }
+    if (renderer) {
+        char tmsg[24];
+        snprintf(tmsg, sizeof(tmsg), "%s %s", lada_engine_name(),
+                 lada_active() ? "LOADING" : "OFF");
+        fsr_toast_show(renderer, tmsg);
+    }
+    if (is)
+        is->force_refresh = 1;
+}
+
 /* Route mouse events through the on-screen controls; returns nonzero when
  * the event was consumed (default handling must be skipped), 2 when the
  * open-file dialog was requested. */
@@ -4707,7 +4739,9 @@ static int handle_ui_event(VideoState *cur_stream, const SDL_Event *event)
         int sym = 0, cmd;
 
         build_audio_tracks(cur_stream, &atracks, amap);
-        cmd = ui_context_menu(fsr, fsr_denoise, fsr_fg, lada_active(), fg_mult,
+        cmd = ui_context_menu(fsr, fsr_denoise, fsr_fg,
+                              lada_active() && !lada_is_jasna(),
+                              lada_active() && lada_is_jasna(), fg_mult,
                               audio_stereo, video_scaling, subtitle_shown,
                               &atracks, menu_idle_present, cur_stream);
         switch (cmd) {
@@ -4718,7 +4752,7 @@ static int handle_ui_event(VideoState *cur_stream, const SDL_Event *event)
         case UI_MENU_FSR: sym = SDLK_x; break;
         case UI_MENU_NR:  sym = SDLK_d; break;
         case UI_MENU_FG:  sym = SDLK_g; break;
-        case UI_MENU_LADA: sym = SDLK_l; break;
+        case UI_MENU_JASNA: apply_engine(cur_stream, 1); break;
         case UI_MENU_SCALE_FIT:     set_video_scaling(cur_stream, 0); break;
         case UI_MENU_SCALE_FILL:    set_video_scaling(cur_stream, 1); break;
         case UI_MENU_SCALE_STRETCH: set_video_scaling(cur_stream, 2); break;
@@ -4920,8 +4954,12 @@ static void event_loop(VideoState *cur_stream)
                 }
                 av_log(NULL, AV_LOG_INFO, "lada mosaic restoration %s\n",
                        lada_active() ? "enabled" : "disabled");
-                if (renderer)
-                    fsr_toast_show(renderer, lada_active() ? "LADA LOADING" : "LADA OFF");
+                if (renderer) {
+                    char tmsg[24];
+                    snprintf(tmsg, sizeof(tmsg), "%s %s", lada_engine_name(),
+                             lada_active() ? "LOADING" : "OFF");
+                    fsr_toast_show(renderer, tmsg);
+                }
                 cur_stream->force_refresh = 1;
                 break;
             case SDLK_d:
@@ -5344,6 +5382,7 @@ static const OptionDef options[] = {
     { "fg_mult",            OPT_TYPE_INT,   OPT_EXPERT, { &fg_mult }, "frame generation factor: 2, 3 or 4 (source x2/x3/x4, capped by display refresh); pick at runtime from the right-click menu", "N" },
     { "lada",               OPT_TYPE_BOOL,           0, { &lada }, "real-time mosaic (JAV) restoration via the lada sidecar; off by default, toggle at runtime with 'L'" },
     { "lada_home",          OPT_TYPE_STRING, OPT_EXPERT, { &lada_home }, "path to the lada project root (contains .venv and lada_sidecar.py)", "dir" },
+    { "jasna_home",         OPT_TYPE_STRING, OPT_EXPERT, { &jasna_home }, "path to the jasna source checkout (contains .venv and model_weights)", "dir" },
     { "install",            OPT_TYPE_BOOL,  OPT_EXPERT, { &install_assoc }, "register .mp4/.mkv file associations for the current user and exit" },
     { "uninstall",          OPT_TYPE_BOOL,  OPT_EXPERT, { &uninstall_assoc }, "remove the .mp4/.mkv file associations and exit" },
     { NULL, },
@@ -5421,6 +5460,8 @@ int main(int argc, char **argv)
     ret = parse_options(NULL, argc, argv, options, opt_input_file);
     if (ret < 0)
         exit(ret == AVERROR_EXIT ? 0 : 1);
+
+    lada_set_engine(1, jasna_home);   /* jasna is the only restoration engine */
 
     if (install_assoc || uninstall_assoc) {
         if (fsr_register_associations(install_assoc) == 0) {

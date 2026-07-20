@@ -586,7 +586,7 @@ static LRESULT CALLBACK menu_wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 }
 #endif
 
-int ui_context_menu(int fsr_on, int nr_on, int fg_on, int lada_on, int fg_mult,
+int ui_context_menu(int fsr_on, int nr_on, int fg_on, int lada_on, int jasna_on, int fg_mult,
                     int stereo_on, int scale_mode, int sub_on,
                     const UIAudioTracks *atracks,
                     void (*on_idle)(void *), void *idle_ctx)
@@ -615,8 +615,9 @@ int ui_context_menu(int fsr_on, int nr_on, int fg_on, int lada_on, int fg_mult,
                     UI_MENU_NR, L"NR 노이즈 제거");
         AppendMenuW(fx, MF_STRING | (fg_on ? MF_CHECKED : 0),
                     UI_MENU_FG, L"FG 프레임 생성");
-        AppendMenuW(fx, MF_STRING | (lada_on ? MF_CHECKED : 0),
-                    UI_MENU_LADA, L"Lada 적용");
+        (void)lada_on;   /* lada engine removed; jasna is the only restoration engine */
+        AppendMenuW(fx, MF_STRING | (jasna_on ? MF_CHECKED : 0),
+                    UI_MENU_JASNA, L"Jasna 적용");
         AppendMenuW(fm, MF_STRING | (fg_mult == 2 ? MF_CHECKED : 0),
                     UI_MENU_FGMULT_2X, L"2X");
         AppendMenuW(fm, MF_STRING | (fg_mult == 3 ? MF_CHECKED : 0),
