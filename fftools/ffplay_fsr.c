@@ -2736,7 +2736,7 @@ int fsr_toast_draw(SDL_Renderer *renderer)
 #define ALB_BLOB_COUNT 6
 #define ALB_BLOB_ALPHA 0xA0     /* blob centre alpha (edges fade to clear)   */
 #define ALB_BLOB_PX    256      /* radial-gradient sprite resolution         */
-#define ALB_LP_PX      512      /* built vinyl-disc texture resolution       */
+#define ALB_LP_PX      1024     /* built vinyl-disc texture resolution       */
 
 static SDL_Texture *alb_blob;   /* soft radial gradient (white -> clear)     */
 static SDL_Texture *alb_shine;  /* fixed specular gleam over the spinning LP  */
@@ -2905,7 +2905,7 @@ static void alb_build_lp(SDL_Renderer *renderer,
                  * (few widely-spaced rings, like a real record) rather than a
                  * dense track texture. A narrow cosine ridge cut into a glossy
                  * base gives the incised groove look. */
-                float ring   = 0.5f + 0.5f * cosf(d * 0.28f); /* 1 at ring centre */
+                float ring   = 0.5f + 0.5f * cosf(d * 0.14f); /* 1 at ring centre */
                 float groove = ring * ring;
                 groove *= groove;                              /* pow(ring, 4): thin */
                 float sh1 = 1.0f - fabsf(dx + dy) / (S * 0.9f);
@@ -3045,12 +3045,12 @@ void fsr_album_set_cover(SDL_Renderer *renderer,
 
 void fsr_album_ensure_default(SDL_Renderer *renderer)
 {
-    static uint8_t defc[512 * 512 * 4];
+    static uint8_t defc[1024 * 1024 * 4];
 
     if (alb_have_cover)
         return;                     /* a real (or already-built) cover exists */
-    alb_make_default_cover(defc, 512);
-    fsr_album_set_cover(renderer, defc, 512, 512);
+    alb_make_default_cover(defc, 1024);
+    fsr_album_set_cover(renderer, defc, 1024, 1024);
     alb_default_built = 1;
 }
 
