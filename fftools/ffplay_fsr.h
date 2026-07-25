@@ -128,6 +128,19 @@ int  fsr_hud_left_draw(SDL_Renderer *renderer);
 void fsr_album_set_cover(SDL_Renderer *renderer, const uint8_t *bgra, int w, int h);
 void fsr_album_draw(SDL_Renderer *renderer, int playing);
 void fsr_album_reset(void);
+/* Install a generated placeholder cover (gradient + music note) when the file
+ * has no embedded art, so a real image shows instead of a blank disc. No-op
+ * once any cover is present. */
+void fsr_album_ensure_default(SDL_Renderer *renderer);
+
+/* Bottom FFT-spectrum bar visualizer (a port of WinVibe's LineBarVisualizer2):
+ * a horizontally-mirrored rainbow bar spectrum with a triangle-wave centre
+ * line, drawn as a band across the bottom over the album view. Feed the newest
+ * mono samples in [-1,1] each frame (nsamp must be >= the internal FFT size);
+ * playing = 0 lets the bars decay while paused. fsr_vis_reset() clears the bar
+ * state on a new file. */
+void fsr_vis_draw(SDL_Renderer *renderer, const float *mono, int nsamp, int playing);
+void fsr_vis_reset(void);
 
 /* 8x8 bitmap for a pixel-font character (uppercase letters, digits,
  * ':', '/', '.'), or NULL for characters rendered as blanks. */
