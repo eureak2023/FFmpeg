@@ -1714,7 +1714,7 @@ static void album_display(VideoState *is)
                 src = sw;
         }
         if (src && src->width > 0 && src->height > 0) {
-            int cw = src->width, ch = src->height, cap = 512;
+            int cw = src->width, ch = src->height, cap = 1024;
             uint8_t *bgra;
             struct SwsContext *sws;
 
@@ -1725,7 +1725,7 @@ static void album_display(VideoState *is)
             bgra = av_malloc((size_t)cw * ch * 4);
             sws  = sws_getContext(src->width, src->height, src->format,
                                   cw, ch, AV_PIX_FMT_BGRA,
-                                  SWS_BILINEAR, NULL, NULL, NULL);
+                                  SWS_LANCZOS | SWS_ACCURATE_RND, NULL, NULL, NULL);
             if (bgra && sws) {
                 uint8_t *dd[4] = { bgra, NULL, NULL, NULL };
                 int      dl[4] = { cw * 4, 0, 0, 0 };
