@@ -2826,15 +2826,22 @@ static void alb_build_lp(SDL_Renderer *renderer,
             } else if (d < labelR - 1.0f) {
                 out = 0xFF303030u;                  /* blank centre label */
             } else {
-                float groove = 0.5f + 0.5f * sinf(d * 0.9f);
+                /* Glossy black platter with sparse, thin concentric grooves
+                 * (few widely-spaced rings, like a real record) rather than a
+                 * dense track texture. A narrow cosine ridge cut into a glossy
+                 * base gives the incised groove look. */
+                float ring   = 0.5f + 0.5f * cosf(d * 0.28f); /* 1 at ring centre */
+                float groove = ring * ring;
+                groove *= groove;                              /* pow(ring, 4): thin */
                 float sh1 = 1.0f - fabsf(dx + dy) / (S * 0.9f);
                 float sh2 = 1.0f - fabsf(dx - dy) / (S * 0.9f);
-                int   base = 10 + (int)(groove * 14.0f);
+                int   base = 26 - (int)(groove * 16.0f);       /* glossy black, dark cuts */
                 uint8_t A = 255;
 
-                if (sh1 > 0) base += (int)(sh1 * 10.0f);
-                if (sh2 > 0) base += (int)(sh2 * 10.0f);
+                if (sh1 > 0) base += (int)(sh1 * 12.0f);
+                if (sh2 > 0) base += (int)(sh2 * 12.0f);
                 if (d < labelR + 2.0f)   base = 200;      /* label rim */
+                if (base < 0)   base = 0;
                 if (base > 255) base = 255;
                 if (d > R - 1.0f) {                        /* AA outer edge */
                     float f = R + 0.5f - d;
