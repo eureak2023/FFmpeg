@@ -4654,8 +4654,7 @@ static char *wait_for_input_file(void)
             }
             }
             if (ev.type == SDL_QUIT ||
-                (ev.type == SDL_KEYDOWN && (ev.key.keysym.sym == SDLK_ESCAPE ||
-                                            ev.key.keysym.sym == SDLK_q)))
+                (ev.type == SDL_KEYDOWN && ev.key.keysym.sym == SDLK_q))
                 do_exit(NULL);
             if (ev.type == SDL_DROPFILE) {
                 char *f = av_strdup(ev.drop.file);
@@ -4837,7 +4836,8 @@ static void event_loop(VideoState *cur_stream)
         }
         switch (event.type) {
         case SDL_KEYDOWN:
-            if (exit_on_keydown || event.key.keysym.sym == SDLK_ESCAPE || event.key.keysym.sym == SDLK_q) {
+            /* ESC intentionally does NOT quit; use 'q' to quit. */
+            if (exit_on_keydown || event.key.keysym.sym == SDLK_q) {
                 do_exit(cur_stream);
                 break;
             }
