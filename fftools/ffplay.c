@@ -101,6 +101,9 @@ const int program_birth_year = 2003;
 /* polls for possible required screen refresh at least this often, should be less than 1/fps */
 #define REFRESH_RATE 0.01
 
+/* redraw cadence for the audio-only album visualizer (~60 fps spin) */
+#define ALBUM_REFRESH (1.0 / 60.0)
+
 /* NOTE: the size must be big enough to compensate the hardware audio buffersize size */
 /* TODO: We assume that a decoded and resampled frame fits into this buffer */
 #define SAMPLE_ARRAY_SIZE (8 * 65536)
@@ -300,6 +303,7 @@ typedef struct VideoState {
     char *filename;
     int width, height, xleft, ytop;
     int step;
+    int album_cover_ready;          /* cover pushed to the album visualizer */
 
     int vfilter_idx;
     AVFilterContext *in_video_filter;   // the first filter in the video chain
@@ -358,6 +362,9 @@ static int loop = 0; /* 0 = repeat forever by default; -loop 1 plays once */
 static int framedrop = -1;
 static int infinite_buffer = -1;
 static enum ShowMode show_mode = SHOW_MODE_NONE;
+/* Show the album-art LP visualizer for audio-only files (no video, or only an
+ * attached cover picture) instead of the classic waveform/RDFT. */
+static int album_view = 1;
 static const char *audio_codec_name;
 static const char *subtitle_codec_name;
 static const char *video_codec_name;
@@ -1393,6 +1400,7 @@ static void stream_close(VideoState *is)
     SDL_WaitThread(is->read_tid, NULL);
 
     thumb_close();
+    fsr_album_reset();
 
     /* close each stream */
     if (is->audio_stream >= 0)
@@ -1672,6 +1680,64 @@ static void ui_draw_overlay(VideoState *is)
 }
 
 /* display the current picture, if any */
+/* True when playback is audio-only and should use the album-art LP visualizer:
+ * an audio stream with either no video at all or only an attached cover
+ * picture, and the user has not forced the classic waveform/RDFT view. */
+static int audio_album_active(VideoState *is)
+{
+    if (!album_view || display_disable || !is->audio_st)
+        return 0;
+    if (show_mode == SHOW_MODE_WAVES || show_mode == SHOW_MODE_RDFT)
+        return 0;
+    return !is->video_st ||
+           (is->video_st->disposition & AV_DISPOSITION_ATTACHED_PIC);
+}
+
+/* Draw the album-art visualizer, extracting the embedded cover once (from the
+ * single attached-picture frame) and handing it to the FSR module. */
+static void album_display(VideoState *is)
+{
+    if (!is->album_cover_ready && is->video_st &&
+        (is->video_st->disposition & AV_DISPOSITION_ATTACHED_PIC) &&
+        frame_queue_nb_remaining(&is->pictq) > 0) {
+        Frame   *vp  = frame_queue_peek_last(&is->pictq);
+        AVFrame *src = vp ? vp->frame : NULL;
+        AVFrame *sw  = NULL;
+
+        if (src && src->format == AV_PIX_FMT_D3D11) {
+            sw = av_frame_alloc();
+            if (sw && av_hwframe_transfer_data(sw, src, 0) == 0)
+                src = sw;
+        }
+        if (src && src->width > 0 && src->height > 0) {
+            int cw = src->width, ch = src->height, cap = 512;
+            uint8_t *bgra;
+            struct SwsContext *sws;
+
+            if (cw > cap || ch > cap) {                 /* cap the label size */
+                if (cw >= ch) { ch = FFMAX(1, ch * cap / cw); cw = cap; }
+                else          { cw = FFMAX(1, cw * cap / ch); ch = cap; }
+            }
+            bgra = av_malloc((size_t)cw * ch * 4);
+            sws  = sws_getContext(src->width, src->height, src->format,
+                                  cw, ch, AV_PIX_FMT_BGRA,
+                                  SWS_BILINEAR, NULL, NULL, NULL);
+            if (bgra && sws) {
+                uint8_t *dd[4] = { bgra, NULL, NULL, NULL };
+                int      dl[4] = { cw * 4, 0, 0, 0 };
+                sws_scale(sws, (const uint8_t * const *)src->data, src->linesize,
+                          0, src->height, dd, dl);
+                fsr_album_set_cover(renderer, bgra, cw, ch);
+            }
+            sws_freeContext(sws);
+            av_free(bgra);
+        }
+        av_frame_free(&sw);
+        is->album_cover_ready = 1;
+    }
+    fsr_album_draw(renderer, !is->paused);
+}
+
 static void video_display(VideoState *is)
 {
     if (!is->width)
@@ -1679,7 +1745,9 @@ static void video_display(VideoState *is)
 
     SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
     SDL_RenderClear(renderer);
-    if (is->audio_st && is->show_mode != SHOW_MODE_VIDEO)
+    if (audio_album_active(is))
+        album_display(is);
+    else if (is->audio_st && is->show_mode != SHOW_MODE_VIDEO)
         video_audio_display(is);
     else if (is->video_st)
         video_image_display(is);
@@ -1968,6 +2036,22 @@ static void video_refresh(void *opaque, double *remaining_time)
 
     if (!is->paused && get_master_sync_type(is) == AV_SYNC_EXTERNAL_CLOCK && is->realtime)
         check_external_clock_speed(is);
+
+    /* Audio-only album visualizer: redraw continuously for the LP spin and
+     * drifting background (attached-picture files also land here, so this
+     * pre-empts the still-image video path). */
+    if (!display_disable && audio_album_active(is)) {
+        time = av_gettime_relative() / 1000000.0;
+        if (is->force_refresh || is->last_vis_time + ALBUM_REFRESH < time) {
+            video_display(is);
+            is->last_vis_time = time;
+        }
+        if (!is->paused)
+            *remaining_time = FFMIN(*remaining_time,
+                                    is->last_vis_time + ALBUM_REFRESH - time);
+        is->force_refresh = 0;
+        return;
+    }
 
     if (!display_disable && is->show_mode != SHOW_MODE_VIDEO && is->audio_st) {
         time = av_gettime_relative() / 1000000.0;
