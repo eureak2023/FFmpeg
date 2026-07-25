@@ -104,6 +104,9 @@ const int program_birth_year = 2003;
 /* redraw cadence for the audio-only album visualizer (~60 fps spin) */
 #define ALBUM_REFRESH (1.0 / 60.0)
 
+/* mono samples handed to the bottom FFT visualizer each frame (>= its FFT) */
+#define VIS_MONO 2048
+
 /* NOTE: the size must be big enough to compensate the hardware audio buffersize size */
 /* TODO: We assume that a decoded and resampled frame fits into this buffer */
 #define SAMPLE_ARRAY_SIZE (8 * 65536)
@@ -1401,6 +1404,7 @@ static void stream_close(VideoState *is)
 
     thumb_close();
     fsr_album_reset();
+    fsr_vis_reset();
 
     /* close each stream */
     if (is->audio_stream >= 0)
@@ -1735,7 +1739,39 @@ static void album_display(VideoState *is)
         av_frame_free(&sw);
         is->album_cover_ready = 1;
     }
+    /* No attached cover picture at all: show a generated placeholder image. */
+    if (!is->video_st)
+        fsr_album_ensure_default(renderer);
     fsr_album_draw(renderer, !is->paused);
+
+    /* Feed the newest samples to the bottom FFT visualizer. sample_array holds
+     * interleaved int16 samples written by the audio thread; gather a mono mix
+     * of the most recent VIS_MONO samples ending at the write head. Reading it
+     * unlocked is a benign race, matching stock ffplay's RDFT display. */
+    if (is->audio_st) {
+        static float mono[VIS_MONO];
+        int ch  = is->audio_tgt.ch_layout.nb_channels;
+        int idx = is->sample_array_index;
+
+        if (ch < 1)
+            ch = 1;
+        for (int i = 0; i < VIS_MONO; i++) {
+            int base = idx - (VIS_MONO - i) * ch;
+            int acc  = 0;
+
+            base %= SAMPLE_ARRAY_SIZE;
+            if (base < 0)
+                base += SAMPLE_ARRAY_SIZE;
+            for (int k = 0; k < ch; k++) {
+                int j = base + k;
+                if (j >= SAMPLE_ARRAY_SIZE)
+                    j -= SAMPLE_ARRAY_SIZE;
+                acc += is->sample_array[j];
+            }
+            mono[i] = (float)acc / (ch * 32768.0f);
+        }
+        fsr_vis_draw(renderer, mono, VIS_MONO, !is->paused);
+    }
 }
 
 static void video_display(VideoState *is)
@@ -3245,7 +3281,10 @@ static void sdl_audio_callback(void *opaque, Uint8 *stream, int len)
                is->audio_buf = NULL;
                is->audio_buf_size = SDL_AUDIO_MIN_BUFFER_SIZE / is->audio_tgt.frame_size * is->audio_tgt.frame_size;
            } else {
-               if (is->show_mode != SHOW_MODE_VIDEO)
+               /* Feed the sample ring for any non-video display, and also for
+                * the album visualizer on attached-picture files (show_mode is
+                * VIDEO there, so it would otherwise never be filled). */
+               if (is->show_mode != SHOW_MODE_VIDEO || audio_album_active(is))
                    update_sample_display(is, (int16_t *)is->audio_buf, audio_size);
                is->audio_buf_size = audio_size;
            }

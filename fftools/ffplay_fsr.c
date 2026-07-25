@@ -33,7 +33,9 @@
 
 #include "libavutil/log.h"
 #include "libavutil/macros.h"
+#include "libavutil/mem.h"
 #include "libavutil/time.h"
+#include "libavutil/tx.h"
 
 #if CONFIG_D3D11VA
 #define COBJMACROS
@@ -2662,9 +2664,11 @@ int fsr_toast_draw(SDL_Renderer *renderer)
 #define ALB_LP_PX      512      /* built vinyl-disc texture resolution       */
 
 static SDL_Texture *alb_blob;   /* soft radial gradient (white -> clear)     */
+static SDL_Texture *alb_shine;  /* fixed specular gleam over the spinning LP  */
 static SDL_Texture *alb_lp;     /* vinyl disc built from the cover           */
 static SDL_Texture *alb_cover;  /* raw cover, drawn flat on the left         */
 static int          alb_have_cover;
+static int          alb_default_built;  /* generated placeholder cover in use */
 static float        alb_phase_x[ALB_BLOB_COUNT];
 static float        alb_phase_y[ALB_BLOB_COUNT];
 static float        alb_phase_r[ALB_BLOB_COUNT];
@@ -2720,6 +2724,65 @@ static void alb_build_blob(SDL_Renderer *renderer)
         SDL_UpdateTexture(alb_blob, NULL, px, N * 4);
         SDL_SetTextureBlendMode(alb_blob, SDL_BLENDMODE_BLEND);
         SDL_SetTextureScaleMode(alb_blob, SDL_ScaleModeLinear);
+    }
+}
+
+/* Build the fixed specular gleam laid over the spinning disc: a circular,
+ * additive white streak (a broad diagonal band + bright core, plus a fainter
+ * crossing band) that fades over the centre label and at the rim. It is drawn
+ * WITHOUT rotation, so as the record spins the reflection stays put and the
+ * grooves catch the light — the realistic look. Built once, cover-independent. */
+static void alb_build_shine(SDL_Renderer *renderer)
+{
+    static uint32_t px[ALB_LP_PX * ALB_LP_PX];
+    const int S = ALB_LP_PX;
+    float c = S / 2.0f, R = S / 2.0f - 1.0f;
+    float labelR = S * 0.19f;
+
+    if (alb_shine)
+        return;
+    for (int y = 0; y < S; y++)
+        for (int x = 0; x < S; x++) {
+            float dx = x - c, dy = y - c;
+            float d  = sqrtf(dx * dx + dy * dy);
+            uint32_t out = 0x00000000u;
+
+            if (d <= R) {
+                float u = dx / R, v = dy / R;
+                float diag1 = u + v, diag2 = u - v;
+                /* A "<"-shaped gleam: an upper "/" arm (along diag1) and a
+                 * lower "\" arm (along diag2) that meet at a vertex left of
+                 * centre and open to the right. Each arm is faded into its own
+                 * half (upper/lower) so the two only join at the vertex. */
+                float off = 0.15f;
+                float a1  = diag1 + off;                 /* upper arm core */
+                float a2  = diag2 + off;                 /* lower arm core */
+                float vu  = v > 0.0f ? v : 0.0f;         /* spill into lower */
+                float vl  = v < 0.0f ? -v : 0.0f;        /* spill into upper */
+                float wu  = expf(-(vu * vu) / (2.0f * 0.30f * 0.30f));
+                float wl  = expf(-(vl * vl) / (2.0f * 0.30f * 0.30f));
+                float inten =
+                    wu * (0.30f * expf(-(a1 * a1) / (2.0f * 0.40f * 0.40f)) +
+                          0.55f * expf(-(a1 * a1) / (2.0f * 0.13f * 0.13f))) +
+                    wl * (0.30f * expf(-(a2 * a2) / (2.0f * 0.40f * 0.40f)) +
+                          0.55f * expf(-(a2 * a2) / (2.0f * 0.13f * 0.13f)));
+                uint8_t A;
+
+                if (d < labelR)   inten *= 0.35f;          /* softer on label */
+                if (d > R - 2.0f) inten *= (R - d) / 2.0f;  /* fade rim edge  */
+                if (inten < 0.0f) inten = 0.0f;
+                if (inten > 1.0f) inten = 1.0f;
+                A = (uint8_t)(inten * 255.0f);
+                out = ((uint32_t)A << 24) | 0x00FFFFFFu;
+            }
+            px[y * S + x] = out;
+        }
+    alb_shine = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
+                                  SDL_TEXTUREACCESS_STATIC, S, S);
+    if (alb_shine) {
+        SDL_UpdateTexture(alb_shine, NULL, px, S * 4);
+        SDL_SetTextureBlendMode(alb_shine, SDL_BLENDMODE_ADD);
+        SDL_SetTextureScaleMode(alb_shine, SDL_ScaleModeLinear);
     }
 }
 
@@ -2793,6 +2856,90 @@ static void alb_build_lp(SDL_Renderer *renderer,
     }
 }
 
+/* Alpha-blend an RGB colour into a BGRA pixel. */
+static void alb_blend_px(uint8_t *p, uint8_t r, uint8_t g, uint8_t b, float a)
+{
+    if (a <= 0.0f) return;
+    if (a > 1.0f)  a = 1.0f;
+    p[0] = (uint8_t)(p[0] * (1.0f - a) + b * a);
+    p[1] = (uint8_t)(p[1] * (1.0f - a) + g * a);
+    p[2] = (uint8_t)(p[2] * (1.0f - a) + r * a);
+    p[3] = 255;
+}
+
+static void alb_fill_rect(uint8_t *bgra, int S, int x0, int y0, int x1, int y1,
+                          uint8_t r, uint8_t g, uint8_t b, float a)
+{
+    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+    if (x1 > S) x1 = S; if (y1 > S) y1 = S;
+    for (int y = y0; y < y1; y++)
+        for (int x = x0; x < x1; x++)
+            alb_blend_px(bgra + ((size_t)y * S + x) * 4, r, g, b, a);
+}
+
+/* Filled, tilted ellipse with a 1px soft edge (for the note heads). */
+static void alb_fill_ellipse(uint8_t *bgra, int S, float cx, float cy,
+                             float rx, float ry, float ang,
+                             uint8_t r, uint8_t g, uint8_t b)
+{
+    float ca = cosf(ang), sa = sinf(ang);
+    int   rad = (int)(rx + ry + 2);
+    int   x0 = (int)(cx - rad), x1 = (int)(cx + rad);
+    int   y0 = (int)(cy - rad), y1 = (int)(cy + rad);
+
+    if (x0 < 0) x0 = 0; if (y0 < 0) y0 = 0;
+    if (x1 > S) x1 = S; if (y1 > S) y1 = S;
+    for (int y = y0; y < y1; y++)
+        for (int x = x0; x < x1; x++) {
+            float dx = x - cx, dy = y - cy;
+            float u  =  dx * ca + dy * sa;
+            float v  = -dx * sa + dy * ca;
+            float e  = (u * u) / (rx * rx) + (v * v) / (ry * ry);
+            float a;
+
+            if (e > 1.0f) continue;
+            a = e > 0.85f ? 1.0f - (e - 0.85f) / 0.15f : 1.0f;
+            alb_blend_px(bgra + ((size_t)y * S + x) * 4, r, g, b, a);
+        }
+}
+
+/* Build a placeholder cover for music with no embedded art: a diagonal
+ * purple->blue gradient with a soft vignette and a centred beamed-eighth-note
+ * (♫) in off-white. Written as BGRA into a caller S*S*4 buffer. */
+static void alb_make_default_cover(uint8_t *bgra, int S)
+{
+    const uint8_t nr = 235, ng = 236, nb = 248;   /* note colour */
+    float rx = 0.085f * S, ry = 0.062f * S, tilt = -0.32f;
+    float hlx = 0.36f * S, hrx = 0.60f * S, hy = 0.64f * S;
+    int   stemW  = (int)(0.024f * S);
+    int   stemTop = (int)(0.30f * S);
+    int   slx = (int)(hlx + rx * 0.88f), srx = (int)(hrx + rx * 0.88f);
+
+    for (int y = 0; y < S; y++)
+        for (int x = 0; x < S; x++) {
+            float u = (float)x / S, v = (float)y / S;
+            float t = (u + v) * 0.5f;
+            float dx = u - 0.5f, dy = v - 0.5f;
+            float vig = 1.0f - 0.55f * sqrtf(dx * dx + dy * dy);
+            uint8_t *p = bgra + ((size_t)y * S + x) * 4;
+
+            if (vig < 0.0f) vig = 0.0f;
+            p[2] = (uint8_t)((58 * (1 - t) + 18 * t) * vig);   /* R */
+            p[1] = (uint8_t)((30 * (1 - t) + 74 * t) * vig);   /* G */
+            p[0] = (uint8_t)((90 * (1 - t) + 122 * t) * vig);  /* B */
+            p[3] = 255;
+        }
+
+    /* stems (up from each head's right edge) + top beam connecting them */
+    alb_fill_rect(bgra, S, slx, stemTop, slx + stemW, (int)hy, nr, ng, nb, 0.95f);
+    alb_fill_rect(bgra, S, srx, stemTop, srx + stemW, (int)hy, nr, ng, nb, 0.95f);
+    alb_fill_rect(bgra, S, slx, stemTop, srx + stemW, stemTop + (int)(0.055f * S),
+                  nr, ng, nb, 0.95f);
+    /* note heads */
+    alb_fill_ellipse(bgra, S, hlx, hy, rx, ry, tilt, nr, ng, nb);
+    alb_fill_ellipse(bgra, S, hrx, hy, rx, ry, tilt, nr, ng, nb);
+}
+
 void fsr_album_set_cover(SDL_Renderer *renderer,
                          const uint8_t *bgra, int w, int h)
 {
@@ -2814,12 +2961,33 @@ void fsr_album_set_cover(SDL_Renderer *renderer,
     alb_build_lp(renderer, bgra, w, h);
 }
 
+void fsr_album_ensure_default(SDL_Renderer *renderer)
+{
+    static uint8_t defc[512 * 512 * 4];
+
+    if (alb_have_cover)
+        return;                     /* a real (or already-built) cover exists */
+    alb_make_default_cover(defc, 512);
+    fsr_album_set_cover(renderer, defc, 512, 512);
+    alb_default_built = 1;
+}
+
 void fsr_album_reset(void)
 {
     if (alb_cover) { SDL_DestroyTexture(alb_cover); alb_cover = NULL; }
     if (alb_lp)    { SDL_DestroyTexture(alb_lp);    alb_lp    = NULL; }
-    alb_have_cover = 0;
+    alb_have_cover    = 0;
+    alb_default_built = 0;
     /* Keep the blob sprite, phases and rotation angle across files. */
+}
+
+/* Height of the bottom FFT-visualizer band for a given output height. Shared
+ * by the album view (to sit clear above it) and fsr_vis_draw (which draws it).
+ * The band occupies this height plus a small bottom margin (oh * 0.04). */
+static float vis_band_h(int oh)
+{
+    float h = oh * 0.20f;
+    return h < 80.0f ? 80.0f : h;
 }
 
 void fsr_album_draw(SDL_Renderer *renderer, int playing)
@@ -2834,6 +3002,7 @@ void fsr_album_draw(SDL_Renderer *renderer, int playing)
         return;
 
     alb_build_blob(renderer);
+    alb_build_shine(renderer);
     if (!alb_lp)                              /* no cover set yet: blank disc */
         alb_build_lp(renderer, NULL, 0, 0);
     if (!alb_blob || !alb_lp)
@@ -2883,14 +3052,21 @@ void fsr_album_draw(SDL_Renderer *renderer, int playing)
         SDL_RenderCopy(renderer, alb_blob, NULL, &dst);
     }
 
-    /* 2. layout: cover flat on the left, LP spinning out to its right */
+    /* 2. layout: cover flat on the left, LP spinning out to its right.
+     * Vertically centre the pair in the room ABOVE the visualizer band so the
+     * two never overlap. */
     {
+        float avail     = oh - (oh * 0.04f + vis_band_h(oh));
         float albumSize = minside * 0.55f;
-        float lpSize    = albumSize * 0.90f;
-        float exposed   = lpSize * 0.55f;
-        float totalW    = albumSize + (exposed - (albumSize - lpSize) / 2.0f);
-        float startX    = (ow - totalW) / 2.0f;
-        float startY    = (oh - albumSize) / 2.0f;
+        float lpSize, exposed, totalW, startX, startY;
+
+        if (avail < 1.0f)               avail = oh;      /* degenerate guard */
+        if (albumSize > avail * 0.90f)  albumSize = avail * 0.90f;
+        lpSize  = albumSize * 0.90f;
+        exposed = lpSize * 0.55f;
+        totalW  = albumSize + (exposed - (albumSize - lpSize) / 2.0f);
+        startX  = (ow - totalW) / 2.0f;
+        startY  = (avail - albumSize) / 2.0f;
         float wob       = sinf(alb_angle * 0.01745329f) * (albumSize * 0.012f);
         float lpcx      = startX + albumSize + lpSize * 0.05f;
         float lpcy      = startY + albumSize / 2.0f + wob;
@@ -2912,6 +3088,13 @@ void fsr_album_draw(SDL_Renderer *renderer, int playing)
         ctr.x = ctr.y = (int)(lpSize / 2.0f);
         SDL_RenderCopyEx(renderer, alb_lp, NULL, &dst, alb_angle, &ctr,
                          SDL_FLIP_NONE);
+
+        /* fixed specular gleam on top (same rect, NOT rotated) */
+        if (alb_shine) {
+            SDL_SetTextureColorMod(alb_shine, 235, 242, 255);
+            SDL_SetTextureAlphaMod(alb_shine, 45);
+            SDL_RenderCopy(renderer, alb_shine, NULL, &dst);
+        }
 
         /* cover laid flat on the left (soft shadow behind) */
         if (alb_have_cover && alb_cover) {
@@ -2937,6 +3120,217 @@ void fsr_album_draw(SDL_Renderer *renderer, int playing)
     SDL_SetTextureAlphaMod(alb_blob, 255);
 }
 
+/* ------------------------------------------------------------------------
+ * Bottom FFT-spectrum bar visualizer (audio-only playback)
+ *
+ * A port of WinVibe's LineBarVisualizer2: a horizontally-mirrored bar
+ * spectrum (bass at the centre, treble at the edges) with a time-cycled
+ * rainbow palette and a translucent triangle-wave centre line, drawn as a
+ * band across the bottom of the window over the album view. The caller feeds
+ * the newest mono samples each frame; the FFT, response smoothing and drawing
+ * all happen here.
+ * --------------------------------------------------------------------- */
+
+#define VIS_BARS          96        /* total bars (mirrored -> 48 per side) */
+#define VIS_FFT_LEN       2048      /* FFT window size (power of two)        */
+#define VIS_BAR_ALPHA     0xB0
+#define VIS_LINE_ALPHA    0x50
+#define VIS_INPUT_SMOOTH  0.20f     /* IIR smoothing on the FFT targets      */
+#define VIS_ATTACK        0.30f     /* rise speed (staged, centre-out)       */
+#define VIS_RELEASE       0.45f     /* fall speed                            */
+#define VIS_CASCADE       0.10f     /* centre-out rise delay per band        */
+#define VIS_IDLE_DECAY    0.85f     /* decay toward 0 while paused/stopped   */
+#define VIS_DB_MIN       (-58.0f)   /* magnitude (dBFS) mapped to bar 0.0    */
+#define VIS_DB_MAX       (-8.0f)    /* magnitude (dBFS) mapped to bar 1.0    */
+#define VIS_COLOR_SPEED   28.0f     /* palette indices/sec (~9s per cycle)   */
+
+static AVTXContext    *vis_tx;
+static av_tx_fn        vis_tx_fn;
+static float          *vis_win;     /* Hann window, VIS_FFT_LEN              */
+static float          *vis_tin;     /* windowed input, VIS_FFT_LEN          */
+static AVComplexFloat *vis_tout;    /* spectrum, VIS_FFT_LEN/2 + 1          */
+static float           vis_target[VIS_BARS];
+static float           vis_disp[VIS_BARS];
+static float           vis_rise[VIS_BARS];
+static uint32_t        vis_color_start;
+
+/* Mirror map: visual position p -> frequency-band index (0 = bass at the two
+ * centre bars, half-1 = treble at both edges). Keeps both sides symmetric. */
+static int vis_freq_idx(int p)
+{
+    int half = VIS_BARS / 2;
+    return (p < half) ? (half - 1 - p) : (p - half);
+}
+
+static int vis_fft_init(void)
+{
+    float scale = 1.0f;
+
+    if (vis_tx)
+        return 0;
+    vis_win  = av_malloc_array(VIS_FFT_LEN, sizeof(*vis_win));
+    vis_tin  = av_malloc_array(VIS_FFT_LEN, sizeof(*vis_tin));
+    vis_tout = av_malloc_array(VIS_FFT_LEN / 2 + 1, sizeof(*vis_tout));
+    if (!vis_win || !vis_tin || !vis_tout)
+        return -1;
+    for (int i = 0; i < VIS_FFT_LEN; i++)   /* Hann window */
+        vis_win[i] = 0.5f - 0.5f * cosf(6.2831853f * i / (VIS_FFT_LEN - 1));
+    if (av_tx_init(&vis_tx, &vis_tx_fn, AV_TX_FLOAT_RDFT,
+                   0, VIS_FFT_LEN, &scale, 0) < 0) {
+        vis_tx = NULL;
+        return -1;
+    }
+    return 0;
+}
+
+void fsr_vis_reset(void)
+{
+    for (int i = 0; i < VIS_BARS; i++)
+        vis_target[i] = vis_disp[i] = vis_rise[i] = 0.0f;
+}
+
+void fsr_vis_draw(SDL_Renderer *renderer, const float *mono, int nsamp,
+                  int playing)
+{
+    const int half   = VIS_BARS / 2;
+    const int maxbin = VIS_FFT_LEN / 2;
+    float raw[VIS_BARS / 2];
+    int   ow = 0, oh = 0;
+    uint32_t now;
+    float t, bandH, midY, barW, offset, maxAmp;
+    SDL_BlendMode prev_bm;
+
+    if (nsamp < VIS_FFT_LEN || vis_fft_init() < 0)
+        return;
+
+    /* window + forward real FFT over the newest VIS_FFT_LEN samples */
+    for (int i = 0; i < VIS_FFT_LEN; i++)
+        vis_tin[i] = mono[nsamp - VIS_FFT_LEN + i] * vis_win[i];
+    vis_tx_fn(vis_tx, vis_tout, vis_tin, sizeof(float));
+
+    /* log-spaced frequency bands -> normalized magnitude (dBFS window).
+     * A running cursor makes each band's bin range distinct and non-overlapping:
+     * at low frequencies the log spacing falls below one bin, so without this
+     * several centre bars would read the *same* bin and rise identically. The
+     * cursor forces one distinct bin per band there (sequential), keeping the
+     * bass bars differentiated, and stays log-spaced once bands span many bins. */
+    int nextbin = 1;
+    for (int b = 0; b < half; b++) {
+        int   i0 = nextbin;
+        int   i1 = (int)powf((float)maxbin, (float)(b + 1) / half);
+        double pw = 0.0;
+        int    cnt = 0;
+        float  mag, db, lvl;
+
+        if (i1 <= i0)     i1 = i0 + 1;      /* at least one distinct bin */
+        if (i1 > maxbin)  i1 = maxbin;
+        for (int k = i0; k < i1; k++) {
+            float re = vis_tout[k].re, im = vis_tout[k].im;
+            pw += (double)re * re + (double)im * im;
+            cnt++;
+        }
+        nextbin = i1;                       /* next band starts where this ends */
+        if (nextbin >= maxbin) nextbin = maxbin - 1;
+        mag = cnt ? sqrtf((float)(pw / cnt)) * (2.0f / VIS_FFT_LEN) : 0.0f;
+        db  = 20.0f * log10f(mag + 1e-6f);
+        lvl = (db - VIS_DB_MIN) / (VIS_DB_MAX - VIS_DB_MIN);
+        lvl *= 1.0f + 0.6f * ((float)b / (half - 1));   /* lift the treble */
+        if (lvl < 0.0f) lvl = 0.0f;
+        if (lvl > 1.0f) lvl = 1.0f;
+        raw[b] = lvl;
+    }
+
+    /* input smoothing + attack/release with a centre-out rise cascade */
+    now = SDL_GetTicks();
+    if (!vis_color_start)
+        vis_color_start = now;
+    for (int p = 0; p < VIS_BARS; p++) {
+        int   fi     = vis_freq_idx(p);
+        float target = vis_target[p] * VIS_INPUT_SMOOTH +
+                       raw[fi] * (1.0f - VIS_INPUT_SMOOTH);
+        float delta;
+
+        if (!playing)
+            target *= VIS_IDLE_DECAY;
+        vis_target[p] = target;
+        delta = target - vis_disp[p];
+        if (delta >= 0.0f) {
+            if (vis_rise[p] < fi * VIS_CASCADE)
+                vis_rise[p] += VIS_ATTACK;              /* still delayed */
+            else {
+                vis_rise[p] += VIS_ATTACK;
+                vis_disp[p] += delta * VIS_ATTACK;
+            }
+        } else {
+            vis_disp[p] += delta * VIS_RELEASE;
+            vis_rise[p]  = 0.0f;
+        }
+    }
+
+    /* geometry: a band across the bottom, bars mirrored about their midline */
+    SDL_GetRendererOutputSize(renderer, &ow, &oh);
+    if (ow <= 0 || oh <= 0)
+        return;
+    bandH  = vis_band_h(oh);
+    midY   = oh - oh * 0.04f - bandH * 0.5f;
+    barW   = (float)ow / (VIS_BARS * 2.0f);
+    offset = barW * 0.5f;
+    maxAmp = bandH;
+    t      = (now - vis_color_start) / 1000.0f;
+
+    SDL_GetRenderDrawBlendMode(renderer, &prev_bm);
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+
+    /* centre triangle-wave line (behind the bars), rainbow per segment */
+    {
+        float pad   = barW * 0.5f;
+        float startX = pad, endX = ow - pad;
+        float xStep = (endX - startX) / (VIS_BARS - 1);
+        float px = startX, py = midY;
+
+        for (int i = 0; i < VIS_BARS; i++) {
+            float x    = startX + i * xStep;
+            float sign = (i % 2 == 0) ? -1.0f : 1.0f;
+            float amp  = vis_disp[i] * maxAmp;
+            float y, hue;
+            uint8_t r, g, b;
+
+            if (amp < barW) amp = barW;
+            y   = midY + sign * (amp * 0.5f) * 0.5f;
+            hue = fmodf((float)i / VIS_BARS * 360.0f + t * VIS_COLOR_SPEED * 1.4f,
+                        360.0f);
+            alb_hsv(hue, 0.85f, 1.0f, &r, &g, &b);
+            SDL_SetRenderDrawColor(renderer, r, g, b, VIS_LINE_ALPHA);
+            /* 2px-thick segment */
+            for (int o = 0; o <= 1; o++) {
+                SDL_RenderDrawLineF(renderer, px, py + o, x, y + o);
+                SDL_RenderDrawLineF(renderer, px + o, py, x + o, y);
+            }
+            px = x; py = y;
+        }
+    }
+
+    /* the mirrored spectrum bars, time-cycled rainbow */
+    for (int i = 0; i < VIS_BARS; i++) {
+        float amp = vis_disp[i] * maxAmp;
+        float hue = fmodf((float)i / VIS_BARS * 360.0f + t * VIS_COLOR_SPEED,
+                          360.0f);
+        SDL_FRect rc;
+        uint8_t r, g, b;
+
+        if (amp < barW) amp = barW;                     /* min visible nub */
+        alb_hsv(hue, 0.85f, 1.0f, &r, &g, &b);
+        SDL_SetRenderDrawColor(renderer, r, g, b, VIS_BAR_ALPHA);
+        rc.x = barW * i * 2.0f + offset;
+        rc.y = midY - amp * 0.5f;
+        rc.w = barW;
+        rc.h = amp;
+        SDL_RenderFillRectF(renderer, &rc);
+    }
+
+    SDL_SetRenderDrawBlendMode(renderer, prev_bm);
+}
+
 void fsr_uninit(void)
 {
 #if CONFIG_D3D11VA
@@ -2944,7 +3338,12 @@ void fsr_uninit(void)
     fg_destroy();
     hwgl_destroy();
 #endif
+    if (vis_tx) { av_tx_uninit(&vis_tx); vis_tx = NULL; }
+    av_freep(&vis_win);
+    av_freep(&vis_tin);
+    av_freep(&vis_tout);
     if (alb_blob)   { SDL_DestroyTexture(alb_blob);   alb_blob   = NULL; }
+    if (alb_shine)  { SDL_DestroyTexture(alb_shine);  alb_shine  = NULL; }
     if (alb_lp)     { SDL_DestroyTexture(alb_lp);     alb_lp     = NULL; }
     if (alb_cover)  { SDL_DestroyTexture(alb_cover);  alb_cover  = NULL; }
     if (toast_tex)  { SDL_DestroyTexture(toast_tex);  toast_tex  = NULL; }
