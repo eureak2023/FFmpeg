@@ -2722,6 +2722,296 @@ int fsr_toast_draw(SDL_Renderer *renderer)
     return 1;
 }
 
+/* ------------------------------------------------------------------------
+ * Album-art "now playing" visualizer (audio-only playback)
+ *
+ * A port of WinVibe's LPPlayerView: an animated rainbow-blob background with
+ * the cover art laid flat on the left and a vinyl LP spinning out from behind
+ * it. Everything is drawn with the plain SDL_Renderer (no GL), so it works on
+ * any backend, mirroring the "degrade gracefully" rule for the audio path.
+ * --------------------------------------------------------------------- */
+
+#define ALB_BLOB_COUNT 6
+#define ALB_BLOB_ALPHA 0xA0     /* blob centre alpha (edges fade to clear)   */
+#define ALB_BLOB_PX    256      /* radial-gradient sprite resolution         */
+#define ALB_LP_PX      512      /* built vinyl-disc texture resolution       */
+
+static SDL_Texture *alb_blob;   /* soft radial gradient (white -> clear)     */
+static SDL_Texture *alb_lp;     /* vinyl disc built from the cover           */
+static SDL_Texture *alb_cover;  /* raw cover, drawn flat on the left         */
+static int          alb_have_cover;
+static float        alb_phase_x[ALB_BLOB_COUNT];
+static float        alb_phase_y[ALB_BLOB_COUNT];
+static float        alb_phase_r[ALB_BLOB_COUNT];
+static float        alb_base_hue[ALB_BLOB_COUNT];
+static int          alb_phase_init;
+static float        alb_angle;      /* LP rotation, degrees                  */
+static uint32_t     alb_last_ticks;
+static uint32_t     alb_start_ticks;
+
+static void alb_hsv(float h, float s, float v,
+                    uint8_t *r, uint8_t *g, uint8_t *b)
+{
+    float c = v * s;
+    float x = c * (1.0f - fabsf(fmodf(h / 60.0f, 2.0f) - 1.0f));
+    float m = v - c, rr = 0, gg = 0, bb = 0;
+
+    if      (h <  60) { rr = c; gg = x; }
+    else if (h < 120) { rr = x; gg = c; }
+    else if (h < 180) { gg = c; bb = x; }
+    else if (h < 240) { gg = x; bb = c; }
+    else if (h < 300) { rr = x; bb = c; }
+    else              { rr = c; bb = x; }
+    *r = (uint8_t)((rr + m) * 255.0f + 0.5f);
+    *g = (uint8_t)((gg + m) * 255.0f + 0.5f);
+    *b = (uint8_t)((bb + m) * 255.0f + 0.5f);
+}
+
+/* Build the soft radial-gradient blob sprite once (reused for the rainbow
+ * background and, tinted black, for drop shadows). */
+static void alb_build_blob(SDL_Renderer *renderer)
+{
+    static uint32_t px[ALB_BLOB_PX * ALB_BLOB_PX];
+    const int N = ALB_BLOB_PX;
+
+    if (alb_blob)
+        return;
+    for (int y = 0; y < N; y++)
+        for (int x = 0; x < N; x++) {
+            float dx = (x - N / 2.0f) / (N / 2.0f);
+            float dy = (y - N / 2.0f) / (N / 2.0f);
+            float d  = sqrtf(dx * dx + dy * dy);
+            float a  = 1.0f - d;
+            uint8_t A;
+
+            if (a < 0.0f) a = 0.0f;
+            a = a * a;                          /* softer falloff */
+            A = (uint8_t)(a * 255.0f + 0.5f);
+            px[y * N + x] = ((uint32_t)A << 24) | 0x00FFFFFFu;
+        }
+    alb_blob = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
+                                 SDL_TEXTUREACCESS_STATIC, N, N);
+    if (alb_blob) {
+        SDL_UpdateTexture(alb_blob, NULL, px, N * 4);
+        SDL_SetTextureBlendMode(alb_blob, SDL_BLENDMODE_BLEND);
+        SDL_SetTextureScaleMode(alb_blob, SDL_ScaleModeLinear);
+    }
+}
+
+/* Build the vinyl disc: a black platter with fine concentric grooves, a faint
+ * crossed shine, the cover cropped into a circular centre label, and a punched
+ * spindle hole. cover may be NULL for a blank record. */
+static void alb_build_lp(SDL_Renderer *renderer,
+                         const uint8_t *cover, int cw, int ch)
+{
+    static uint32_t px[ALB_LP_PX * ALB_LP_PX];
+    const int S = ALB_LP_PX;
+    float c = S / 2.0f, R = S / 2.0f - 1.0f;
+    int labelR = (int)(S * 0.19f);
+    int holeR  = (int)(S * 0.02f);
+    int cmin = cover ? (cw < ch ? cw : ch) : 0;
+    int cx0  = cover ? (cw - cmin) / 2 : 0;
+    int cy0  = cover ? (ch - cmin) / 2 : 0;
+
+    for (int y = 0; y < S; y++)
+        for (int x = 0; x < S; x++) {
+            float dx = x - c, dy = y - c;
+            float d  = sqrtf(dx * dx + dy * dy);
+            uint32_t out;
+
+            if (d > R + 0.5f || d < holeR) {
+                out = 0x00000000u;                  /* outside / spindle hole */
+            } else if (cover && d < labelR - 1.0f) {
+                float u  = (x - (c - labelR)) / (2.0f * labelR);
+                float v  = (y - (c - labelR)) / (2.0f * labelR);
+                int   sx = cx0 + (int)(u * cmin);
+                int   sy = cy0 + (int)(v * cmin);
+                const uint8_t *p;
+
+                if (sx < 0)   sx = 0;
+                if (sy < 0)   sy = 0;
+                if (sx >= cw) sx = cw - 1;
+                if (sy >= ch) sy = ch - 1;
+                p = cover + ((size_t)sy * cw + sx) * 4;   /* BGRA */
+                out = 0xFF000000u | ((uint32_t)p[2] << 16) |
+                      ((uint32_t)p[1] << 8) | p[0];
+            } else if (d < labelR - 1.0f) {
+                out = 0xFF303030u;                  /* blank centre label */
+            } else {
+                float groove = 0.5f + 0.5f * sinf(d * 0.9f);
+                float sh1 = 1.0f - fabsf(dx + dy) / (S * 0.9f);
+                float sh2 = 1.0f - fabsf(dx - dy) / (S * 0.9f);
+                int   base = 10 + (int)(groove * 14.0f);
+                uint8_t A = 255;
+
+                if (sh1 > 0) base += (int)(sh1 * 10.0f);
+                if (sh2 > 0) base += (int)(sh2 * 10.0f);
+                if (d < labelR + 2.0f)   base = 200;      /* label rim */
+                if (base > 255) base = 255;
+                if (d > R - 1.0f) {                        /* AA outer edge */
+                    float f = R + 0.5f - d;
+                    A = (uint8_t)((f < 0 ? 0 : f > 1 ? 1 : f) * 255.0f);
+                }
+                out = ((uint32_t)A << 24) | ((uint32_t)base << 16) |
+                      ((uint32_t)base << 8) | base;
+            }
+            px[y * S + x] = out;
+        }
+
+    if (alb_lp) { SDL_DestroyTexture(alb_lp); alb_lp = NULL; }
+    alb_lp = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
+                               SDL_TEXTUREACCESS_STATIC, S, S);
+    if (alb_lp) {
+        SDL_UpdateTexture(alb_lp, NULL, px, S * 4);
+        SDL_SetTextureBlendMode(alb_lp, SDL_BLENDMODE_BLEND);
+        SDL_SetTextureScaleMode(alb_lp, SDL_ScaleModeLinear);
+    }
+}
+
+void fsr_album_set_cover(SDL_Renderer *renderer,
+                         const uint8_t *bgra, int w, int h)
+{
+    if (alb_cover) { SDL_DestroyTexture(alb_cover); alb_cover = NULL; }
+    alb_have_cover = 0;
+
+    if (bgra && w > 0 && h > 0) {
+        /* SDL_PIXELFORMAT_ARGB8888 is byte order B,G,R,A on little-endian,
+         * which is exactly AV_PIX_FMT_BGRA, so the buffer uploads as-is. */
+        alb_cover = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888,
+                                      SDL_TEXTUREACCESS_STATIC, w, h);
+        if (alb_cover) {
+            SDL_UpdateTexture(alb_cover, NULL, bgra, w * 4);
+            SDL_SetTextureBlendMode(alb_cover, SDL_BLENDMODE_BLEND);
+            SDL_SetTextureScaleMode(alb_cover, SDL_ScaleModeLinear);
+            alb_have_cover = 1;
+        }
+    }
+    alb_build_lp(renderer, bgra, w, h);
+}
+
+void fsr_album_reset(void)
+{
+    if (alb_cover) { SDL_DestroyTexture(alb_cover); alb_cover = NULL; }
+    if (alb_lp)    { SDL_DestroyTexture(alb_lp);    alb_lp    = NULL; }
+    alb_have_cover = 0;
+    /* Keep the blob sprite, phases and rotation angle across files. */
+}
+
+void fsr_album_draw(SDL_Renderer *renderer, int playing)
+{
+    const float twoPi = 6.2831853f;
+    int   ow = 0, oh = 0;
+    uint32_t now;
+    float t, minside;
+
+    SDL_GetRendererOutputSize(renderer, &ow, &oh);
+    if (ow <= 0 || oh <= 0)
+        return;
+
+    alb_build_blob(renderer);
+    if (!alb_lp)                              /* no cover set yet: blank disc */
+        alb_build_lp(renderer, NULL, 0, 0);
+    if (!alb_blob || !alb_lp)
+        return;
+
+    now = SDL_GetTicks();
+    if (!alb_phase_init) {
+        uint32_t s = now ^ 0x9E3779B9u;       /* small LCG for blob phases */
+        for (int i = 0; i < ALB_BLOB_COUNT; i++) {
+            s = s * 1664525u + 1013904223u; alb_phase_x[i] = (s >> 8) / 16777216.0f * twoPi;
+            s = s * 1664525u + 1013904223u; alb_phase_y[i] = (s >> 8) / 16777216.0f * twoPi;
+            s = s * 1664525u + 1013904223u; alb_phase_r[i] = (s >> 8) / 16777216.0f * twoPi;
+            alb_base_hue[i] = fmodf(i * (360.0f / ALB_BLOB_COUNT), 360.0f);
+        }
+        alb_phase_init  = 1;
+        alb_start_ticks = now;
+        alb_last_ticks  = now;
+    }
+
+    /* Spin only while playing (~18 deg/s, matching the reference view). */
+    if (playing)
+        alb_angle = fmodf(alb_angle + (now - alb_last_ticks) * 0.018f, 360.0f);
+    alb_last_ticks = now;
+
+    t       = (now - alb_start_ticks) / 1000.0f;
+    minside = (float)(ow < oh ? ow : oh);
+
+    /* 1. black base + drifting rainbow blobs */
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+    SDL_RenderFillRect(renderer, NULL);
+    for (int i = 0; i < ALB_BLOB_COUNT; i++) {
+        float cx    = ow * (0.5f + 0.45f * sinf(t * twoPi * 0.05f + alb_phase_x[i]));
+        float cy    = oh * (0.5f + 0.45f * cosf(t * twoPi * 0.07f + alb_phase_y[i]));
+        float pulse = 0.5f + 0.5f * sinf(t * twoPi * 0.04f + alb_phase_r[i]);
+        float rad   = minside * (0.55f + 0.55f * pulse);
+        float hue   = fmodf(alb_base_hue[i] + t * 8.0f, 360.0f);
+        uint8_t r, g, b;
+        SDL_Rect dst;
+
+        if (rad < 1.0f) rad = 1.0f;
+        alb_hsv(hue, 0.75f, 1.0f, &r, &g, &b);
+        SDL_SetTextureColorMod(alb_blob, r, g, b);
+        SDL_SetTextureAlphaMod(alb_blob, ALB_BLOB_ALPHA);
+        dst.x = (int)(cx - rad);
+        dst.y = (int)(cy - rad);
+        dst.w = dst.h = (int)(rad * 2.0f);
+        SDL_RenderCopy(renderer, alb_blob, NULL, &dst);
+    }
+
+    /* 2. layout: cover flat on the left, LP spinning out to its right */
+    {
+        float albumSize = minside * 0.55f;
+        float lpSize    = albumSize * 0.90f;
+        float exposed   = lpSize * 0.55f;
+        float totalW    = albumSize + (exposed - (albumSize - lpSize) / 2.0f);
+        float startX    = (ow - totalW) / 2.0f;
+        float startY    = (oh - albumSize) / 2.0f;
+        float wob       = sinf(alb_angle * 0.01745329f) * (albumSize * 0.012f);
+        float lpcx      = startX + albumSize + lpSize * 0.05f;
+        float lpcy      = startY + albumSize / 2.0f + wob;
+        SDL_Rect dst, sh;
+        SDL_Point ctr;
+
+        /* LP drop shadow (blob tinted black, offset down-right) */
+        SDL_SetTextureColorMod(alb_blob, 0, 0, 0);
+        SDL_SetTextureAlphaMod(alb_blob, 120);
+        sh.w = sh.h = (int)(lpSize * 1.06f);
+        sh.x = (int)(lpcx - sh.w / 2.0f + lpSize * 0.03f);
+        sh.y = (int)(lpcy - sh.h / 2.0f + lpSize * 0.04f);
+        SDL_RenderCopy(renderer, alb_blob, NULL, &sh);
+
+        /* the disc, rotating about its centre */
+        dst.w = dst.h = (int)lpSize;
+        dst.x = (int)(lpcx - lpSize / 2.0f);
+        dst.y = (int)(lpcy - lpSize / 2.0f);
+        ctr.x = ctr.y = (int)(lpSize / 2.0f);
+        SDL_RenderCopyEx(renderer, alb_lp, NULL, &dst, alb_angle, &ctr,
+                         SDL_FLIP_NONE);
+
+        /* cover laid flat on the left (soft shadow behind) */
+        if (alb_have_cover && alb_cover) {
+            float ccx = startX + albumSize / 2.0f;
+            float ccy = startY + albumSize / 2.0f;
+
+            SDL_SetTextureColorMod(alb_blob, 0, 0, 0);
+            SDL_SetTextureAlphaMod(alb_blob, 150);
+            sh.w = sh.h = (int)(albumSize * 1.10f);
+            sh.x = (int)(ccx - sh.w / 2.0f + albumSize * 0.03f);
+            sh.y = (int)(ccy - sh.h / 2.0f + albumSize * 0.04f);
+            SDL_RenderCopy(renderer, alb_blob, NULL, &sh);
+
+            dst.x = (int)startX;
+            dst.y = (int)startY;
+            dst.w = dst.h = (int)albumSize;
+            SDL_RenderCopy(renderer, alb_cover, NULL, &dst);
+        }
+    }
+
+    /* leave the blob sprite un-modulated for any later reuse */
+    SDL_SetTextureColorMod(alb_blob, 255, 255, 255);
+    SDL_SetTextureAlphaMod(alb_blob, 255);
+}
+
 void fsr_uninit(void)
 {
 #if CONFIG_D3D11VA
@@ -2729,6 +3019,9 @@ void fsr_uninit(void)
     fg_destroy();
     hwgl_destroy();
 #endif
+    if (alb_blob)   { SDL_DestroyTexture(alb_blob);   alb_blob   = NULL; }
+    if (alb_lp)     { SDL_DestroyTexture(alb_lp);     alb_lp     = NULL; }
+    if (alb_cover)  { SDL_DestroyTexture(alb_cover);  alb_cover  = NULL; }
     if (toast_tex)  { SDL_DestroyTexture(toast_tex);  toast_tex  = NULL; }
     if (hud_tex)    { SDL_DestroyTexture(hud_tex);    hud_tex    = NULL; }
     if (hud_left_tex) { SDL_DestroyTexture(hud_left_tex); hud_left_tex = NULL; }

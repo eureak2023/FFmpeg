@@ -116,6 +116,19 @@ int  fsr_hud_draw(SDL_Renderer *renderer);
 void fsr_hud_left_set(SDL_Renderer *renderer, const char *text);
 int  fsr_hud_left_draw(SDL_Renderer *renderer);
 
+/* Album-art "now playing" visualizer for audio-only playback (a port of
+ * WinVibe's LPPlayerView): an animated rainbow-blob background with the cover
+ * art laid flat and a vinyl LP spinning out from behind it. Drawn with the
+ * plain SDL_Renderer, so it works on any backend.
+ *
+ * fsr_album_set_cover() feeds the cover pixels once (BGRA byte order, i.e.
+ * AV_PIX_FMT_BGRA); with no cover a blank record still spins. fsr_album_draw()
+ * renders one frame (playing = advance the spin, 0 = frozen while paused).
+ * fsr_album_reset() drops the current cover/disc when a new file loads. */
+void fsr_album_set_cover(SDL_Renderer *renderer, const uint8_t *bgra, int w, int h);
+void fsr_album_draw(SDL_Renderer *renderer, int playing);
+void fsr_album_reset(void);
+
 /* 8x8 bitmap for a pixel-font character (uppercase letters, digits,
  * ':', '/', '.'), or NULL for characters rendered as blanks. */
 const uint8_t *fsr_glyph(char c);
