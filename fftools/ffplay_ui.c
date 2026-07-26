@@ -702,27 +702,42 @@ int ui_context_menu(int fsr_on, int nr_on, int fg_on, int lada_on, int jasna_on,
 }
 
 #ifdef _WIN32
-/* Explorer-style open-dialog hook: when the dialog finishes initialising,
- * force it to the top and give it the foreground. Without this, a borderless
- * fullscreen (topmost) player window can end up drawn over the dialog. */
-static UINT_PTR CALLBACK ui_ofn_hook(HWND hdlg, UINT msg, WPARAM wParam,
-                                     LPARAM lParam)
+/* The open dialog, when its owner is a fullscreen (topmost) player window, can
+ * be created behind it. gofn() blocks the calling thread, so a short-lived
+ * helper thread waits for the modal dialog to appear (the owner's enabled
+ * popup) and lifts it to the top of the topmost band — keeping the player
+ * fullscreen while the dialog shows in front. */
+struct ui_raise_ctx { HWND owner; volatile LONG stop; };
+
+static DWORD WINAPI ui_raise_dialog(LPVOID p)
 {
-    (void)wParam;
-    if (msg == WM_NOTIFY) {
-        LPOFNOTIFYW n = (LPOFNOTIFYW)lParam;
+    struct ui_raise_ctx *c = (struct ui_raise_ctx *)p;
+    int i, forced = 0;
 
-        if (n && n->hdr.code == CDN_INITDONE) {
-            HWND top = GetParent(hdlg);     /* the real dialog window */
+    for (i = 0; i < 120 && !c->stop; i++) {
+        HWND dlg = GetWindow(c->owner, GW_ENABLEDPOPUP);
 
-            if (top) {
-                /* HWND_TOPMOST so it clears a fullscreen player window that is
-                 * itself topmost (HWND_TOP would only reach the normal band). */
-                SetWindowPos(top, HWND_TOPMOST, 0, 0, 0, 0,
-                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-                SetForegroundWindow(top);
+        if (dlg && dlg != c->owner) {
+            /* Keep the dialog at the top of the topmost band (SetWindowPos is
+             * not thread-restricted), above the fullscreen owner. */
+            SetWindowPos(dlg, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            if (!forced) {
+                /* Force the foreground once via AttachThreadInput, which
+                 * bypasses the foreground lock that otherwise leaves the
+                 * dialog behind a fullscreen player launched from the button
+                 * (the right-click menu happens to clear this lock itself). */
+                DWORD tgt = GetWindowThreadProcessId(dlg, NULL);
+                DWORD me  = GetCurrentThreadId();
+
+                AttachThreadInput(me, tgt, TRUE);
+                BringWindowToTop(dlg);
+                SetForegroundWindow(dlg);
+                AttachThreadInput(me, tgt, FALSE);
+                forced = 1;
             }
         }
+        Sleep(20);
     }
     return 0;
 }
@@ -744,7 +759,8 @@ char *ui_open_file_dialog(void)
     char utf8[MAX_PATH * 3];
     SDL_SysWMinfo wm;
     HWND owner = NULL;
-    int  was_topmost = 0;
+    HANDLE raise_th = NULL;
+    struct ui_raise_ctx rc = { NULL, 0 };
     BOOL ok;
 
     if (!dlg)
@@ -760,29 +776,23 @@ char *ui_open_file_dialog(void)
     ofn.lpstrFile   = path;
     ofn.nMaxFile    = MAX_PATH;
     ofn.lpstrFilter = filter;
-    /* OFN_EXPLORER|OFN_ENABLEHOOK so ui_ofn_hook can raise the dialog above a
-     * fullscreen (topmost) player window. */
-    ofn.Flags       = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY |
-                      OFN_EXPLORER | OFN_ENABLEHOOK;
-    ofn.lpfnHook    = ui_ofn_hook;
+    ofn.Flags       = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
 
-    /* A fullscreen player window is WS_EX_TOPMOST; the dialog, opened straight
-     * from the control-bar button, then lands behind it. (The right-click menu
-     * happens to normalise the window first, which is why that path already
-     * works.) Drop topmost + take foreground for the duration of the dialog. */
+    /* Keep the player fullscreen, but lift the dialog above it: a helper thread
+     * finds the modal dialog once it appears and makes it topmost. */
     if (owner) {
-        was_topmost = (GetWindowLongPtrW(owner, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
-        if (was_topmost)
-            SetWindowPos(owner, HWND_NOTOPMOST, 0, 0, 0, 0,
-                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         SetForegroundWindow(owner);
+        rc.owner = owner;
+        raise_th = CreateThread(NULL, 0, ui_raise_dialog, &rc, 0, NULL);
     }
 
     ok = gofn(&ofn);
 
-    if (owner && was_topmost)          /* restore the player's topmost state */
-        SetWindowPos(owner, HWND_TOPMOST, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    if (raise_th) {                    /* stop and join the helper thread */
+        rc.stop = 1;
+        WaitForSingleObject(raise_th, 1000);
+        CloseHandle(raise_th);
+    }
     if (!ok)
         return NULL;
     if (!WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, sizeof(utf8),
