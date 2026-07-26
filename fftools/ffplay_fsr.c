@@ -2911,7 +2911,8 @@ static void alb_build_lp(SDL_Renderer *renderer,
                 float ring   = 0.5f + 0.5f * cosf(d * 0.14f + warp);
                 float groove = ring * ring;
                 groove *= groove;                              /* pow(ring, 4)  */
-                groove *= groove;                              /* pow(ring, 8): thin lines */
+                groove *= groove;                              /* pow(ring, 8)  */
+                groove *= groove;                              /* pow(ring, 16): very thin lines */
 
                 float gate = sinf(d * 0.070f + 1.7f * sinf(d * 0.017f));
                 if (gate > 0.82f)                              /* smooth track gap */
@@ -3171,6 +3172,30 @@ void fsr_album_draw(SDL_Renderer *renderer, int playing)
         float lpcy      = startY + albumSize / 2.0f + wob;
         SDL_Rect dst, sh;
         SDL_Point ctr;
+
+        /* Ground contact shadow: soft, flat ellipses under the whole assembly
+         * so the cover + record read as standing on a surface. Drawn first,
+         * their upper half is covered by the art -> a grounded shadow, not a
+         * floating blob. Two passes (a wide soft base plus a darker, tighter
+         * core) make it read clearly against the coloured background. */
+        {
+            float gcx = startX + totalW / 2.0f;
+            float gcy = startY + albumSize;        /* cover's bottom edge */
+            /* pass 0: wide soft base, pass 1: dark tight core */
+            const float gw[2] = { totalW * 1.06f, totalW * 0.72f };
+            const float gh[2] = { albumSize * 0.19f, albumSize * 0.12f };
+            const int   ga[2] = { 130, 165 };
+
+            SDL_SetTextureColorMod(alb_blob, 0, 0, 0);
+            for (int s = 0; s < 2; s++) {
+                SDL_SetTextureAlphaMod(alb_blob, ga[s]);
+                sh.w = (int)gw[s];
+                sh.h = (int)gh[s];
+                sh.x = (int)(gcx - gw[s] / 2.0f);
+                sh.y = (int)(gcy - gh[s] / 2.0f);
+                SDL_RenderCopy(renderer, alb_blob, NULL, &sh);
+            }
+        }
 
         /* LP drop shadow (blob tinted black, offset down-right) */
         SDL_SetTextureColorMod(alb_blob, 0, 0, 0);
