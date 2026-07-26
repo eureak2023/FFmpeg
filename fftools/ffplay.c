@@ -5088,30 +5088,6 @@ static void event_loop(VideoState *cur_stream)
                     status_hud_update(-1);   /* reflect the switch right away */
                 cur_stream->force_refresh = 1;
                 break;
-            /* Live frame-generation tuning: [ ] pick a knob, , . change it,
-             * \ restores every default. Values apply to the next generated
-             * frame, so the effect is visible immediately on the scene being
-             * watched. */
-            case SDLK_LEFTBRACKET:
-            case SDLK_RIGHTBRACKET:
-            case SDLK_COMMA:
-            case SDLK_PERIOD:
-            case SDLK_BACKSLASH: {
-                const char *msg;
-                int sym = event.key.keysym.sym;
-
-                if (sym == SDLK_LEFTBRACKET || sym == SDLK_RIGHTBRACKET)
-                    msg = fsr_fg_tune_select(sym == SDLK_RIGHTBRACKET ? 1 : -1);
-                else if (sym == SDLK_COMMA || sym == SDLK_PERIOD)
-                    msg = fsr_fg_tune_adjust(sym == SDLK_PERIOD ? 1 : -1);
-                else
-                    msg = fsr_fg_tune_reset();
-                av_log(NULL, AV_LOG_INFO, "FG tune: %s\n", msg);
-                if (renderer)
-                    fsr_toast_show(renderer, msg);
-                cur_stream->force_refresh = 1;
-                break;
-            }
             case SDLK_d:
                 fsr_denoise = !fsr_denoise;
                 fsr_set_denoise(renderer, fsr_denoise);
