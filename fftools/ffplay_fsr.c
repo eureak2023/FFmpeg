@@ -1676,21 +1676,11 @@ static const char *fg_src =
     "uniform isampler2D flowBwd;\n" /* cur->prev */
     "uniform float phase;\n"        /* interpolation position, 0=prev 1=cur */
     "uniform vec2 outSize;\n"       /* render size; may differ from native */
-    /* Runtime-tunable quality knobs (fsr_fg_tune_*). Their defaults reproduce
-     * the original hard-coded behaviour exactly, so tuning always starts from
-     * the known-good baseline and each knob moves away from it. */
-    "uniform float tolBase;\n"      /* fallback tolerance floor, px */
-    "uniform float tolSlope;\n"     /* how far tolerance grows with motion */
-    "uniform float discSup;\n"      /* 0 = off; distrust of motion boundaries */
-    "uniform float fbSmooth;\n"     /* 0 = hard prev/cur switch, 1 = crossfade */
     "out vec4 fragColor;\n"
     HDR_TM_GLSL
     /* Bilinearly sample the 4x4-grid flow field (integer texture, so the
-     * filtering is done by hand); smooths out block-shaped artifacts.
-     * "disc" reports how much the flow varies inside the sampled cell: near
-     * zero over smooth motion, large on a moving subject's silhouette where
-     * the interpolated vector is a blend of two unrelated motions. */
-    "vec2 sampleFlow(isampler2D t, vec2 pg, out float disc) {\n"
+     * filtering is done by hand); smooths out block-shaped artifacts. */
+    "vec2 sampleFlow(isampler2D t, vec2 pg) {\n"
     "    vec2 fs = vec2(textureSize(t, 0));\n"
     "    vec2 g  = clamp(pg - 0.5, vec2(0.0), fs - 1.0);\n"
     "    ivec2 g0 = ivec2(floor(g));\n"
@@ -1700,17 +1690,14 @@ static const char *fg_src =
     "    vec2 b = vec2(texelFetch(t, ivec2(g1.x, g0.y), 0).xy);\n"
     "    vec2 c = vec2(texelFetch(t, ivec2(g0.x, g1.y), 0).xy);\n"
     "    vec2 d = vec2(texelFetch(t, g1, 0).xy);\n"
-    "    disc = length(max(max(a, b), max(c, d))\n"
-    "                - min(min(a, b), min(c, d))) / 32.0;\n"
     "    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y) / 32.0;\n"
     "}\n"
     "void main() {\n"
     "    vec2 ts = vec2(textureSize(curTex, 0));\n"
     "    vec2 uv = gl_FragCoord.xy / outSize;\n"
     "    vec2 pg = uv * ts / 4.0;\n"
-    "    float dF, dB;\n"
-    "    vec2 F = sampleFlow(flowFwd, pg, dF);\n"
-    "    vec2 B = sampleFlow(flowBwd, pg, dB);\n"
+    "    vec2 F = sampleFlow(flowFwd, pg);\n"
+    "    vec2 B = sampleFlow(flowBwd, pg);\n"
     "    vec3 cPrev = texture(prevTex, uv - phase * F / ts).rgb;\n"
     "    vec3 cCur  = texture(curTex,  uv - (1.0 - phase) * B / ts).rgb;\n"
     /* Confidence from forward/backward consistency, relative to the motion
@@ -1720,81 +1707,14 @@ static const char *fg_src =
     "    float mag = length(F) + length(B);\n"
     /* tolerance grows with motion but is capped: unlimited slack let large
      * shaky motion pass garbage through (image tearing) */
-    "    float w = clamp(1.0 - err / (tolBase + tolSlope * min(mag, 32.0)),\n"
-    "                    0.0, 1.0);\n"
-    /* Optional extra distrust of motion boundaries (discSup = 0 disables it,
-     * which is the original behaviour). */
-    "    w *= 1.0 - discSup * smoothstep(3.0, 14.0, max(dF, dB));\n"
-    /* Fallback frame: a hard switch at the midpoint (fbSmooth = 0, original)
-     * through to a straight crossfade (fbSmooth = 1). The hard switch makes
-     * consecutive generated frames jump between two different real frames,
-     * which reads as tearing wherever the fallback covers much area. */
-    "    float fbMix = mix(step(0.5, phase), phase, fbSmooth);\n"
-    "    vec3 fallback = mix(texture(prevTex, uv).rgb,\n"
-    "                        texture(curTex, uv).rgb, fbMix);\n"
+    "    float w = clamp(1.0 - err / (3.0 + 0.25 * min(mag, 32.0)), 0.0, 1.0);\n"
+    "    vec3 fallback = phase < 0.5 ? texture(prevTex, uv).rgb\n"
+    "                                : texture(curTex, uv).rgb;\n"
     "    vec3 mid = mix(fallback, mix(cPrev, cCur, phase), w);\n"
     "    if (hdrMode > 0.5)\n"
     "        mid = hdr_tonemap(mid);\n"
     "    fragColor = vec4(mid, 1.0);\n"
     "}\n";
-
-/* ---- runtime-tunable FG quality parameters ------------------------------
- * Adjusted live from the player (see fsr_fg_tune_* below) so the right
- * settings can be found on the actual problem scene instead of guessed.
- * The defaults below are exactly the values the shader used to hard-code. */
-static struct {
-    const char *name;
-    float val, def, min, max, step;
-} fg_tune[] = {
-    { "TOL BASE",  3.00f, 3.00f, 0.50f, 12.00f, 0.50f },
-    { "TOL SLOPE", 0.25f, 0.25f, 0.00f,  1.00f, 0.05f },
-    { "EDGE SUPP", 0.00f, 0.00f, 0.00f,  1.00f, 0.10f },
-    { "FB SMOOTH", 0.00f, 0.00f, 0.00f,  1.00f, 0.25f },
-};
-#define FG_TUNE_N ((int)(sizeof(fg_tune) / sizeof(fg_tune[0])))
-static int fg_tune_sel;
-
-/* Text for the toast/log, e.g. "TOL BASE 3.0" (the pixel font is uppercase
- * letters, digits and '.', so this renders as-is). */
-static const char *fg_tune_text(void)
-{
-    static char buf[48];
-
-    snprintf(buf, sizeof(buf), "%s %.*f", fg_tune[fg_tune_sel].name,
-             fg_tune[fg_tune_sel].step >= 0.5f ? 1 : 2,
-             fg_tune[fg_tune_sel].val);
-    return buf;
-}
-
-const char *fsr_fg_tune_select(int dir)
-{
-    fg_tune_sel = (fg_tune_sel + (dir >= 0 ? 1 : FG_TUNE_N - 1)) % FG_TUNE_N;
-    return fg_tune_text();
-}
-
-const char *fsr_fg_tune_adjust(int dir)
-{
-    float *v = &fg_tune[fg_tune_sel].val;
-
-    *v += (dir >= 0 ? 1.0f : -1.0f) * fg_tune[fg_tune_sel].step;
-    if (*v < fg_tune[fg_tune_sel].min) *v = fg_tune[fg_tune_sel].min;
-    if (*v > fg_tune[fg_tune_sel].max) *v = fg_tune[fg_tune_sel].max;
-    return fg_tune_text();
-}
-
-const char *fsr_fg_tune_reset(void)
-{
-    for (int i = 0; i < FG_TUNE_N; i++)
-        fg_tune[i].val = fg_tune[i].def;
-    return "FG TUNE RESET";
-}
-
-void fsr_fg_tune_log(void)
-{
-    for (int i = 0; i < FG_TUNE_N; i++)
-        av_log(NULL, AV_LOG_INFO, "FG tune: %-10s %.2f (default %.2f)\n",
-               fg_tune[i].name, fg_tune[i].val, fg_tune[i].def);
-}
 
 static struct {
     int state;                    /* 0 = untried, 1 = ready, -1 = unavailable */
@@ -1819,7 +1739,6 @@ static struct {
     GLint phase_loc;
     GLint outsize_loc;
     GLint hdr_loc, peak_loc;
-    GLint tune_loc[FG_TUNE_N];
     const void *in_frame[2];              /* what each OF input buffer holds */
     int64_t in_pts[2];
     const void *pair_a, *pair_b;          /* frames the current flow refers to */
@@ -2122,14 +2041,6 @@ static int fg_init_body(void)
         fg.outsize_loc = gl.GetUniformLocation(fg.prog, "outSize");
         fg.hdr_loc     = gl.GetUniformLocation(fg.prog, "hdrMode");
         fg.peak_loc    = gl.GetUniformLocation(fg.prog, "hdrPeak");
-        {
-            static const char *const tnames[FG_TUNE_N] = {
-                "tolBase", "tolSlope", "discSup", "fbSmooth"
-            };
-
-            for (int i = 0; i < FG_TUNE_N; i++)
-                fg.tune_loc[i] = gl.GetUniformLocation(fg.prog, tnames[i]);
-        }
     }
     return 0;
 }
@@ -2302,9 +2213,6 @@ static int fg_warp(SDL_Renderer *renderer, int sp, int sn, float phase,
     gl.Uniform2f(fg.outsize_loc, (GLfloat)ow, (GLfloat)oh);
     gl.Uniform1f(fg.hdr_loc, tonemap && hdr_active ? 1.0f : 0.0f);
     gl.Uniform1f(fg.peak_loc, hdr_peak);
-    for (int i = 0; i < FG_TUNE_N; i++)
-        if (fg.tune_loc[i] >= 0)
-            gl.Uniform1f(fg.tune_loc[i], fg_tune[i].val);
     gl.DrawArrays(GL_TRIANGLES, 0, 3);
     gl.UseProgram(prev_prog);
     for (int i = 3; i >= 0; i--) {
@@ -2696,10 +2604,6 @@ int fsr_fg_draw(SDL_Renderer *renderer, struct AVFrame *prev, struct AVFrame *ne
     return 0;
 }
 
-const char *fsr_fg_tune_select(int dir) { (void)dir; return "FG N/A"; }
-const char *fsr_fg_tune_adjust(int dir) { (void)dir; return "FG N/A"; }
-const char *fsr_fg_tune_reset(void)     { return "FG N/A"; }
-void        fsr_fg_tune_log(void)       { }
 void        fsr_rife_set(int on)        { (void)on; }
 int         fsr_rife_active(int w, int h) { (void)w; (void)h; return 0; }
 int         fsr_rife_boot(void)         { return -1; }
