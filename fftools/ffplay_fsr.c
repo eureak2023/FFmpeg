@@ -1668,6 +1668,21 @@ fail_permanent:
 typedef NV_OF_STATUS (NVOFAPI *PFN_NvOFAPICreateInstanceCuda)(uint32_t apiVer,
         NV_OF_CUDA_API_FUNCTION_LIST *functionList);
 
+/* Output grid of the hardware optical flow: one motion vector per FG_GRID
+ * pixels. A coarser grid means a cell straddling a moving subject's edge
+ * mixes the subject's motion with the background's, which is what makes the
+ * silhouette shimmer, so this is the main quality lever on the warp path.
+ * Measured per frame pair on an RTX 5080 (forward + backward, real frames),
+ * against the 41.7 ms a 23.976 fps interval allows:
+ *     1080p  4x4 3.2 ms   2x2 8.3 ms   1x1 17.4 ms
+ *     4K     4x4 6.0 ms   2x2 18.8 ms  1x1 63.8 ms  <- 1x1 cannot hold 4K
+ * 2x2 buys 4x the flow resolution and still fits at both sizes. Note the
+ * flow is computed once per *pair*, not per generated frame, so this cost
+ * does not scale with the FG multiplier (unlike RIFE).
+ * FG_GRID_STR must match FG_GRID - the shader divides by it. */
+#define FG_GRID     2
+#define FG_GRID_STR "2.0"
+
 static const char *fg_src =
     "#version 330\n"
     "uniform sampler2D prevTex;\n"
@@ -1695,7 +1710,7 @@ static const char *fg_src =
     "void main() {\n"
     "    vec2 ts = vec2(textureSize(curTex, 0));\n"
     "    vec2 uv = gl_FragCoord.xy / outSize;\n"
-    "    vec2 pg = uv * ts / 4.0;\n"
+    "    vec2 pg = uv * ts / " FG_GRID_STR ";\n"
     "    vec2 F = sampleFlow(flowFwd, pg);\n"
     "    vec2 B = sampleFlow(flowBwd, pg);\n"
     "    vec3 cPrev = texture(prevTex, uv - phase * F / ts).rgb;\n"
@@ -1936,7 +1951,7 @@ static int fg_init_body(void)
 
     ip.width       = fg.w;
     ip.height      = fg.h;
-    ip.outGridSize = NV_OF_OUTPUT_VECTOR_GRID_SIZE_4;
+    ip.outGridSize = (NV_OF_OUTPUT_VECTOR_GRID_SIZE)FG_GRID;
     ip.mode        = NV_OF_MODE_OPTICALFLOW;
     /* Best flow quality up to 1080p; above that the SLOW preset costs too
      * much of the frame budget to sustain 60 presented fps. */
@@ -2054,8 +2069,8 @@ static int fg_init(void)
 
     fg.w  = hwgl.w;
     fg.h  = hwgl.h;
-    fg.gw = (fg.w + 3) / 4;
-    fg.gh = (fg.h + 3) / 4;
+    fg.gw = (fg.w + FG_GRID - 1) / FG_GRID;
+    fg.gh = (fg.h + FG_GRID - 1) / FG_GRID;
 
     fg_push_ctx();
     ret = fg_init_body();
