@@ -3163,9 +3163,9 @@ void fsr_album_draw(SDL_Renderer *renderer, int playing)
         exposed = lpSize * 0.55f;
         totalW  = albumSize + (exposed - (albumSize - lpSize) / 2.0f);
         startX  = (ow - totalW) / 2.0f;
-        /* Bias below centre (0.68 of the slack, vs 0.5) so the cover + record
-         * sit a little lower in the room above the visualizer band. */
-        startY  = (avail - albumSize) * 0.68f;
+        /* Bias below centre (0.80 of the slack, vs 0.5) so the cover + record
+         * sit lower in the room above the visualizer band. */
+        startY  = (avail - albumSize) * 0.80f;
         float wob       = sinf(alb_angle * 0.01745329f) * (albumSize * 0.012f);
         float lpcx      = startX + albumSize + lpSize * 0.05f;
         float lpcy      = startY + albumSize / 2.0f + wob;
@@ -3429,6 +3429,151 @@ void fsr_vis_draw(SDL_Renderer *renderer, const float *mono, int nsamp,
 
     SDL_SetRenderDrawBlendMode(renderer, prev_bm);
 }
+
+/* ------------------------------------------------------------------------
+ * Single-instance support (Windows)
+ *
+ * A named mutex marks the first ("primary") player. Later launches — e.g.
+ * double-clicking a media file associated with ffplay — detect the mutex,
+ * hand their file path to the primary over WM_COPYDATA and exit, so the file
+ * opens in the already-running player instead of a second window. The primary
+ * hosts a hidden message-only window (found by class name) whose WndProc
+ * receives the paths; SDL's message pump on the main thread dispatches the
+ * WM_COPYDATA to it.
+ * --------------------------------------------------------------------- */
+
+#ifdef _WIN32
+#define SI_MUTEX_NAME "ffplay_single_instance_v1"
+#define SI_WNDCLASS   "ffplay_single_instance_msgwin_v1"
+#define SI_MAGIC      0x4646504Cu   /* 'FFPL' — WM_COPYDATA dwData tag */
+
+static HANDLE     si_mutex;
+static SDL_mutex *si_lock;          /* guards si_pending */
+static char      *si_pending;       /* received path, taken by the main loop */
+static Uint32     si_wake_event;    /* pushed to wake the event loop (0 = none) */
+
+static HWND si_msgwin;              /* primary's hidden message-only window */
+
+/* Window proc for the primary's message-only window. A secondary instance
+ * SendMessage()s WM_COPYDATA here with the file path; the buffer is valid for
+ * the duration of the call, so copy it out and wake the event loop. This runs
+ * synchronously when SDL pumps the main thread's queue. */
+static LRESULT CALLBACK si_wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (msg == WM_COPYDATA) {
+        const COPYDATASTRUCT *cds = (const COPYDATASTRUCT *)lp;
+
+        if (cds && cds->dwData == SI_MAGIC && cds->lpData && cds->cbData) {
+            char *p = av_malloc(cds->cbData + 1);
+
+            if (p) {
+                memcpy(p, cds->lpData, cds->cbData);
+                p[cds->cbData] = '\0';
+                if (si_lock)
+                    SDL_LockMutex(si_lock);
+                av_free(si_pending);
+                si_pending = p;
+                if (si_lock)
+                    SDL_UnlockMutex(si_lock);
+                /* wake refresh_loop_wait_event (it only returns on an SDL
+                 * event, so an idle player would otherwise not notice). */
+                if (si_wake_event) {
+                    SDL_Event ev;
+                    SDL_memset(&ev, 0, sizeof(ev));
+                    ev.type = si_wake_event;
+                    SDL_PushEvent(&ev);
+                }
+            }
+            return TRUE;
+        }
+    }
+    return DefWindowProcA(h, msg, wp, lp);
+}
+
+int fsr_single_instance_begin(void)
+{
+    si_mutex = CreateMutexA(NULL, FALSE, SI_MUTEX_NAME);
+    if (si_mutex && GetLastError() == ERROR_ALREADY_EXISTS)
+        return 0;                   /* another instance already owns it */
+    return 1;                       /* primary (or mutex failed -> act primary) */
+}
+
+int fsr_single_instance_forward(const char *path)
+{
+    HWND target;
+    COPYDATASTRUCT cds;
+    DWORD_PTR res = 0;
+
+    if (!path || !path[0])
+        return -1;
+    /* the primary's receiver is a message-only window, found by class name */
+    target = FindWindowExA(HWND_MESSAGE, NULL, SI_WNDCLASS, NULL);
+    if (!target)
+        return -1;                  /* primary not up yet */
+
+    cds.dwData = SI_MAGIC;
+    cds.cbData = (DWORD)strlen(path);
+    cds.lpData = (void *)path;
+    /* SMTO_NORMAL: wait until the primary next pumps its queue and copies the
+     * path (it spends most time in a waitable-timer sleep, so SMTO_ABORTIFHUNG
+     * would wrongly treat it as unresponsive). Bounded so we never hang. */
+    if (!SendMessageTimeoutA(target, WM_COPYDATA, 0, (LPARAM)&cds,
+                             SMTO_NORMAL, 5000, &res))
+        return -1;
+
+    /* bring the existing player's visible window forward */
+    {
+        HWND vis = FindWindowExA(NULL, NULL, "SDL_app", NULL);
+        if (vis) { ShowWindow(vis, SW_RESTORE); SetForegroundWindow(vis); }
+    }
+    return 0;
+}
+
+void fsr_single_instance_setup(SDL_Window *window)
+{
+    WNDCLASSA wc;
+
+    (void)window;
+    if (!si_lock)
+        si_lock = SDL_CreateMutex();
+    if (!si_wake_event) {
+        si_wake_event = SDL_RegisterEvents(1);
+        if (si_wake_event == (Uint32)-1)
+            si_wake_event = 0;      /* registration failed; poll-only */
+        else
+            /* The registered type lands in the SDL_USEREVENT range, which main()
+             * sets to SDL_IGNORE; re-enable ours so the wake push is delivered. */
+            SDL_EventState(si_wake_event, SDL_ENABLE);
+    }
+    if (!si_msgwin) {
+        SDL_memset(&wc, 0, sizeof(wc));
+        wc.lpfnWndProc   = si_wndproc;
+        wc.hInstance     = GetModuleHandleA(NULL);
+        wc.lpszClassName = SI_WNDCLASS;
+        RegisterClassA(&wc);        /* harmless if already registered */
+        si_msgwin = CreateWindowExA(0, SI_WNDCLASS, SI_WNDCLASS, 0, 0, 0, 0, 0,
+                                    HWND_MESSAGE, NULL, wc.hInstance, NULL);
+    }
+}
+
+char *fsr_single_instance_take_path(void)
+{
+    char *p = NULL;
+
+    if (!si_lock)
+        return NULL;
+    SDL_LockMutex(si_lock);
+    p = si_pending;
+    si_pending = NULL;
+    SDL_UnlockMutex(si_lock);
+    return p;
+}
+#else  /* !_WIN32 */
+int   fsr_single_instance_begin(void)             { return 1; }
+int   fsr_single_instance_forward(const char *p)  { (void)p; return -1; }
+void  fsr_single_instance_setup(SDL_Window *w)    { (void)w; }
+char *fsr_single_instance_take_path(void)         { return NULL; }
+#endif
 
 void fsr_uninit(void)
 {

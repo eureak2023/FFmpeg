@@ -146,6 +146,19 @@ void fsr_vis_reset(void);
  * ':', '/', '.'), or NULL for characters rendered as blanks. */
 const uint8_t *fsr_glyph(char c);
 
+/* Single-instance support (Windows). fsr_single_instance_begin() creates the
+ * named mutex and returns 1 for the first (primary) instance, 0 if another is
+ * already running. A secondary instance hands its file to the primary with
+ * fsr_single_instance_forward(path) (WM_COPYDATA) and then exits. The primary
+ * calls fsr_single_instance_setup(window) once its window exists (tags the
+ * window and installs the message hook), and polls fsr_single_instance_take_
+ * path() from the event loop for an incoming path (av_malloc'd, caller frees),
+ * or NULL. Non-Windows builds are single-instance no-ops. */
+int   fsr_single_instance_begin(void);
+int   fsr_single_instance_forward(const char *path);
+void  fsr_single_instance_setup(SDL_Window *window);
+char *fsr_single_instance_take_path(void);
+
 /* Destroy GL programs and intermediate textures. Call before the renderer
  * is destroyed. */
 void fsr_uninit(void);
