@@ -4288,7 +4288,12 @@ static int read_thread(void *arg)
         }
         if (!is->paused &&
             (!is->audio_st || (is->auddec.finished == is->audioq.serial && frame_queue_nb_remaining(&is->sampq) == 0)) &&
-            (!is->video_st || (is->viddec.finished == is->videoq.serial && frame_queue_nb_remaining(&is->pictq) == 0))) {
+            /* A cover-art "video" is a single still that the album view peeks
+             * but never advances out of pictq, so its queue never drains to 0.
+             * Treat it like no video for end-of-file detection, or attached-
+             * picture music would never reach the loop/autoexit branch below. */
+            (!is->video_st || (is->video_st->disposition & AV_DISPOSITION_ATTACHED_PIC) ||
+             (is->viddec.finished == is->videoq.serial && frame_queue_nb_remaining(&is->pictq) == 0))) {
             if (autoexit) {
                 /* -autoexit wins over the default repeat, so scripts and
                  * -t/-autoexit runs still terminate at EOF. */
