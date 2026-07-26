@@ -61,6 +61,8 @@
 #include "libavutil/avstring.h"
 
 #include "ffplay_fsr.h"
+#include "ffplay_rife.h"
+#include "ffplay_ui.h"      /* ui_render_text: system font for the HUD */
 
 /* Ask Windows for 1 ms timer resolution: av_usleep() otherwise rounds up to
  * the default 15.6 ms tick, which ruins frame-generation slot pacing (and
@@ -293,6 +295,7 @@ static struct {
     void      (APIENTRY *DeleteTextures)(GLsizei, const GLuint *);
     void      (APIENTRY *Finish)(void);
     void      (APIENTRY *ReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *);
+    void      (APIENTRY *GetTexImage)(GLenum, GLint, GLenum, GLenum, void *);
     void      (APIENTRY *TexImage2D)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *);
 } gl;
 
@@ -584,6 +587,7 @@ static int load_gl_functions(void)
     LOAD(DeleteTextures);
     LOAD(Finish);
     LOAD(ReadPixels);
+    LOAD(GetTexImage);
     LOAD(TexImage2D);
 #undef LOAD
     return 0;
@@ -1640,11 +1644,21 @@ static const char *fg_src =
     "uniform isampler2D flowBwd;\n" /* cur->prev */
     "uniform float phase;\n"        /* interpolation position, 0=prev 1=cur */
     "uniform vec2 outSize;\n"       /* render size; may differ from native */
+    /* Runtime-tunable quality knobs (fsr_fg_tune_*). Their defaults reproduce
+     * the original hard-coded behaviour exactly, so tuning always starts from
+     * the known-good baseline and each knob moves away from it. */
+    "uniform float tolBase;\n"      /* fallback tolerance floor, px */
+    "uniform float tolSlope;\n"     /* how far tolerance grows with motion */
+    "uniform float discSup;\n"      /* 0 = off; distrust of motion boundaries */
+    "uniform float fbSmooth;\n"     /* 0 = hard prev/cur switch, 1 = crossfade */
     "out vec4 fragColor;\n"
     HDR_TM_GLSL
     /* Bilinearly sample the 4x4-grid flow field (integer texture, so the
-     * filtering is done by hand); smooths out block-shaped artifacts. */
-    "vec2 sampleFlow(isampler2D t, vec2 pg) {\n"
+     * filtering is done by hand); smooths out block-shaped artifacts.
+     * "disc" reports how much the flow varies inside the sampled cell: near
+     * zero over smooth motion, large on a moving subject's silhouette where
+     * the interpolated vector is a blend of two unrelated motions. */
+    "vec2 sampleFlow(isampler2D t, vec2 pg, out float disc) {\n"
     "    vec2 fs = vec2(textureSize(t, 0));\n"
     "    vec2 g  = clamp(pg - 0.5, vec2(0.0), fs - 1.0);\n"
     "    ivec2 g0 = ivec2(floor(g));\n"
@@ -1654,14 +1668,17 @@ static const char *fg_src =
     "    vec2 b = vec2(texelFetch(t, ivec2(g1.x, g0.y), 0).xy);\n"
     "    vec2 c = vec2(texelFetch(t, ivec2(g0.x, g1.y), 0).xy);\n"
     "    vec2 d = vec2(texelFetch(t, g1, 0).xy);\n"
+    "    disc = length(max(max(a, b), max(c, d))\n"
+    "                - min(min(a, b), min(c, d))) / 32.0;\n"
     "    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y) / 32.0;\n"
     "}\n"
     "void main() {\n"
     "    vec2 ts = vec2(textureSize(curTex, 0));\n"
     "    vec2 uv = gl_FragCoord.xy / outSize;\n"
     "    vec2 pg = uv * ts / 4.0;\n"
-    "    vec2 F = sampleFlow(flowFwd, pg);\n"
-    "    vec2 B = sampleFlow(flowBwd, pg);\n"
+    "    float dF, dB;\n"
+    "    vec2 F = sampleFlow(flowFwd, pg, dF);\n"
+    "    vec2 B = sampleFlow(flowBwd, pg, dB);\n"
     "    vec3 cPrev = texture(prevTex, uv - phase * F / ts).rgb;\n"
     "    vec3 cCur  = texture(curTex,  uv - (1.0 - phase) * B / ts).rgb;\n"
     /* Confidence from forward/backward consistency, relative to the motion
@@ -1671,14 +1688,81 @@ static const char *fg_src =
     "    float mag = length(F) + length(B);\n"
     /* tolerance grows with motion but is capped: unlimited slack let large
      * shaky motion pass garbage through (image tearing) */
-    "    float w = clamp(1.0 - err / (3.0 + 0.25 * min(mag, 32.0)), 0.0, 1.0);\n"
-    "    vec3 fallback = phase < 0.5 ? texture(prevTex, uv).rgb\n"
-    "                                : texture(curTex, uv).rgb;\n"
+    "    float w = clamp(1.0 - err / (tolBase + tolSlope * min(mag, 32.0)),\n"
+    "                    0.0, 1.0);\n"
+    /* Optional extra distrust of motion boundaries (discSup = 0 disables it,
+     * which is the original behaviour). */
+    "    w *= 1.0 - discSup * smoothstep(3.0, 14.0, max(dF, dB));\n"
+    /* Fallback frame: a hard switch at the midpoint (fbSmooth = 0, original)
+     * through to a straight crossfade (fbSmooth = 1). The hard switch makes
+     * consecutive generated frames jump between two different real frames,
+     * which reads as tearing wherever the fallback covers much area. */
+    "    float fbMix = mix(step(0.5, phase), phase, fbSmooth);\n"
+    "    vec3 fallback = mix(texture(prevTex, uv).rgb,\n"
+    "                        texture(curTex, uv).rgb, fbMix);\n"
     "    vec3 mid = mix(fallback, mix(cPrev, cCur, phase), w);\n"
     "    if (hdrMode > 0.5)\n"
     "        mid = hdr_tonemap(mid);\n"
     "    fragColor = vec4(mid, 1.0);\n"
     "}\n";
+
+/* ---- runtime-tunable FG quality parameters ------------------------------
+ * Adjusted live from the player (see fsr_fg_tune_* below) so the right
+ * settings can be found on the actual problem scene instead of guessed.
+ * The defaults below are exactly the values the shader used to hard-code. */
+static struct {
+    const char *name;
+    float val, def, min, max, step;
+} fg_tune[] = {
+    { "TOL BASE",  3.00f, 3.00f, 0.50f, 12.00f, 0.50f },
+    { "TOL SLOPE", 0.25f, 0.25f, 0.00f,  1.00f, 0.05f },
+    { "EDGE SUPP", 0.00f, 0.00f, 0.00f,  1.00f, 0.10f },
+    { "FB SMOOTH", 0.00f, 0.00f, 0.00f,  1.00f, 0.25f },
+};
+#define FG_TUNE_N ((int)(sizeof(fg_tune) / sizeof(fg_tune[0])))
+static int fg_tune_sel;
+
+/* Text for the toast/log, e.g. "TOL BASE 3.0" (the pixel font is uppercase
+ * letters, digits and '.', so this renders as-is). */
+static const char *fg_tune_text(void)
+{
+    static char buf[48];
+
+    snprintf(buf, sizeof(buf), "%s %.*f", fg_tune[fg_tune_sel].name,
+             fg_tune[fg_tune_sel].step >= 0.5f ? 1 : 2,
+             fg_tune[fg_tune_sel].val);
+    return buf;
+}
+
+const char *fsr_fg_tune_select(int dir)
+{
+    fg_tune_sel = (fg_tune_sel + (dir >= 0 ? 1 : FG_TUNE_N - 1)) % FG_TUNE_N;
+    return fg_tune_text();
+}
+
+const char *fsr_fg_tune_adjust(int dir)
+{
+    float *v = &fg_tune[fg_tune_sel].val;
+
+    *v += (dir >= 0 ? 1.0f : -1.0f) * fg_tune[fg_tune_sel].step;
+    if (*v < fg_tune[fg_tune_sel].min) *v = fg_tune[fg_tune_sel].min;
+    if (*v > fg_tune[fg_tune_sel].max) *v = fg_tune[fg_tune_sel].max;
+    return fg_tune_text();
+}
+
+const char *fsr_fg_tune_reset(void)
+{
+    for (int i = 0; i < FG_TUNE_N; i++)
+        fg_tune[i].val = fg_tune[i].def;
+    return "FG TUNE RESET";
+}
+
+void fsr_fg_tune_log(void)
+{
+    for (int i = 0; i < FG_TUNE_N; i++)
+        av_log(NULL, AV_LOG_INFO, "FG tune: %-10s %.2f (default %.2f)\n",
+               fg_tune[i].name, fg_tune[i].val, fg_tune[i].def);
+}
 
 static struct {
     int state;                    /* 0 = untried, 1 = ready, -1 = unavailable */
@@ -1703,6 +1787,7 @@ static struct {
     GLint phase_loc;
     GLint outsize_loc;
     GLint hdr_loc, peak_loc;
+    GLint tune_loc[FG_TUNE_N];
     const void *in_frame[2];              /* what each OF input buffer holds */
     int64_t in_pts[2];
     const void *pair_a, *pair_b;          /* frames the current flow refers to */
@@ -2005,6 +2090,14 @@ static int fg_init_body(void)
         fg.outsize_loc = gl.GetUniformLocation(fg.prog, "outSize");
         fg.hdr_loc     = gl.GetUniformLocation(fg.prog, "hdrMode");
         fg.peak_loc    = gl.GetUniformLocation(fg.prog, "hdrPeak");
+        {
+            static const char *const tnames[FG_TUNE_N] = {
+                "tolBase", "tolSlope", "discSup", "fbSmooth"
+            };
+
+            for (int i = 0; i < FG_TUNE_N; i++)
+                fg.tune_loc[i] = gl.GetUniformLocation(fg.prog, tnames[i]);
+        }
     }
     return 0;
 }
@@ -2177,6 +2270,9 @@ static int fg_warp(SDL_Renderer *renderer, int sp, int sn, float phase,
     gl.Uniform2f(fg.outsize_loc, (GLfloat)ow, (GLfloat)oh);
     gl.Uniform1f(fg.hdr_loc, tonemap && hdr_active ? 1.0f : 0.0f);
     gl.Uniform1f(fg.peak_loc, hdr_peak);
+    for (int i = 0; i < FG_TUNE_N; i++)
+        if (fg.tune_loc[i] >= 0)
+            gl.Uniform1f(fg.tune_loc[i], fg_tune[i].val);
     gl.DrawArrays(GL_TRIANGLES, 0, 3);
     gl.UseProgram(prev_prog);
     for (int i = 3; i >= 0; i--) {
@@ -2281,6 +2377,147 @@ int fsr_fg_prepare(SDL_Renderer *renderer, AVFrame *prev, AVFrame *next)
     return fg_prepare_pair(renderer, prev, next, &sp, &sn) == 0;
 }
 
+/* ---- RIFE frame generation ----------------------------------------------
+ * An alternative to the optical-flow warp above. The hardware flow is computed
+ * on a 4x4 block grid, so a block straddling a moving subject's silhouette
+ * mixes the subject's motion with the background's and the warp smears the
+ * edge; RIFE estimates the flow per pixel instead. It runs on ncnn/Vulkan and
+ * consumes plain RGB, so the pair is read back out of the shared GL textures
+ * once per pair - that cost is amortised over every frame generated from it -
+ * and only the result is uploaded per generated frame. */
+#ifndef GL_RGB
+#define GL_RGB 0x1907
+#endif
+
+static int fsr_rife;                    /* set from ffplay.c (-rife / hotkey) */
+
+void fsr_rife_set(int on)
+{
+    /* Only ever enable what fsr_rife_boot() already brought up: creating the
+     * Vulkan device now, with the renderer live, would crash (see below). */
+    fsr_rife = on && rife_available();
+}
+
+/* Bring the Vulkan device up. This MUST run before SDL_CreateRenderer:
+ * creating ncnn's Vulkan device after the SDL OpenGL renderer exists leaves
+ * the renderer broken, and the next SDL_CreateTexture() segfaults (reproduced
+ * standalone - it is not specific to the player). Doing it first also keeps
+ * the ~1 s model load out of the refresh loop. */
+int fsr_rife_boot(void)
+{
+    return rife_init();
+}
+
+int fsr_rife_active(int w, int h)
+{
+    /* All three gates, so callers can report the engine actually in use:
+     * a 4K source keeps the flow warp even with RIFE switched on. */
+    return fsr_rife && rife_available() && rife_size_supported(w, h);
+}
+
+static uint8_t     *rife_rgb[2];        /* the pair, packed RGB24 */
+static uint8_t     *rife_outbuf;
+static int          rife_bw, rife_bh;   /* size the buffers were made for */
+static const void  *rife_pa, *rife_pb;  /* frames rife_rgb[] currently holds */
+static SDL_Texture *rife_tex;
+
+static void rife_free_buffers(void)
+{
+    av_freep(&rife_rgb[0]);
+    av_freep(&rife_rgb[1]);
+    av_freep(&rife_outbuf);
+    if (rife_tex) {
+        SDL_DestroyTexture(rife_tex);
+        rife_tex = NULL;
+    }
+    rife_bw = rife_bh = 0;
+    rife_pa = rife_pb = NULL;
+}
+
+static int rife_ensure_buffers(SDL_Renderer *renderer, int w, int h)
+{
+    if (rife_bw == w && rife_bh == h && rife_rgb[0] && rife_outbuf && rife_tex)
+        return 0;
+    rife_free_buffers();
+    rife_rgb[0] = av_malloc((size_t)w * h * 3);
+    rife_rgb[1] = av_malloc((size_t)w * h * 3);
+    rife_outbuf = av_malloc((size_t)w * h * 3);
+    rife_tex    = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGB24,
+                                    SDL_TEXTUREACCESS_STREAMING, w, h);
+    if (!rife_rgb[0] || !rife_rgb[1] || !rife_outbuf || !rife_tex) {
+        rife_free_buffers();
+        return -1;
+    }
+    SDL_SetTextureBlendMode(rife_tex, SDL_BLENDMODE_NONE);
+    rife_bw = w;
+    rife_bh = h;
+    return 0;
+}
+
+/* Copy both frames of the current pair out of their shared GL textures. */
+static int rife_fetch_pair(int sp, int sn)
+{
+    HANDLE objs[2] = { hwgl.gl_object[sp], hwgl.gl_object[sn] };
+    int    slots[2] = { sp, sn };
+    GLint  prev_tex = 0;
+
+    hwgl_lock();
+    if (!hwgl.DXLockObjects(hwgl.gl_device, 2, objs)) {
+        hwgl_unlock();
+        return -1;
+    }
+    gl.GetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+    for (int i = 0; i < 2; i++) {
+        gl.BindTexture(GL_TEXTURE_2D, hwgl.gl_tex[slots[i]]);
+        gl.GetTexImage(GL_TEXTURE_2D, 0, GL_RGB, GL_UNSIGNED_BYTE, rife_rgb[i]);
+    }
+    gl.BindTexture(GL_TEXTURE_2D, prev_tex);
+    hwgl.DXUnlockObjects(hwgl.gl_device, 2, objs);
+    hwgl_unlock();
+    return 0;
+}
+
+/* Returns 1 if the interpolated frame was drawn, 0 to fall back to the warp. */
+static int rife_fg_draw(SDL_Renderer *renderer, int sp, int sn,
+                        const SDL_Rect *rect, float phase)
+{
+    void *pixels;
+    int   pitch;
+
+    if (!rife_size_supported(fg.w, fg.h))
+        return 0;
+    if (!rife_available())              /* boot happens before the renderer */
+        return 0;
+    if (rife_ensure_buffers(renderer, fg.w, fg.h) < 0)
+        return 0;
+
+    /* Re-read only when this is a different frame pair. */
+    if (rife_pa != fg.pair_a || rife_pb != fg.pair_b) {
+        if (rife_fetch_pair(sp, sn) < 0)
+            return 0;
+        rife_pa = fg.pair_a;
+        rife_pb = fg.pair_b;
+    }
+
+    if (rife_interpolate(rife_rgb[0], rife_rgb[1], fg.w, fg.h,
+                         phase, rife_outbuf) < 0) {
+        av_log(NULL, AV_LOG_VERBOSE, "RIFE: interpolation failed\n");
+        return 0;
+    }
+
+    if (SDL_LockTexture(rife_tex, NULL, &pixels, &pitch) < 0)
+        return 0;
+    for (int y = 0; y < fg.h; y++)
+        memcpy((uint8_t *)pixels + (size_t)y * pitch,
+               rife_outbuf + (size_t)y * fg.w * 3, (size_t)fg.w * 3);
+    SDL_UnlockTexture(rife_tex);
+
+    hwgl.last_frame = NULL;             /* the target no longer holds a real frame */
+    SDL_SetRenderTarget(renderer, NULL);
+    SDL_RenderCopy(renderer, rife_tex, NULL, rect);
+    return 1;
+}
+
 int fsr_fg_draw(SDL_Renderer *renderer, AVFrame *prev, AVFrame *next,
                 const SDL_Rect *rect, int fsr_on, float sharpness, float phase)
 {
@@ -2290,6 +2527,11 @@ int fsr_fg_draw(SDL_Renderer *renderer, AVFrame *prev, AVFrame *next,
 
     if (fg_prepare_pair(renderer, prev, next, &sp, &sn) < 0)
         return 0;
+
+    /* RIFE replaces the warp entirely when it is on and the frame is small
+     * enough to fit the time budget; it falls through to the warp otherwise. */
+    if (fsr_rife && rife_fg_draw(renderer, sp, sn, rect, phase))
+        return 1;
 
     engaged = fsr_on && (rect->w > fg.w || rect->h > fg.h);
     if (engaged) {
@@ -2378,6 +2620,14 @@ int fsr_fg_draw(SDL_Renderer *renderer, struct AVFrame *prev, struct AVFrame *ne
     return 0;
 }
 
+const char *fsr_fg_tune_select(int dir) { (void)dir; return "FG N/A"; }
+const char *fsr_fg_tune_adjust(int dir) { (void)dir; return "FG N/A"; }
+const char *fsr_fg_tune_reset(void)     { return "FG N/A"; }
+void        fsr_fg_tune_log(void)       { }
+void        fsr_rife_set(int on)        { (void)on; }
+int         fsr_rife_active(int w, int h) { (void)w; (void)h; return 0; }
+int         fsr_rife_boot(void)         { return -1; }
+
 #endif /* CONFIG_D3D11VA */
 
 int fsr_draw(SDL_Renderer *renderer, SDL_Texture *vid_texture,
@@ -2438,6 +2688,7 @@ fail:
 
 static SDL_Texture *toast_tex;
 static int          toast_w, toast_h;
+static int          toast_sys;  /* the texture came from the system font */
 static int64_t      toast_until;
 
 /* 8x8 bitmap glyphs, one byte per row, MSB = leftmost pixel. Only the
@@ -2580,26 +2831,63 @@ static SDL_Texture *toast_render(SDL_Renderer *renderer, const char *text,
 
 void fsr_toast_show(SDL_Renderer *renderer, const char *text)
 {
+    int ow = 0, oh = 0;
+
     if (toast_tex) {
         SDL_DestroyTexture(toast_tex);
         toast_tex = NULL;
     }
-    toast_tex = toast_render(renderer, text, &toast_w, &toast_h);
+    if (!text || !text[0])
+        return;
+    /* System font first, for the same reason as the HUD: the pixel font is
+     * missing half the alphabet and drops those letters silently. The size
+     * matches what the old 8px font scaled up to (8 * oh/180). */
+    SDL_GetRendererOutputSize(renderer, &ow, &oh);
+    toast_sys = 0;
+    if (oh > 0) {
+        int px = oh / 22;
+
+        if (px < 16)
+            px = 16;
+        toast_tex = ui_render_text(renderer, text, px, &toast_w, &toast_h);
+        toast_sys = toast_tex != NULL;
+    }
+    if (!toast_tex)                     /* GDI unavailable: pixel font */
+        toast_tex = toast_render(renderer, text, &toast_w, &toast_h);
     if (toast_tex)
         toast_until = av_gettime_relative() + TOAST_DURATION_US;
 }
 
-/* Persistent HUD (FPS display): same pixel font, top-right corner. */
+/* Persistent HUD (FPS display), top-right corner. Rendered with the system
+ * font (as the subtitles are), falling back to the pixel font. */
 static SDL_Texture *hud_tex;
 static int          hud_w, hud_h;
+static int          hud_sys;    /* the texture came from the system font */
 
 void fsr_hud_set(SDL_Renderer *renderer, const char *text)
 {
+    int ow = 0, oh = 0;
+
     if (hud_tex) {
         SDL_DestroyTexture(hud_tex);
         hud_tex = NULL;
     }
-    if (text && text[0])
+    if (!text || !text[0])
+        return;
+    /* Prefer the system font the subtitles use: the pixel font only carries
+     * about half the alphabet, so anything else silently loses letters.
+     * Sized against the output height so it matches the old apparent size. */
+    SDL_GetRendererOutputSize(renderer, &ow, &oh);
+    hud_sys = 0;
+    if (oh > 0) {
+        int px = oh / 45;
+
+        if (px < 12)
+            px = 12;
+        hud_tex = ui_render_text(renderer, text, px, &hud_w, &hud_h);
+        hud_sys = hud_tex != NULL;
+    }
+    if (!hud_tex)                       /* GDI unavailable: pixel font */
         hud_tex = toast_render(renderer, text, &hud_w, &hud_h);
 }
 
@@ -2611,7 +2899,9 @@ int fsr_hud_draw(SDL_Renderer *renderer)
     if (!hud_tex)
         return 0;
     SDL_GetRendererOutputSize(renderer, &ow, &oh);
-    scale = oh / 300;
+    /* The system font is already rasterized at the right size; only the 8px
+     * pixel-font fallback needs scaling up. */
+    scale = hud_sys ? 1 : oh / 300;
     if (scale < 1)
         scale = 1;
     dst.w = hud_w * scale;
@@ -2620,6 +2910,25 @@ int fsr_hud_draw(SDL_Renderer *renderer)
     /* Sit below the UI title bar (34px tall, window buttons on the right) so
      * the TAB status readout does not overlap it. */
     dst.y = 50;
+
+    /* Dark translucent plate behind the text: white glyphs alone wash out
+     * over bright video. Drawn first so the text sits on top of it. */
+    {
+        int pad = scale * 6;
+        SDL_Rect bg = { dst.x - pad, dst.y - pad,
+                        dst.w + 2 * pad, dst.h + 2 * pad };
+        SDL_BlendMode prev_bm;
+        uint8_t r, g, b, a;
+
+        SDL_GetRenderDrawBlendMode(renderer, &prev_bm);
+        SDL_GetRenderDrawColor(renderer, &r, &g, &b, &a);
+        SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 150);
+        SDL_RenderFillRect(renderer, &bg);
+        SDL_SetRenderDrawColor(renderer, r, g, b, a);
+        SDL_SetRenderDrawBlendMode(renderer, prev_bm);
+    }
+
     SDL_RenderCopy(renderer, hud_tex, NULL, &dst);
     return 1;
 }
@@ -2638,9 +2947,11 @@ int fsr_toast_draw(SDL_Renderer *renderer)
     if (!toast_tex || rem <= 0)
         return 0;
     SDL_GetRendererOutputSize(renderer, &ow, &oh);
-    scale = oh / 180;
-    if (scale < 2)
-        scale = 2;
+    /* Only the 8px pixel-font fallback needs scaling up; the system font is
+     * already rasterized at the intended size. */
+    scale = toast_sys ? 1 : oh / 180;
+    if (scale < (toast_sys ? 1 : 2))
+        scale = toast_sys ? 1 : 2;
     alpha = rem < TOAST_FADE_US ? (int)(255 * rem / TOAST_FADE_US) : 255;
     SDL_SetTextureAlphaMod(toast_tex, alpha);
     dst.x = 16;
@@ -3768,6 +4079,8 @@ void fsr_uninit(void)
     hwgl_exiting = 1;
     fg_destroy();
     hwgl_destroy();
+    rife_free_buffers();
+    rife_uninit();          /* drop the Vulkan session before the GPU goes */
 #endif
     if (vis_tx) { av_tx_uninit(&vis_tx); vis_tx = NULL; }
     av_freep(&vis_win);

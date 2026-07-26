@@ -56,6 +56,20 @@ OBJS-ffplay += fftools/ffplay_renderer.o
 OBJS-ffplay += fftools/ffplay_fsr.o
 OBJS-ffplay += fftools/ffplay_ui.o
 OBJS-ffplay += fftools/ffplay_thumb.o
+# RIFE frame interpolation (ncnn + Vulkan). The wrapper under fftools/rife/ is
+# rife-ncnn-vulkan by nihui (MIT, see fftools/rife/LICENSE); ncnn itself is
+# vendored at the repo root like SDL2/dav1d/nvheaders. Vulkan is reached
+# through the system vulkan-1.dll, which ncnn loads at runtime, so the
+# executable stays free of non-system DLL imports.
+OBJS-ffplay += fftools/ffplay_rife.o
+OBJS-ffplay += fftools/rife/rife.o
+OBJS-ffplay += fftools/rife/warp.o
+NCNN_DIR := $(SRC_PATH)/../ncnn
+fftools/ffplay_rife.o fftools/rife/rife.o fftools/rife/warp.o: \
+    CXXFLAGS += -I$(SRC_PATH)/fftools/rife -I$(NCNN_DIR)/include/ncnn -fopenmp
+EXTRALIBS-ffplay += -L$(NCNN_DIR)/lib -lncnn -lglslang -lSPIRV \
+    -lMachineIndependent -lGenericCodeGen -lOSDependent \
+    -lglslang-default-resource-limits -fopenmp
 OBJS-ffplay-$(HAVE_GNU_WINDRES) += fftools/ffplay_res.o
 # GUI subsystem: no console window flashes on double-click launches;
 # fsr_detach_console() re-attaches to the parent console when run from one.
@@ -67,7 +81,7 @@ ifdef HAVE_GNU_WINDRES
 OBJS-$(1) += fftools/fftoolsres.o
 endif
 $(1)$(PROGSSUF)_g$(EXESUF): $$(OBJS-$(1))
-$$(OBJS-$(1)): | fftools fftools/textformat fftools/resources fftools/graph
+$$(OBJS-$(1)): | fftools fftools/rife fftools/textformat fftools/resources fftools/graph
 $$(OBJS-$(1)): CFLAGS  += $(CFLAGS-$(1))
 $(1)$(PROGSSUF)_g$(EXESUF): LDFLAGS += $(LDFLAGS-$(1))
 $(1)$(PROGSSUF)_g$(EXESUF): FF_EXTRALIBS += $(EXTRALIBS-$(1))
@@ -80,6 +94,7 @@ all: $(AVPROGS)
 
 fftools/ffprobe.o fftools/cmdutils.o: libavutil/ffversion.h | fftools
 OUTDIRS += fftools
+OUTDIRS += fftools/rife
 OUTDIRS += fftools/textformat
 OUTDIRS += fftools/resources
 OUTDIRS += fftools/graph
@@ -101,4 +116,4 @@ uninstall-progs:
 	$(RM) $(addprefix "$(BINDIR)/", $(ALLAVPROGS))
 
 clean::
-	$(RM) $(ALLAVPROGS) $(ALLAVPROGS_G) $(CLEANSUFFIXES:%=fftools/%) $(CLEANSUFFIXES:%=fftools/graph/%) $(CLEANSUFFIXES:%=fftools/textformat/%)
+	$(RM) $(ALLAVPROGS) $(ALLAVPROGS_G) $(CLEANSUFFIXES:%=fftools/%) $(CLEANSUFFIXES:%=fftools/graph/%) $(CLEANSUFFIXES:%=fftools/rife/%) $(CLEANSUFFIXES:%=fftools/textformat/%)

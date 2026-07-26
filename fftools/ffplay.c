@@ -388,6 +388,7 @@ static int fsr = -1; /* -1 = auto: on for any source resolution */
 static float fsr_sharpness = 0.0f; /* RCAS attenuation stops, 0 = maximum sharpness */
 static int fsr_denoise = 0;
 static int fsr_fg = 1;             /* frame generation (hardware optical flow) */
+static int fsr_rife = 1;           /* ...using RIFE instead, where it fits */
 static int fg_mult = 2;            /* interpolation factor: 2/3/4 -> source x2/x3/x4,
                                     * capped by the display refresh (cannot present
                                     * faster than the panel) */
@@ -1595,6 +1596,7 @@ static int video_open(VideoState *is)
 static int    hud_src_w, hud_src_h;   /* source video dimensions */
 static double hud_src_fps;            /* source frame rate */
 static int    hud_hw;                 /* hardware decoding in use */
+static int    hud_album;              /* album view is up (audio playback) */
 
 /* Refresh the TAB-toggled status overlay: source resolution, source ->
  * presented frame rate (incl. generated frames) and the current
@@ -1624,12 +1626,16 @@ static void status_hud_update(int fps)
      * still tops out at 60 on a 60 Hz panel, indistinguishable from 2X by the
      * FPS reading alone). */
     {
-        int fg_on = fsr_fg && hud_hw &&
+        int fg_on = fsr_fg && hud_hw && !hud_album &&
                     (hud_src_fps <= 0 || 1.0 / hud_src_fps > fg_refresh * 1.5);
         char fg_state[16];
 
         if (fg_on)
-            snprintf(fg_state, sizeof(fg_state), "ON %dX", av_clip(fg_mult, 2, 4));
+            /* name the engine: RIFE only takes over for sources small enough
+             * to fit the time budget, so a 4K file still reads FLOW here */
+            snprintf(fg_state, sizeof(fg_state), "%s %dX",
+                     fsr_rife_active(hud_src_w, hud_src_h) ? "RIFE" : "FLOW",
+                     av_clip(fg_mult, 2, 4));
         else
             snprintf(fg_state, sizeof(fg_state), "OFF");
         snprintf(buf + n, sizeof(buf) - n,
@@ -2186,7 +2192,11 @@ static void video_refresh(void *opaque, double *remaining_time)
     /* Audio-only album visualizer: redraw continuously for the LP spin and
      * drifting background (attached-picture files also land here, so this
      * pre-empts the still-image video path). */
-    if (!display_disable && audio_album_active(is)) {
+    /* Album playback returns before the frame-generation block below, so FG
+     * never runs for music; record that so the status overlay says so too
+     * (a cover-art file has a video stream and would otherwise read "on"). */
+    hud_album = !display_disable && audio_album_active(is);
+    if (hud_album) {
         time = av_gettime_relative() / 1000000.0;
         if (is->force_refresh || is->last_vis_time + ALBUM_REFRESH < time) {
             video_display(is);
@@ -5066,6 +5076,42 @@ static void event_loop(VideoState *cur_stream)
                     fsr_toast_show(renderer, fsr_fg ? "FG ON" : "FG OFF");
                 cur_stream->force_refresh = 1;
                 break;
+            case SDLK_r:
+                /* A/B the two frame-generation engines on the same scene. */
+                fsr_rife = !fsr_rife;
+                fsr_rife_set(fsr_rife);
+                av_log(NULL, AV_LOG_INFO, "Frame generation: %s\n",
+                       fsr_rife ? "RIFE" : "optical flow");
+                if (renderer)
+                    fsr_toast_show(renderer, fsr_rife ? "FG RIFE" : "FG FLOW");
+                if (show_fps)
+                    status_hud_update(-1);   /* reflect the switch right away */
+                cur_stream->force_refresh = 1;
+                break;
+            /* Live frame-generation tuning: [ ] pick a knob, , . change it,
+             * \ restores every default. Values apply to the next generated
+             * frame, so the effect is visible immediately on the scene being
+             * watched. */
+            case SDLK_LEFTBRACKET:
+            case SDLK_RIGHTBRACKET:
+            case SDLK_COMMA:
+            case SDLK_PERIOD:
+            case SDLK_BACKSLASH: {
+                const char *msg;
+                int sym = event.key.keysym.sym;
+
+                if (sym == SDLK_LEFTBRACKET || sym == SDLK_RIGHTBRACKET)
+                    msg = fsr_fg_tune_select(sym == SDLK_RIGHTBRACKET ? 1 : -1);
+                else if (sym == SDLK_COMMA || sym == SDLK_PERIOD)
+                    msg = fsr_fg_tune_adjust(sym == SDLK_PERIOD ? 1 : -1);
+                else
+                    msg = fsr_fg_tune_reset();
+                av_log(NULL, AV_LOG_INFO, "FG tune: %s\n", msg);
+                if (renderer)
+                    fsr_toast_show(renderer, msg);
+                cur_stream->force_refresh = 1;
+                break;
+            }
             case SDLK_d:
                 fsr_denoise = !fsr_denoise;
                 fsr_set_denoise(renderer, fsr_denoise);
@@ -5514,6 +5560,7 @@ static const OptionDef options[] = {
     { "fsr_sharpness",      OPT_TYPE_FLOAT, OPT_EXPERT, { &fsr_sharpness }, "FSR RCAS sharpness attenuation in stops (0=sharpest, adjust at runtime with +/-)", "stops" },
     { "fsr_denoise",        OPT_TYPE_BOOL,  OPT_EXPERT, { &fsr_denoise }, "reduce FSR sharpening of noise and film grain; toggle at runtime with 'd'" },
     { "fsr_fg",             OPT_TYPE_BOOL,  OPT_EXPERT, { &fsr_fg }, "frame generation via NVIDIA hardware optical flow, on by default (-nofsr_fg disables); toggle at runtime with 'g'" },
+    { "rife",               OPT_TYPE_BOOL,  OPT_EXPERT, { &fsr_rife }, "generate frames with RIFE (per-pixel, ncnn+Vulkan) instead of the block-grid optical flow where it fits the time budget, on by default (-norife disables); toggle at runtime with 'r'" },
     { "fg_mult",            OPT_TYPE_INT,   OPT_EXPERT, { &fg_mult }, "frame generation factor: 2, 3 or 4 (source x2/x3/x4, capped by display refresh); pick at runtime from the right-click menu", "N" },
     { "install",            OPT_TYPE_BOOL,  OPT_EXPERT, { &install_assoc }, "register .mp4/.mkv file associations for the current user and exit" },
     { "uninstall",          OPT_TYPE_BOOL,  OPT_EXPERT, { &uninstall_assoc }, "remove the .mp4/.mkv file associations and exit" },
@@ -5562,6 +5609,35 @@ void show_help_default(const char *opt, const char *arg)
            "right mouse click   seek to percentage in file corresponding to fraction of width\n"
            "left double-click   toggle full screen\n"
            );
+}
+
+/* Nonzero if the input carries a real video stream (a cover picture does not
+ * count). RIFE's Vulkan device has to be created before SDL_CreateRenderer,
+ * i.e. before the file is opened for playback, so peek at it here to avoid
+ * spending ~1 s loading the model for a music file that will never generate
+ * a frame. Unknown/unopenable inputs answer "yes", leaving RIFE available. */
+static int input_has_video(const char *filename)
+{
+    AVFormatContext *ic = NULL;
+    int has = 0;
+
+    if (!filename || avformat_open_input(&ic, filename, NULL, NULL) < 0)
+        return 1;
+    if (avformat_find_stream_info(ic, NULL) >= 0) {
+        for (unsigned i = 0; i < ic->nb_streams; i++) {
+            const AVStream *st = ic->streams[i];
+
+            if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
+                !(st->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
+                has = 1;
+                break;
+            }
+        }
+    } else {
+        has = 1;                        /* could not probe: assume video */
+    }
+    avformat_close_input(&ic);
+    return has;
 }
 
 /* Called from the main */
@@ -5695,6 +5771,19 @@ int main(int argc, char **argv)
         } else {
             if (fsr)
                 SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
+            /* Before the renderer: ncnn's Vulkan device must exist first or
+             * the SDL OpenGL renderer is left broken (see fsr_rife_boot).
+             * Skip it entirely for audio-only input - frame generation never
+             * runs behind the album view, so the model load would be wasted. */
+            if (fsr_rife && !input_has_video(input_filename)) {
+                av_log(NULL, AV_LOG_INFO,
+                       "RIFE: audio-only input, skipping the model load\n");
+                fsr_rife = 0;
+            } else if (fsr_rife && fsr_rife_boot() < 0) {
+                av_log(NULL, AV_LOG_WARNING,
+                       "RIFE: unavailable, using optical-flow frame generation\n");
+                fsr_rife = 0;
+            }
             renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
             if (!renderer) {
                 av_log(NULL, AV_LOG_WARNING, "Failed to initialize a hardware accelerated renderer: %s\n", SDL_GetError());
@@ -5718,6 +5807,9 @@ int main(int argc, char **argv)
             if (fsr_fg && fsr_fg_boot() < 0)
                 av_log(NULL, AV_LOG_WARNING,
                        "FG: hardware optical flow unavailable, frame generation disabled\n");
+            /* RIFE loads lazily on the first generated frame; if its model or
+             * Vulkan is missing the optical-flow warp just keeps being used. */
+            fsr_rife_set(fsr_rife);
             update_fg_refresh();
         }
         /* Tag this window as the primary and start receiving forwarded files

@@ -96,6 +96,30 @@ int  fsr_fg_draw(SDL_Renderer *renderer, struct AVFrame *prev, struct AVFrame *n
  * call while waiting for a presentation slot so fsr_fg_draw is fast. */
 int  fsr_fg_prepare(SDL_Renderer *renderer, struct AVFrame *prev, struct AVFrame *next);
 int  fsr_fg_available(void);
+
+/* RIFE frame generation: a learned per-pixel alternative to the block-grid
+ * optical flow, used in place of the warp while it is on and the frame is
+ * small enough to fit the time budget (see ffplay_rife.h). fsr_rife_active()
+ * reports whether it is both requested and actually usable. */
+void fsr_rife_set(int on);
+/* Nonzero if a source of this size will actually be interpolated by RIFE
+ * rather than the flow warp (requested, available, and small enough). */
+int  fsr_rife_active(int w, int h);
+/* Create the Vulkan device. Call BEFORE SDL_CreateRenderer: bringing ncnn's
+ * Vulkan device up after the SDL OpenGL renderer exists corrupts the renderer
+ * and the next SDL_CreateTexture() crashes. Returns 0 if RIFE is usable. */
+int  fsr_rife_boot(void);
+
+/* Live tuning of the frame-generation quality knobs, so the right values can
+ * be found on a problem scene during playback instead of guessed. The
+ * defaults reproduce the original hard-coded behaviour exactly.
+ * _select() moves between knobs, _adjust() changes the selected one, and
+ * _reset() restores every default; each returns a short label to show as a
+ * toast ("TOL BASE 3.0"). _log() dumps the current set at AV_LOG_INFO. */
+const char *fsr_fg_tune_select(int dir);
+const char *fsr_fg_tune_adjust(int dir);
+const char *fsr_fg_tune_reset(void);
+void        fsr_fg_tune_log(void);
 /* Load driver libraries and create the CUDA context; call at startup,
  * before decoding begins (device probing races with active decode). */
 int  fsr_fg_boot(void);
