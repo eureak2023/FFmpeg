@@ -54,6 +54,8 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <shellapi.h>
+#include <SDL_syswm.h>
 #endif
 
 #include "libavutil/avstring.h"
@@ -3555,11 +3557,209 @@ char *fsr_single_instance_take_path(void)
     SDL_UnlockMutex(si_lock);
     return p;
 }
+
+/* True if a wide name ends with one of our playable media extensions. */
+static int fsr_is_media_name_w(const wchar_t *name)
+{
+    static const wchar_t *const exts[] = {
+        L".mp4", L".mkv", L".avi", L".mov", L".m4v", L".webm", L".flv", L".wmv",
+        L".ts", L".m2ts", L".mts", L".mpg", L".mpeg", L".vob", L".ogv", L".3gp",
+        L".mp3", L".flac", L".wav", L".m4a", L".aac", L".ogg", L".opus", L".wma",
+        L".ape", L".alac", L".wv", L".mka", L".mid", L".aiff", L".dsf",
+    };
+    const wchar_t *dot = wcsrchr(name, L'.');
+    size_t i;
+
+    if (!dot)
+        return 0;
+    for (i = 0; i < sizeof(exts) / sizeof(exts[0]); i++)
+        if (lstrcmpiW(dot, exts[i]) == 0)
+            return 1;
+    return 0;
+}
+
+static int fsr_name_cmp_w(const void *a, const void *b)
+{
+    /* locale-aware, case-insensitive — close to Explorer's ordering */
+    return lstrcmpiW(*(const wchar_t *const *)a, *(const wchar_t *const *)b);
+}
+
+static wchar_t *fsr_wcsdup(const wchar_t *s)
+{
+    size_t   n   = wcslen(s) + 1;
+    wchar_t *dup = av_malloc(n * sizeof(wchar_t));
+
+    if (dup)
+        wmemcpy(dup, s, n);
+    return dup;
+}
+
+/* ffplay filenames are UTF-8 (SDL's main hands us a UTF-8 argv, and the
+ * single-instance forwarder passes UTF-8 too), so directories/files with
+ * non-ASCII names — e.g. "Café Cubano Playlist" — are only found through the
+ * wide (UTF-16) file API. We convert in, enumerate wide, and convert the
+ * chosen path back to UTF-8 for the caller. */
+char *fsr_sibling_media_path(const char *cur_path, int dir)
+{
+    wchar_t        *wpath = NULL, *wpattern = NULL, *wres = NULL;
+    wchar_t       **names = NULL;
+    const wchar_t  *base;
+    size_t          dirlen, i, count = 0, cap = 0;
+    int             cur_idx = -1, next_idx, need;
+    char           *result = NULL;
+    WIN32_FIND_DATAW fd;
+    HANDLE          h = INVALID_HANDLE_VALUE;
+
+    if (!cur_path || !cur_path[0] || (dir != 1 && dir != -1))
+        return NULL;
+
+    /* UTF-8 -> UTF-16 */
+    need = MultiByteToWideChar(CP_UTF8, 0, cur_path, -1, NULL, 0);
+    if (need <= 0)
+        return NULL;
+    wpath = av_malloc((size_t)need * sizeof(wchar_t));
+    if (!wpath)
+        return NULL;
+    MultiByteToWideChar(CP_UTF8, 0, cur_path, -1, wpath, need);
+
+    /* split directory prefix (with trailing separator) from the file name */
+    base = wpath;
+    for (const wchar_t *p = wpath; *p; p++)
+        if (*p == L'\\' || *p == L'/')
+            base = p + 1;
+    dirlen = (size_t)(base - wpath);
+
+    wpattern = av_malloc((dirlen + 2) * sizeof(wchar_t));
+    if (!wpattern)
+        goto done;
+    wmemcpy(wpattern, wpath, dirlen);
+    wpattern[dirlen]     = L'*';
+    wpattern[dirlen + 1] = L'\0';
+
+    h = FindFirstFileW(wpattern, &fd);
+    if (h == INVALID_HANDLE_VALUE)
+        goto done;
+
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            continue;
+        if (!fsr_is_media_name_w(fd.cFileName))
+            continue;
+        if (count == cap) {
+            size_t    ncap = cap ? cap * 2 : 64;
+            wchar_t **tmp  = av_realloc(names, ncap * sizeof(*names));
+            if (!tmp)
+                goto done;
+            names = tmp;
+            cap   = ncap;
+        }
+        names[count] = fsr_wcsdup(fd.cFileName);
+        if (!names[count])
+            goto done;
+        count++;
+    } while (FindNextFileW(h, &fd));
+
+    if (count <= 1)
+        goto done;                      /* nothing to move to */
+
+    qsort(names, count, sizeof(*names), fsr_name_cmp_w);
+
+    /* locate the current file within the sorted list */
+    for (i = 0; i < count; i++)
+        if (lstrcmpiW(names[i], base) == 0) {
+            cur_idx = (int)i;
+            break;
+        }
+    if (cur_idx < 0)
+        cur_idx = (dir == 1) ? -1 : 0;  /* unknown: start before first / at first */
+
+    next_idx = (int)(((size_t)cur_idx + count + (size_t)dir) % count);
+
+    /* rebuild the full path (dir prefix + chosen name) and convert to UTF-8 */
+    {
+        size_t nlen = wcslen(names[next_idx]);
+        wres = av_malloc((dirlen + nlen + 1) * sizeof(wchar_t));
+        if (wres) {
+            wmemcpy(wres, wpath, dirlen);
+            wmemcpy(wres + dirlen, names[next_idx], nlen + 1);
+            need = WideCharToMultiByte(CP_UTF8, 0, wres, -1, NULL, 0, NULL, NULL);
+            if (need > 0 && (result = av_malloc((size_t)need)))
+                WideCharToMultiByte(CP_UTF8, 0, wres, -1, result, need, NULL, NULL);
+        }
+    }
+
+done:
+    if (h != INVALID_HANDLE_VALUE)
+        FindClose(h);
+    for (i = 0; i < count; i++)
+        av_free(names[i]);
+    av_free(names);
+    av_free(wpattern);
+    av_free(wpath);
+    av_free(wres);
+    return result;
+}
+
+/* Modal "delete this file?" confirmation, owned by the player window so it
+ * comes to front even over a fullscreen window. Returns 1 if the user chose
+ * OK. utf8_path is shown so it is clear which file is about to go. */
+int fsr_confirm_delete(SDL_Window *window, const char *utf8_path)
+{
+    wchar_t wpath[1024], wmsg[1200];
+    HWND    owner = NULL;
+
+    if (!utf8_path || !utf8_path[0])
+        return 0;
+    if (MultiByteToWideChar(CP_UTF8, 0, utf8_path, -1, wpath,
+                            (int)(sizeof(wpath) / sizeof(wpath[0]))) <= 0)
+        wpath[0] = L'\0';
+
+    if (window) {
+        SDL_SysWMinfo info;
+        SDL_VERSION(&info.version);
+        if (SDL_GetWindowWMInfo(window, &info) &&
+            info.subsystem == SDL_SYSWM_WINDOWS)
+            owner = info.info.win.window;
+    }
+
+    _snwprintf(wmsg, sizeof(wmsg) / sizeof(wmsg[0]),
+               L"이 파일을 삭제하시겠습니까?\n\n%ls", wpath);
+    return MessageBoxW(owner, wmsg, L"파일 삭제",
+                       MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2 |
+                       MB_SETFOREGROUND | MB_TOPMOST) == IDOK;
+}
+
+/* Send utf8_path to the Recycle Bin (FOF_ALLOWUNDO, so a mistaken delete is
+ * recoverable). The file must already be closed by the player. Returns 0 on
+ * success. The SHFILEOP source list is double-NUL terminated. */
+int fsr_delete_file(const char *utf8_path)
+{
+    wchar_t          wpath[1024 + 1];
+    SHFILEOPSTRUCTW  op;
+    int              n;
+
+    if (!utf8_path || !utf8_path[0])
+        return -1;
+    n = MultiByteToWideChar(CP_UTF8, 0, utf8_path, -1, wpath,
+                            (int)(sizeof(wpath) / sizeof(wpath[0])) - 1);
+    if (n <= 0)
+        return -1;
+    wpath[n] = L'\0';                    /* extra terminator for the list */
+
+    SDL_memset(&op, 0, sizeof(op));
+    op.wFunc  = FO_DELETE;
+    op.pFrom  = wpath;
+    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI;
+    return SHFileOperationW(&op) == 0 ? 0 : -1;
+}
 #else  /* !_WIN32 */
 int   fsr_single_instance_begin(void)             { return 1; }
 int   fsr_single_instance_forward(const char *p)  { (void)p; return -1; }
 void  fsr_single_instance_setup(SDL_Window *w)    { (void)w; }
 char *fsr_single_instance_take_path(void)         { return NULL; }
+char *fsr_sibling_media_path(const char *p, int d){ (void)p; (void)d; return NULL; }
+int   fsr_confirm_delete(SDL_Window *w, const char *p) { (void)w; (void)p; return 0; }
+int   fsr_delete_file(const char *p)              { (void)p; return -1; }
 #endif
 
 void fsr_uninit(void)

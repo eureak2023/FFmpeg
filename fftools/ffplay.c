@@ -5129,19 +5129,52 @@ static void event_loop(VideoState *cur_stream)
                 }
                 break;
             case SDLK_PAGEUP:
-                if (cur_stream->ic->nb_chapters <= 1) {
-                    incr = 600.0;
-                    goto do_seek;
+            case SDLK_PAGEDOWN: {
+                /* Playlist navigation: jump to the previous/next media file in
+                 * the current file's directory (sorted by name, wrapping). */
+                int fwd = event.key.keysym.sym == SDLK_PAGEDOWN;
+                char *sib = cur_stream->filename ?
+                    fsr_sibling_media_path(cur_stream->filename, fwd ? 1 : -1) : NULL;
+
+                av_log(NULL, AV_LOG_INFO, "Playlist %s: %s\n",
+                       fwd ? "next" : "prev", sib ? sib : "(none)");
+                if (sib) {
+                    if (renderer)
+                        fsr_toast_show(renderer, fwd ? "NEXT" : "PREV");
+                    cur_stream = switch_input(cur_stream, sib);
+                } else if (renderer) {
+                    fsr_toast_show(renderer, "NO OTHER FILE");
                 }
-                seek_chapter(cur_stream, 1);
-                break;
-            case SDLK_PAGEDOWN:
-                if (cur_stream->ic->nb_chapters <= 1) {
-                    incr = -600.0;
-                    goto do_seek;
+                continue;
+            }
+            case SDLK_DELETE: {
+                /* Delete the current file (to the Recycle Bin) after a
+                 * confirmation, then play the next file in the folder. The
+                 * demuxer holds the file open, so the stream must be closed
+                 * before the delete: switch to the next file first (that
+                 * releases the handle), then delete the old path; when it is
+                 * the only file, close and quit. */
+                char *cur = cur_stream->filename ?
+                            av_strdup(cur_stream->filename) : NULL;
+                char *nxt = cur ? fsr_sibling_media_path(cur, 1) : NULL;
+
+                if (cur && fsr_confirm_delete(window, cur)) {
+                    if (nxt) {
+                        cur_stream = switch_input(cur_stream, nxt);
+                        nxt = NULL;                 /* owned by switch_input */
+                        fsr_delete_file(cur);
+                        if (renderer)
+                            fsr_toast_show(renderer, "DELETED");
+                    } else {                        /* only file in the folder */
+                        stream_close(cur_stream);
+                        fsr_delete_file(cur);
+                        do_exit(NULL);              /* nothing left to play */
+                    }
                 }
-                seek_chapter(cur_stream, -1);
-                break;
+                av_free(cur);
+                av_free(nxt);
+                continue;
+            }
             case SDLK_LEFT:
                 incr = seek_interval ? -seek_interval : -10.0;
                 goto do_seek;
