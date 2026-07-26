@@ -132,9 +132,11 @@ static struct {
  * everything else the pixel font cannot). White glyphs, alpha from
  * coverage. Returns NULL on failure (caller falls back to the pixel font). */
 static SDL_Texture *render_text_sys(SDL_Renderer *r, const char *utf8,
-                                    int px_h, int *out_w, int *out_h)
+                                    int px_h, int *out_w, int *out_h,
+                                    int multiline)
 {
 #ifdef _WIN32
+    const UINT dtflags = (multiline ? 0u : (UINT)DT_SINGLELINE) | DT_NOPREFIX;
     wchar_t wbuf[512];
     BITMAPINFO bmi = { 0 };
     SDL_Texture *tex = NULL;
@@ -158,7 +160,7 @@ static SDL_Texture *render_text_sys(SDL_Renderer *r, const char *utf8,
     if (!font)
         goto out;
     old_font = (HFONT)SelectObject(dc, font);
-    DrawTextW(dc, wbuf, -1, &rc, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+    DrawTextW(dc, wbuf, -1, &rc, DT_CALCRECT | dtflags);
     tw = rc.right;
     th = rc.bottom;
     if (tw <= 0 || th <= 0)
@@ -177,7 +179,7 @@ static SDL_Texture *render_text_sys(SDL_Renderer *r, const char *utf8,
     memset(bits, 0, (size_t)tw * th * 4);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, RGB(255, 255, 255));
-    DrawTextW(dc, wbuf, -1, &rc, DT_SINGLELINE | DT_NOPREFIX);
+    DrawTextW(dc, wbuf, -1, &rc, dtflags);
     GdiFlush();
 
     px = SDL_malloc((size_t)tw * th * 4);
@@ -210,6 +212,16 @@ out:
 #else
     return NULL;
 #endif
+}
+
+/* Public wrapper so other modules (the TAB status HUD in ffplay_fsr.c) can
+ * use the same system font as the subtitles instead of the built-in pixel
+ * font, which only carries a handful of letters and silently drops the rest.
+ * Multi-line: embedded newlines are laid out by GDI. NULL on failure. */
+SDL_Texture *ui_render_text(SDL_Renderer *r, const char *utf8, int px_h,
+                            int *out_w, int *out_h)
+{
+    return render_text_sys(r, utf8, px_h, out_w, out_h, 1);
 }
 
 /* ---- text subtitles (SRT/SMI/ASS events rendered with the system font) */
@@ -459,7 +471,7 @@ void ui_sub_draw(SDL_Renderer *renderer, int win_w, int win_h, double now)
 
                 subs.line_tex[li] = render_text_sys(renderer, line, px,
                                                     &subs.line_w[li],
-                                                    &subs.line_h[li]);
+                                                    &subs.line_h[li], 0);
                 if (subs.line_tex[li])
                     subs.nlines++;
             }
@@ -1262,7 +1274,7 @@ static void draw_seek_thumb(SDL_Renderer *r, int win_w, int seek_top,
         if (ui.thumb_label_tex)
             SDL_DestroyTexture(ui.thumb_label_tex);
         ui.thumb_label_tex = render_text_sys(r, tc, 15,
-                                             &ui.thumb_label_w, &ui.thumb_label_h);
+                                             &ui.thumb_label_w, &ui.thumb_label_h, 0);
         av_strlcpy(ui.thumb_label, tc, sizeof(ui.thumb_label));
     }
     if (ui.thumb_label_tex) {
@@ -1386,7 +1398,7 @@ void ui_draw(SDL_Renderer *renderer, int win_w, int win_h,
     if (!ui.title_tex && ui.title[0]) {
         ui.title_scale = 1; /* system font renders at final size */
         ui.title_tex = render_text_sys(renderer, ui.title, TITLE_H - 14,
-                                       &ui.title_w, &ui.title_h);
+                                       &ui.title_w, &ui.title_h, 0);
         if (!ui.title_tex) { /* fallback: pixel font (ASCII only), drawn x2 */
             ui.title_scale = 2;
             ui.title_tex = render_text(renderer, ui.title,
@@ -1464,7 +1476,7 @@ controls:
             if (ui.badge_str[i][0])
                 ui.badge_tex[i] = render_text_sys(renderer, ui.badge_str[i],
                                                   16, &ui.badge_w[i],
-                                                  &ui.badge_h[i]);
+                                                  &ui.badge_h[i], 0);
         }
         ui.badges_dirty = 0;
     }

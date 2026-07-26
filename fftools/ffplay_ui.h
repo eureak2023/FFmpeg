@@ -121,6 +121,12 @@ int  ui_context_menu(int fsr_on, int nr_on, int fg_on, int lada_on, int jasna_on
  * font. Events may be added from decode threads; drawing and clearing
  * happen on the render thread. Times in seconds. */
 void ui_sub_add(double start, double end, const char *text);
+
+/* Rasterize UTF-8 text (newlines allowed) with the same system font the
+ * subtitles use, at px_h pixels tall. The caller owns the texture. NULL on
+ * failure, so callers can fall back to the built-in pixel font. */
+SDL_Texture *ui_render_text(SDL_Renderer *r, const char *utf8, int px_h,
+                            int *out_w, int *out_h);
 void ui_sub_add_ass(double start, double end, const char *ass);
 void ui_sub_clear(void);
 void ui_sub_draw(SDL_Renderer *renderer, int win_w, int win_h, double now);
