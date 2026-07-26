@@ -469,7 +469,7 @@ void ui_sub_draw(SDL_Renderer *renderer, int win_w, int win_h, double now)
     if (!subs.nlines)
         return;
 
-    y = win_h - win_h / 12;
+    y = win_h - win_h / 18;
     for (int i = subs.nlines - 1; i >= 0; i--) {
         SDL_Texture *t = subs.line_tex[i];
         SDL_Rect dst;
