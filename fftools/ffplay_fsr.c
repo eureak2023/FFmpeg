@@ -2901,13 +2901,22 @@ static void alb_build_lp(SDL_Renderer *renderer,
             } else if (d < labelR - 1.0f) {
                 out = 0xFF303030u;                  /* blank centre label */
             } else {
-                /* Glossy black platter with sparse, thin concentric grooves
-                 * (few widely-spaced rings, like a real record) rather than a
-                 * dense track texture. A narrow cosine ridge cut into a glossy
-                 * base gives the incised groove look. */
-                float ring   = 0.5f + 0.5f * cosf(d * 0.14f); /* 1 at ring centre */
+                /* Glossy black platter with thin grooves grouped into irregular
+                 * track bands, like a real pressed record rather than a machine-
+                 * perfect comb: the ring phase is warped so the spacing drifts,
+                 * a slow envelope opens a few smooth inter-track gaps, and the
+                 * groove depth varies so not every ring is equally dark. */
+                float warp   = 3.0f * sinf(d * 0.010f) +
+                               1.5f * sinf(d * 0.031f + 1.3f);   /* uneven pitch */
+                float ring   = 0.5f + 0.5f * cosf(d * 0.14f + warp);
                 float groove = ring * ring;
                 groove *= groove;                              /* pow(ring, 4): thin */
+
+                float gate = sinf(d * 0.070f + 1.7f * sinf(d * 0.017f));
+                if (gate > 0.82f)                              /* smooth track gap */
+                    groove *= (1.0f - gate) / 0.18f;
+                groove *= 0.80f + 0.20f * (0.5f + 0.5f * sinf(d * 0.043f));
+
                 float sh1 = 1.0f - fabsf(dx + dy) / (S * 0.9f);
                 float sh2 = 1.0f - fabsf(dx - dy) / (S * 0.9f);
                 int   base = 26 - (int)(groove * 16.0f);       /* glossy black, dark cuts */
