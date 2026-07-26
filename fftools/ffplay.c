@@ -4832,9 +4832,15 @@ static void stream_seek_frac(VideoState *is, double frac)
 static VideoState *switch_input(VideoState *old, char *filename)
 {
     VideoState *new_is;
+    int carry_volume = -1, carry_muted = 0;
 
-    if (old)
+    if (old) {
+        /* preserve the user's runtime volume/mute across the switch: a fresh
+         * VideoState would otherwise reset to startup_volume (stream_open). */
+        carry_volume = old->audio_volume;
+        carry_muted  = old->muted;
         stream_close(old);
+    }
     lada_stop();                /* re-point the restoration sidecar at the new file */
     input_filename = filename;
     ui_set_window(window, filename);
@@ -4844,6 +4850,10 @@ static VideoState *switch_input(VideoState *old, char *filename)
     if (!new_is) {
         av_log(NULL, AV_LOG_FATAL, "Failed to initialize VideoState!\n");
         do_exit(NULL);
+    }
+    if (carry_volume >= 0) {
+        new_is->audio_volume = carry_volume;
+        new_is->muted        = carry_muted;
     }
     return new_is;
 }
