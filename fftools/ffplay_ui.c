@@ -701,6 +701,33 @@ int ui_context_menu(int fsr_on, int nr_on, int fg_on, int lada_on, int jasna_on,
 #endif
 }
 
+#ifdef _WIN32
+/* Explorer-style open-dialog hook: when the dialog finishes initialising,
+ * force it to the top and give it the foreground. Without this, a borderless
+ * fullscreen (topmost) player window can end up drawn over the dialog. */
+static UINT_PTR CALLBACK ui_ofn_hook(HWND hdlg, UINT msg, WPARAM wParam,
+                                     LPARAM lParam)
+{
+    (void)wParam;
+    if (msg == WM_NOTIFY) {
+        LPOFNOTIFYW n = (LPOFNOTIFYW)lParam;
+
+        if (n && n->hdr.code == CDN_INITDONE) {
+            HWND top = GetParent(hdlg);     /* the real dialog window */
+
+            if (top) {
+                /* HWND_TOPMOST so it clears a fullscreen player window that is
+                 * itself topmost (HWND_TOP would only reach the normal band). */
+                SetWindowPos(top, HWND_TOPMOST, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                SetForegroundWindow(top);
+            }
+        }
+    }
+    return 0;
+}
+#endif
+
 /* Native "open file" dialog; returns an av_strdup'ed UTF-8 path or NULL. */
 char *ui_open_file_dialog(void)
 {
@@ -716,6 +743,9 @@ char *ui_open_file_dialog(void)
     wchar_t path[MAX_PATH] = L"";
     char utf8[MAX_PATH * 3];
     SDL_SysWMinfo wm;
+    HWND owner = NULL;
+    int  was_topmost = 0;
+    BOOL ok;
 
     if (!dlg)
         return NULL;
@@ -725,12 +755,35 @@ char *ui_open_file_dialog(void)
     ofn.lStructSize = sizeof(ofn);
     SDL_VERSION(&wm.version);
     if (ui.window && SDL_GetWindowWMInfo(ui.window, &wm))
-        ofn.hwndOwner = wm.info.win.window;
+        owner = wm.info.win.window;
+    ofn.hwndOwner   = owner;
     ofn.lpstrFile   = path;
     ofn.nMaxFile    = MAX_PATH;
     ofn.lpstrFilter = filter;
-    ofn.Flags       = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
-    if (!gofn(&ofn))
+    /* OFN_EXPLORER|OFN_ENABLEHOOK so ui_ofn_hook can raise the dialog above a
+     * fullscreen (topmost) player window. */
+    ofn.Flags       = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY |
+                      OFN_EXPLORER | OFN_ENABLEHOOK;
+    ofn.lpfnHook    = ui_ofn_hook;
+
+    /* A fullscreen player window is WS_EX_TOPMOST; the dialog, opened straight
+     * from the control-bar button, then lands behind it. (The right-click menu
+     * happens to normalise the window first, which is why that path already
+     * works.) Drop topmost + take foreground for the duration of the dialog. */
+    if (owner) {
+        was_topmost = (GetWindowLongPtrW(owner, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+        if (was_topmost)
+            SetWindowPos(owner, HWND_NOTOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        SetForegroundWindow(owner);
+    }
+
+    ok = gofn(&ofn);
+
+    if (owner && was_topmost)          /* restore the player's topmost state */
+        SetWindowPos(owner, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    if (!ok)
         return NULL;
     if (!WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, sizeof(utf8),
                              NULL, NULL))
