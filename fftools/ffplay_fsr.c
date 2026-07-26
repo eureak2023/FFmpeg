@@ -2844,6 +2844,12 @@ static void alb_build_lp(SDL_Renderer *renderer,
                     groove *= (1.0f - gate) / 0.18f;
                 groove *= 0.80f + 0.20f * (0.5f + 0.5f * sinf(d * 0.043f));
 
+                /* Smooth glossy black bands (no grooves): a thicker ring just
+                 * outside the centre label and a plain rim at the outer edge,
+                 * like a real pressed record. */
+                if (d < labelR + S * 0.045f || d > R - S * 0.055f)
+                    groove = 0.0f;
+
                 float sh1 = 1.0f - fabsf(dx + dy) / (S * 0.9f);
                 float sh2 = 1.0f - fabsf(dx - dy) / (S * 0.9f);
                 int   base = 14 - (int)(groove * 10.0f);       /* near-black platter, thin dark cuts */
@@ -2851,7 +2857,7 @@ static void alb_build_lp(SDL_Renderer *renderer,
 
                 if (sh1 > 0) base += (int)(sh1 * 7.0f);        /* subtle diagonal gloss */
                 if (sh2 > 0) base += (int)(sh2 * 7.0f);
-                if (d < labelR + 2.0f)   base = 200;      /* label rim */
+                if (d < labelR + 1.5f)   base += 35;      /* subtle label lip */
                 if (base < 0)   base = 0;
                 if (base > 255) base = 255;
                 if (d > R - 1.0f) {                        /* AA outer edge */
