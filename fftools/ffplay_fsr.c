@@ -2418,7 +2418,13 @@ int fsr_rife_active(int w, int h)
 static uint8_t     *rife_rgb[2];        /* the pair, packed RGB24 */
 static uint8_t     *rife_outbuf;
 static int          rife_bw, rife_bh;   /* size the buffers were made for */
-static const void  *rife_pa, *rife_pb;  /* frames rife_rgb[] currently holds */
+/* Which pair rife_rgb[] currently holds. The pts has to be part of the key:
+ * AVFrame structs come from a pool and their addresses are recycled, so a
+ * pointer-only check occasionally mistakes a *new* pair for the cached one
+ * and re-interpolates stale pixels - seen as an intermittent flicker. This
+ * mirrors how fg_prepare_pair() keys fg.pair_a/apts/b/bpts. */
+static const void  *rife_pa, *rife_pb;
+static int64_t      rife_apts, rife_bpts;
 static SDL_Texture *rife_tex;
 
 static void rife_free_buffers(void)
@@ -2432,6 +2438,7 @@ static void rife_free_buffers(void)
     }
     rife_bw = rife_bh = 0;
     rife_pa = rife_pb = NULL;
+    rife_apts = rife_bpts = AV_NOPTS_VALUE;
 }
 
 static int rife_ensure_buffers(SDL_Renderer *renderer, int w, int h)
@@ -2479,10 +2486,11 @@ static int rife_fetch_pair(int sp, int sn)
 
 /* Returns 1 if the interpolated frame was drawn, 0 to fall back to the warp. */
 static int rife_fg_draw(SDL_Renderer *renderer, int sp, int sn,
-                        const SDL_Rect *rect, float phase)
+                        const SDL_Rect *rect, float phase,
+                        int fsr_on, float sharpness)
 {
     void *pixels;
-    int   pitch;
+    int   pitch, engaged;
 
     if (!rife_size_supported(fg.w, fg.h))
         return 0;
@@ -2491,12 +2499,15 @@ static int rife_fg_draw(SDL_Renderer *renderer, int sp, int sn,
     if (rife_ensure_buffers(renderer, fg.w, fg.h) < 0)
         return 0;
 
-    /* Re-read only when this is a different frame pair. */
-    if (rife_pa != fg.pair_a || rife_pb != fg.pair_b) {
+    /* Re-read only when this is a different frame pair (pointer *and* pts). */
+    if (rife_pa != fg.pair_a || rife_apts != fg.pair_apts ||
+        rife_pb != fg.pair_b || rife_bpts != fg.pair_bpts) {
         if (rife_fetch_pair(sp, sn) < 0)
             return 0;
-        rife_pa = fg.pair_a;
-        rife_pb = fg.pair_b;
+        rife_pa   = fg.pair_a;
+        rife_apts = fg.pair_apts;
+        rife_pb   = fg.pair_b;
+        rife_bpts = fg.pair_bpts;
     }
 
     if (rife_interpolate(rife_rgb[0], rife_rgb[1], fg.w, fg.h,
@@ -2512,7 +2523,40 @@ static int rife_fg_draw(SDL_Renderer *renderer, int sp, int sn,
                rife_outbuf + (size_t)y * fg.w * 3, (size_t)fg.w * 3);
     SDL_UnlockTexture(rife_tex);
 
-    hwgl.last_frame = NULL;             /* the target no longer holds a real frame */
+    /* Send the generated frame through exactly the passes a real frame takes
+     * (fsr_hw_draw): EASU+RCAS when upscaling, the copy shader otherwise -
+     * both of which also tone-map HDR. Presenting rife_tex directly instead
+     * left the generated frames as the only unsharpened, un-tone-mapped ones,
+     * so every other frame looked different and the picture pulsed. */
+    engaged = fsr_on && (rect->w > fg.w || rect->h > fg.h);
+    if (ensure_textures(renderer, fg.w, fg.h, rect->w, rect->h) >= 0) {
+        int ok;
+
+        if (engaged) {
+            GLfloat con0[4];
+
+            con0[0] = (GLfloat)fg.w / rect->w;
+            con0[1] = (GLfloat)fg.h / rect->h;
+            con0[2] = 0.5f * con0[0] - 0.5f;
+            con0[3] = 0.5f * con0[1] - 0.5f;
+            ok = run_pass(renderer, easu_prog, rife_tex, easu_tex,
+                          rect->w, rect->h, con0, 0.0f) >= 0 &&
+                 run_pass(renderer, rcas_prog, easu_tex, out_tex,
+                          rect->w, rect->h, NULL, exp2f(-sharpness)) >= 0;
+        } else {
+            ok = run_pass(renderer, copy_prog, rife_tex, out_tex,
+                          rect->w, rect->h, NULL, 0.0f) >= 0;
+        }
+        if (ok) {
+            hwgl.last_frame = NULL;     /* out_tex no longer holds a real frame */
+            SDL_SetRenderTarget(renderer, NULL);
+            SDL_RenderCopy(renderer, out_tex, NULL, rect);
+            return 1;
+        }
+    }
+
+    /* Passes unavailable: show the frame unprocessed rather than dropping it. */
+    hwgl.last_frame = NULL;
     SDL_SetRenderTarget(renderer, NULL);
     SDL_RenderCopy(renderer, rife_tex, NULL, rect);
     return 1;
@@ -2530,7 +2574,7 @@ int fsr_fg_draw(SDL_Renderer *renderer, AVFrame *prev, AVFrame *next,
 
     /* RIFE replaces the warp entirely when it is on and the frame is small
      * enough to fit the time budget; it falls through to the warp otherwise. */
-    if (fsr_rife && rife_fg_draw(renderer, sp, sn, rect, phase))
+    if (fsr_rife && rife_fg_draw(renderer, sp, sn, rect, phase, fsr_on, sharpness))
         return 1;
 
     engaged = fsr_on && (rect->w > fg.w || rect->h > fg.h);
