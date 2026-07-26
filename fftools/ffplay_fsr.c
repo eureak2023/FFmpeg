@@ -2835,7 +2835,8 @@ static void alb_build_lp(SDL_Renderer *renderer,
                                1.5f * sinf(d * 0.031f + 1.3f);   /* uneven pitch */
                 float ring   = 0.5f + 0.5f * cosf(d * 0.14f + warp);
                 float groove = ring * ring;
-                groove *= groove;                              /* pow(ring, 4): thin */
+                groove *= groove;                              /* pow(ring, 4)  */
+                groove *= groove;                              /* pow(ring, 8): thin lines */
 
                 float gate = sinf(d * 0.070f + 1.7f * sinf(d * 0.017f));
                 if (gate > 0.82f)                              /* smooth track gap */
@@ -2844,11 +2845,11 @@ static void alb_build_lp(SDL_Renderer *renderer,
 
                 float sh1 = 1.0f - fabsf(dx + dy) / (S * 0.9f);
                 float sh2 = 1.0f - fabsf(dx - dy) / (S * 0.9f);
-                int   base = 26 - (int)(groove * 16.0f);       /* glossy black, dark cuts */
+                int   base = 14 - (int)(groove * 10.0f);       /* near-black platter, thin dark cuts */
                 uint8_t A = 255;
 
-                if (sh1 > 0) base += (int)(sh1 * 12.0f);
-                if (sh2 > 0) base += (int)(sh2 * 12.0f);
+                if (sh1 > 0) base += (int)(sh1 * 7.0f);        /* subtle diagonal gloss */
+                if (sh2 > 0) base += (int)(sh2 * 7.0f);
                 if (d < labelR + 2.0f)   base = 200;      /* label rim */
                 if (base < 0)   base = 0;
                 if (base > 255) base = 255;
@@ -2997,9 +2998,14 @@ void fsr_album_reset(void)
     /* Keep the blob sprite, phases and rotation angle across files. */
 }
 
+/* Bottom margin below the FFT-visualizer band, as a fraction of the output
+ * height. Raised well above the panel edge so the band clears the text-subtitle
+ * area (subtitles sit at ~win_h - win_h/12), which would otherwise overlap. */
+#define VIS_BAND_BOTTOM_FRAC 0.12f
+
 /* Height of the bottom FFT-visualizer band for a given output height. Shared
  * by the album view (to sit clear above it) and fsr_vis_draw (which draws it).
- * The band occupies this height plus a small bottom margin (oh * 0.04). */
+ * The band occupies this height plus the VIS_BAND_BOTTOM_FRAC bottom margin. */
 static float vis_band_h(int oh)
 {
     float h = oh * 0.20f;
@@ -3072,7 +3078,7 @@ void fsr_album_draw(SDL_Renderer *renderer, int playing)
      * Vertically centre the pair in the room ABOVE the visualizer band so the
      * two never overlap. */
     {
-        float avail     = oh - (oh * 0.04f + vis_band_h(oh));
+        float avail     = oh - (oh * VIS_BAND_BOTTOM_FRAC + vis_band_h(oh));
         float albumSize = minside * 0.55f;
         float lpSize, exposed, totalW, startX, startY;
 
@@ -3082,7 +3088,9 @@ void fsr_album_draw(SDL_Renderer *renderer, int playing)
         exposed = lpSize * 0.55f;
         totalW  = albumSize + (exposed - (albumSize - lpSize) / 2.0f);
         startX  = (ow - totalW) / 2.0f;
-        startY  = (avail - albumSize) / 2.0f;
+        /* Bias below centre (0.68 of the slack, vs 0.5) so the cover + record
+         * sit a little lower in the room above the visualizer band. */
+        startY  = (avail - albumSize) * 0.68f;
         float wob       = sinf(alb_angle * 0.01745329f) * (albumSize * 0.012f);
         float lpcx      = startX + albumSize + lpSize * 0.05f;
         float lpcy      = startY + albumSize / 2.0f + wob;
@@ -3288,7 +3296,7 @@ void fsr_vis_draw(SDL_Renderer *renderer, const float *mono, int nsamp,
     if (ow <= 0 || oh <= 0)
         return;
     bandH  = vis_band_h(oh);
-    midY   = oh - oh * 0.04f - bandH * 0.5f;
+    midY   = oh - oh * VIS_BAND_BOTTOM_FRAC - bandH * 0.5f;
     barW   = (float)ow / (VIS_BARS * 2.0f);
     offset = barW * 0.5f;
     maxAmp = bandH;

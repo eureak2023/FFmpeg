@@ -1683,6 +1683,116 @@ static void ui_draw_overlay(VideoState *is)
             is->audio_volume / (double)SDL_MIX_MAXVOLUME);
 }
 
+/* Parse one LRC timestamp "[mm:ss.cc]" (or "[mm:ss]") at p; on success store
+ * the time in seconds and return the pointer just past ']'. Returns NULL if the
+ * bracket is not a numeric timestamp (e.g. a "[ti:]"/"[ar:]" metadata tag). */
+static const char *parse_lrc_time(const char *p, const char *end, double *out)
+{
+    int mm = 0, ss = 0;
+    double frac = 0.0, scale = 0.1;
+
+    if (p >= end || *p != '[')                return NULL;
+    p++;
+    if (p >= end || *p < '0' || *p > '9')     return NULL;   /* not a time tag */
+    while (p < end && *p >= '0' && *p <= '9') { mm = mm * 10 + (*p - '0'); p++; }
+    if (p >= end || *p != ':')                return NULL;
+    p++;
+    if (p >= end || *p < '0' || *p > '9')     return NULL;
+    while (p < end && *p >= '0' && *p <= '9') { ss = ss * 10 + (*p - '0'); p++; }
+    if (p < end && (*p == '.' || *p == ':')) {                /* fractional part */
+        p++;
+        while (p < end && *p >= '0' && *p <= '9') {
+            frac += (*p - '0') * scale; scale *= 0.1; p++;
+        }
+    }
+    if (p >= end || *p != ']')                return NULL;
+    *out = mm * 60.0 + ss + frac;
+    return p + 1;
+}
+
+/* Show songs whose lyrics live in an ID3 "lyrics" metadata tag (LRC format)
+ * as text subtitles, so they appear on the album view even without a real
+ * subtitle stream. Each timestamped line is shown until the next one; lines
+ * may carry several timestamps (repeated choruses) and non-time "[xx:...]"
+ * tags are skipped. Only used when the file has no subtitle stream. */
+struct LrcEvent { double t; char *txt; };
+
+static void load_embedded_lyrics(VideoState *is)
+{
+    AVDictionaryEntry *e;
+    struct LrcEvent ev[2048];
+    int n = 0;
+    const char *s;
+
+    if (!is->ic)
+        return;
+    e = av_dict_get(is->ic->metadata, "lyrics", NULL, AV_DICT_IGNORE_SUFFIX);
+    if (!e && is->audio_st)
+        e = av_dict_get(is->audio_st->metadata, "lyrics", NULL, AV_DICT_IGNORE_SUFFIX);
+    if (!e || !e->value)
+        return;
+
+    for (s = e->value; *s && n < 2048; ) {
+        const char *nl  = strchr(s, '\n');
+        const char *end = nl ? nl : s + strlen(s);
+        const char *p   = s;
+        double times[32];
+        int    nt = 0;
+        char  *txt;
+        int    len;
+
+        while (nt < 32) {                       /* leading timestamps */
+            double t;
+            const char *q = parse_lrc_time(p, end, &t);
+            if (!q) break;
+            times[nt++] = t;
+            p = q;
+        }
+        if (nt > 0) {
+            const char *te = end;
+            while (p < te && (*p == ' ' || *p == '\t')) p++;      /* trim left  */
+            while (te > p && (te[-1] == '\r' || te[-1] == ' ' ||
+                              te[-1] == '\t')) te--;              /* trim right */
+            len = (int)(te - p);
+            txt = av_malloc(len + 1);
+            if (txt) {
+                memcpy(txt, p, len);
+                txt[len] = '\0';
+                for (int i = 0; i < nt && n < 2048; i++)
+                    { ev[n].t = times[i]; ev[n].txt = txt; n++; }
+                /* txt is shared across this line's events; freed once below */
+            }
+        }
+        s = nl ? nl + 1 : end;
+    }
+    if (n == 0)
+        return;
+
+    /* sort events by time (insertion sort; n is small and near-sorted) */
+    for (int i = 1; i < n; i++) {
+        struct LrcEvent key = ev[i];
+        int j = i - 1;
+        while (j >= 0 && ev[j].t > key.t) { ev[j + 1] = ev[j]; j--; }
+        ev[j + 1] = key;
+    }
+
+    subtitle_shown = 1;
+    for (int i = 0; i < n; i++) {
+        double startt = ev[i].t;
+        double endt   = (i + 1 < n) ? ev[i + 1].t : startt + 5.0;
+        if (endt <= startt) endt = startt + 0.5;
+        if (endt > startt + 8.0) endt = startt + 8.0;      /* cap long gaps */
+        if (ev[i].txt && ev[i].txt[0])
+            ui_sub_add(startt, endt, ev[i].txt);
+    }
+    /* free each distinct text buffer once (adjacent duplicates share a pointer) */
+    for (int i = 0; i < n; i++) {
+        int dup = 0;
+        for (int j = 0; j < i; j++) if (ev[j].txt == ev[i].txt) { dup = 1; break; }
+        if (!dup) av_free(ev[i].txt);
+    }
+}
+
 /* display the current picture, if any */
 /* True when playback is audio-only and should use the album-art LP visualizer:
  * an audio stream with either no video at all or only an attached cover
@@ -4051,6 +4161,11 @@ static int read_thread(void *arg)
     if (st_index[AVMEDIA_TYPE_SUBTITLE] >= 0) {
         stream_component_open(is, st_index[AVMEDIA_TYPE_SUBTITLE]);
     }
+
+    /* No subtitle stream? Fall back to embedded LRC lyrics (common in music
+     * files), so audio-only playback still shows synced words. */
+    if (is->subtitle_stream < 0)
+        load_embedded_lyrics(is);
 
     if (is->video_stream < 0 && is->audio_stream < 0) {
         av_log(NULL, AV_LOG_FATAL, "Failed to open file '%s' or configure filtergraph\n",
