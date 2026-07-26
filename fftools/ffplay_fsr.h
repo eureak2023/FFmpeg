@@ -159,6 +159,20 @@ int   fsr_single_instance_forward(const char *path);
 void  fsr_single_instance_setup(SDL_Window *window);
 char *fsr_single_instance_take_path(void);
 
+/* Return an av_malloc'd path to the next (dir=+1) or previous (dir=-1)
+ * playable media file in the same directory as cur_path, sorted
+ * case-insensitively by name and wrapping around at the ends. NULL if there
+ * is no other media file or on error. Used by the PgUp/PgDn playlist hotkeys.
+ * Non-Windows builds return NULL. */
+char *fsr_sibling_media_path(const char *cur_path, int dir);
+
+/* Show a modal confirmation (owned by window) asking whether to delete
+ * utf8_path; returns 1 if the user confirmed. fsr_delete_file() sends the
+ * (already-closed) file to the Recycle Bin, returning 0 on success. Used by
+ * the Delete hotkey. Non-Windows builds are no-ops. */
+int   fsr_confirm_delete(SDL_Window *window, const char *utf8_path);
+int   fsr_delete_file(const char *utf8_path);
+
 /* Destroy GL programs and intermediate textures. Call before the renderer
  * is destroyed. */
 void fsr_uninit(void);
