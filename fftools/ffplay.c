@@ -4164,8 +4164,35 @@ static int read_thread(void *arg)
 
     /* No subtitle stream? Fall back to embedded LRC lyrics (common in music
      * files), so audio-only playback still shows synced words. */
-    if (is->subtitle_stream < 0)
+    if (is->subtitle_stream < 0) {
         load_embedded_lyrics(is);
+
+        /* For album (audio-only) playback, show "Title / Artist" in the caption
+         * area whenever no lyric line is active: a persistent full-duration cue
+         * at t=0 that any timed lyric line (later start) supersedes. */
+        if (is->audio_st &&
+            (!is->video_st ||
+             (is->video_st->disposition & AV_DISPOSITION_ATTACHED_PIC))) {
+            AVDictionaryEntry *t = av_dict_get(is->ic->metadata, "title", NULL, 0);
+            AVDictionaryEntry *a = av_dict_get(is->ic->metadata, "artist", NULL, 0);
+            char cap[512];
+
+            if (!a) a = av_dict_get(is->ic->metadata, "album_artist", NULL, 0);
+            cap[0] = '\0';
+            if (t && a && t->value[0] && a->value[0])
+                snprintf(cap, sizeof(cap), "%s / %s", t->value, a->value);
+            else if (t && t->value[0])
+                snprintf(cap, sizeof(cap), "%s", t->value);
+            else if (a && a->value[0])
+                snprintf(cap, sizeof(cap), "%s", a->value);
+            if (cap[0]) {
+                double dur = is->ic->duration != AV_NOPTS_VALUE ?
+                             is->ic->duration / (double)AV_TIME_BASE : 0.0;
+                subtitle_shown = 1;
+                ui_sub_add(0.0, dur > 1.0 ? dur : 1e9, cap);
+            }
+        }
+    }
 
     if (is->video_stream < 0 && is->audio_stream < 0) {
         av_log(NULL, AV_LOG_FATAL, "Failed to open file '%s' or configure filtergraph\n",
@@ -4937,6 +4964,12 @@ static void event_loop(VideoState *cur_stream)
 
     for (;;) {
         double x;
+        char *forwarded = fsr_single_instance_take_path();
+
+        if (forwarded) {            /* another launch handed us a file to play */
+            cur_stream = switch_input(cur_stream, forwarded);
+            continue;
+        }
         refresh_loop_wait_event(cur_stream, &event);
         switch (handle_ui_event(cur_stream, &event)) {
         case 2: { /* open-file dialog */
@@ -5523,6 +5556,15 @@ int main(int argc, char **argv)
         exit(1);
     }
 
+    /* Single instance: if a player is already running, hand it this file and
+     * exit so the click reuses the open window instead of spawning another. */
+    if (!display_disable && !fsr_single_instance_begin()) {
+        if (input_filename && fsr_single_instance_forward(input_filename) == 0)
+            exit(0);
+        /* primary not reachable (still starting?): fall through and run
+         * normally rather than dropping the file. */
+    }
+
     if (!input_filename && display_disable) {
         show_usage();
         av_log(NULL, AV_LOG_FATAL, "An input file must be specified\n");
@@ -5630,6 +5672,10 @@ int main(int argc, char **argv)
                        "FG: hardware optical flow unavailable, frame generation disabled\n");
             update_fg_refresh();
         }
+        /* Tag this window as the primary and start receiving forwarded files
+         * from later launches (single-instance). */
+        if (window)
+            fsr_single_instance_setup(window);
     }
 
     /* Hardware decoding by default on Windows; explicit -hwaccel (or 'none')
