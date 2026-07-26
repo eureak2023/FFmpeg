@@ -3244,6 +3244,41 @@ void fsr_vis_reset(void)
         vis_target[i] = vis_disp[i] = vis_rise[i] = 0.0f;
 }
 
+/* Fill a vertical "capsule": a bar of width w whose top and bottom ends are
+ * rounded into semicircles of radius w/2, so the spectrum bars read as pills
+ * instead of hard rectangles. The current render draw color is used. The two
+ * rounded caps are painted as stacked 1px horizontal scanlines whose width
+ * follows the circle chord, meeting the straight middle section seamlessly. */
+static void vis_fill_capsule(SDL_Renderer *renderer, float x, float y,
+                             float w, float h)
+{
+    float r  = w * 0.5f;
+    float cx = x + r;
+    int   ri, dy;
+    SDL_FRect rc;
+
+    if (r > h * 0.5f) r = h * 0.5f;         /* short bar: bound cap by height */
+
+    /* straight middle section between the two caps */
+    rc.x = x;  rc.y = y + r;  rc.w = w;  rc.h = h - 2.0f * r;
+    if (rc.h > 0.0f)
+        SDL_RenderFillRectF(renderer, &rc);
+
+    ri = (int)ceilf(r);
+    for (dy = 0; dy < ri; dy++) {
+        float fy   = dy + 0.5f;
+        float half = (fy < r) ? sqrtf(r * r - fy * fy) : 0.0f;
+        if (half <= 0.0f) continue;
+        rc.x = cx - half;
+        rc.w = half * 2.0f;
+        rc.h = 1.0f;
+        rc.y = (y + r) - dy - 1.0f;         /* top cap, growing upward */
+        SDL_RenderFillRectF(renderer, &rc);
+        rc.y = (y + h - r) + dy;            /* bottom cap, growing downward */
+        SDL_RenderFillRectF(renderer, &rc);
+    }
+}
+
 void fsr_vis_draw(SDL_Renderer *renderer, const float *mono, int nsamp,
                   int playing)
 {
@@ -3370,17 +3405,13 @@ void fsr_vis_draw(SDL_Renderer *renderer, const float *mono, int nsamp,
         float amp = vis_disp[i] * maxAmp;
         float hue = fmodf((float)i / VIS_BARS * 360.0f + t * VIS_COLOR_SPEED,
                           360.0f);
-        SDL_FRect rc;
         uint8_t r, g, b;
 
         if (amp < barW) amp = barW;                     /* min visible nub */
         alb_hsv(hue, 0.85f, 1.0f, &r, &g, &b);
         SDL_SetRenderDrawColor(renderer, r, g, b, VIS_BAR_ALPHA);
-        rc.x = barW * i * 2.0f + offset;
-        rc.y = midY - amp * 0.5f;
-        rc.w = barW;
-        rc.h = amp;
-        SDL_RenderFillRectF(renderer, &rc);
+        vis_fill_capsule(renderer, barW * i * 2.0f + offset,
+                         midY - amp * 0.5f, barW, amp);
     }
 
     SDL_SetRenderDrawBlendMode(renderer, prev_bm);
