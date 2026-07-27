@@ -1648,18 +1648,21 @@ typedef NV_OF_STATUS (NVOFAPI *PFN_NvOFAPICreateInstanceCuda)(uint32_t apiVer,
  * 2x2 buys 4x the flow resolution and still fits at both sizes. Note the
  * flow is computed once per *pair*, not per generated frame, so this cost
  * does not scale with the FG multiplier (unlike RIFE).
- * FG_GRID_STR must match FG_GRID - the shader divides by it. */
+ * The grid is a runtime value (fg.grid): nvOFInit is tried at FG_GRID first and
+ * falls back to 4 on GPUs that reject the finer grid (Turing and earlier only
+ * support 4), so the shader gets it through the flowGrid uniform rather than a
+ * compile-time constant. */
 #define FG_GRID     2
-#define FG_GRID_STR "2.0"
 
 static const char *fg_src =
     "#version 330\n"
     "uniform sampler2D prevTex;\n"
     "uniform sampler2D curTex;\n"
-    "uniform isampler2D flowFwd;\n" /* prev->cur, S10.5 px, grid 4 */
+    "uniform isampler2D flowFwd;\n" /* prev->cur, S10.5 px, flowGrid px/vec */
     "uniform isampler2D flowBwd;\n" /* cur->prev */
     "uniform float phase;\n"        /* interpolation position, 0=prev 1=cur */
     "uniform vec2 outSize;\n"       /* render size; may differ from native */
+    "uniform float flowGrid;\n"     /* flow-field grid size (px per vector) */
     "out vec4 fragColor;\n"
     HDR_TM_GLSL
     /* Bilinearly sample the 4x4-grid flow field (integer texture, so the
@@ -1679,7 +1682,7 @@ static const char *fg_src =
     "void main() {\n"
     "    vec2 ts = vec2(textureSize(curTex, 0));\n"
     "    vec2 uv = gl_FragCoord.xy / outSize;\n"
-    "    vec2 pg = uv * ts / " FG_GRID_STR ";\n"
+    "    vec2 pg = uv * ts / flowGrid;\n"
     "    vec2 F = sampleFlow(flowFwd, pg);\n"
     "    vec2 B = sampleFlow(flowBwd, pg);\n"
     "    vec3 cPrev = texture(prevTex, uv - phase * F / ts).rgb;\n"
@@ -1707,6 +1710,7 @@ static struct {
     NV_OF_CUDA_API_FUNCTION_LIST of;
     NvOFHandle hof;
     int w, h, gw, gh;             /* session and flow-grid dimensions */
+    int grid;                     /* flow-grid size actually in use (2 or 4) */
     NvOFGPUBufferHandle in_buf[2];
     NvOFGPUBufferHandle flow_buf[2];      /* [0] = forward, [1] = backward */
     NV_OF_CUDA_BUFFER_STRIDE_INFO flow_stride[2];
@@ -1722,6 +1726,7 @@ static struct {
     GLuint prog;
     GLint phase_loc;
     GLint outsize_loc;
+    GLint flowgrid_loc;
     GLint hdr_loc, peak_loc;
     const void *in_frame[2];              /* what each OF input buffer holds */
     int64_t in_pts[2];
@@ -1918,21 +1923,42 @@ static int fg_init_body(void)
     char last_err[256];
 
 
+    /* Try the preferred (finer) grid first, then fall back to 4. Turing and
+     * earlier only support grid 4 and reject 2/1 with an init error; Ampere+
+     * take the finer grids. */
+    int grids[2] = { FG_GRID, 4 };
+    int ngrids   = FG_GRID == 4 ? 1 : 2;
+    int got      = 0;
+
     ip.width       = fg.w;
     ip.height      = fg.h;
-    ip.outGridSize = (NV_OF_OUTPUT_VECTOR_GRID_SIZE)FG_GRID;
     ip.mode        = NV_OF_MODE_OPTICALFLOW;
     /* Best flow quality up to 1080p; above that the SLOW preset costs too
      * much of the frame budget to sustain 60 presented fps. */
     ip.perfLevel   = fg.w * fg.h > 1920 * 1080 ? NV_OF_PERF_LEVEL_MEDIUM
                                                : NV_OF_PERF_LEVEL_SLOW;
-    if (fg.of.nvOFInit(fg.hof, &ip) != NV_OF_SUCCESS) {
+    for (int i = 0; i < ngrids; i++) {
+        ip.outGridSize = (NV_OF_OUTPUT_VECTOR_GRID_SIZE)grids[i];
+        if (fg.of.nvOFInit(fg.hof, &ip) == NV_OF_SUCCESS) {
+            fg.grid = grids[i];
+            got = 1;
+            break;
+        }
+    }
+    if (!got) {
         last_err_sz = sizeof(last_err);
         last_err[0] = 0;
         fg.of.nvOFGetLastError(fg.hof, last_err, &last_err_sz);
         av_log(NULL, AV_LOG_WARNING, "FG: optical flow init failed: %s\n", last_err);
         return -1;
     }
+    if (fg.grid != FG_GRID)
+        av_log(NULL, AV_LOG_INFO,
+               "FG: grid %d unsupported here, using grid %d\n", FG_GRID, fg.grid);
+
+    /* Flow-buffer dimensions follow the grid actually granted. */
+    fg.gw = (fg.w + fg.grid - 1) / fg.grid;
+    fg.gh = (fg.h + fg.grid - 1) / fg.grid;
 
     bd.width        = fg.w;
     bd.height       = fg.h;
@@ -2021,10 +2047,11 @@ static int fg_init_body(void)
                 gl.Uniform1i(loc, i);
         }
         gl.UseProgram(prev_prog);
-        fg.phase_loc   = gl.GetUniformLocation(fg.prog, "phase");
-        fg.outsize_loc = gl.GetUniformLocation(fg.prog, "outSize");
-        fg.hdr_loc     = gl.GetUniformLocation(fg.prog, "hdrMode");
-        fg.peak_loc    = gl.GetUniformLocation(fg.prog, "hdrPeak");
+        fg.phase_loc    = gl.GetUniformLocation(fg.prog, "phase");
+        fg.outsize_loc  = gl.GetUniformLocation(fg.prog, "outSize");
+        fg.flowgrid_loc = gl.GetUniformLocation(fg.prog, "flowGrid");
+        fg.hdr_loc      = gl.GetUniformLocation(fg.prog, "hdrMode");
+        fg.peak_loc     = gl.GetUniformLocation(fg.prog, "hdrPeak");
     }
     return 0;
 }
@@ -2195,6 +2222,7 @@ static int fg_warp(SDL_Renderer *renderer, int sp, int sn, float phase,
     gl.UseProgram(fg.prog);
     gl.Uniform1f(fg.phase_loc, phase);
     gl.Uniform2f(fg.outsize_loc, (GLfloat)ow, (GLfloat)oh);
+    gl.Uniform1f(fg.flowgrid_loc, (GLfloat)fg.grid);
     gl.Uniform1f(fg.hdr_loc, tonemap && hdr_active ? 1.0f : 0.0f);
     gl.Uniform1f(fg.peak_loc, hdr_peak);
     gl.DrawArrays(GL_TRIANGLES, 0, 3);
