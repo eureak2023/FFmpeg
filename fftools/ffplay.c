@@ -390,6 +390,11 @@ static float fsr_sharpness = 0.0f; /* RCAS attenuation stops, 0 = maximum sharpn
 static int fsr_denoise = 0;
 static int fsr_fg = 1;             /* frame generation (hardware optical flow) */
 static int fsr_rife = 1;           /* ...using RIFE instead, where it fits */
+static int fg_rife_pref = 1;       /* persisted RIFE/FLOW choice; only the 'r'
+                                    * hotkey changes it, so an audio-only file or
+                                    * a failed RIFE boot (which force fsr_rife off
+                                    * for the session) don't overwrite the user's
+                                    * last engine pick in ffplay.ini */
 static int fg_mult = 2;            /* interpolation factor: 2/3/4 -> source x2/x3/x4,
                                     * capped by the display refresh (cannot present
                                     * faster than the panel) */
@@ -1513,6 +1518,8 @@ static void load_settings(void)
             audio_stereo = !!v;
         else if (sscanf(line, "video_scaling=%d", &v) == 1 && v >= 0 && v <= 2)
             video_scaling = v;
+        else if (sscanf(line, "fg_rife=%d", &v) == 1)
+            fg_rife_pref = fsr_rife = !!v;
     }
     fclose(f);
 }
@@ -1538,6 +1545,7 @@ static void save_settings(VideoState *is)
     fprintf(f, "volume=%d\n", av_clip(vol, 0, 100));
     fprintf(f, "audio_stereo=%d\n", audio_stereo);
     fprintf(f, "video_scaling=%d\n", video_scaling);
+    fprintf(f, "fg_rife=%d\n", fg_rife_pref);
     fclose(f);
 }
 
@@ -5261,6 +5269,7 @@ static void event_loop(VideoState *cur_stream)
             case SDLK_r:
                 /* A/B the two frame-generation engines on the same scene. */
                 fsr_rife = !fsr_rife;
+                fg_rife_pref = fsr_rife;   /* remember this pick for next launch */
                 fsr_rife_set(fsr_rife);
                 av_log(NULL, AV_LOG_INFO, "Frame generation: %s\n",
                        fsr_rife ? "RIFE" : "optical flow");
