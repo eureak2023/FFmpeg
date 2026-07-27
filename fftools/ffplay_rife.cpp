@@ -36,13 +36,16 @@ extern "C" {
 }
 
 #include "ffplay_rife.h"
+#include "ffplay_res.h"
 
 #ifdef _WIN32
 #include <windows.h>
+#include <setjmp.h>
 #endif
 
-/* Model directory name, looked up next to the executable. */
-#define RIFE_MODEL_DIR "rife-v4.6"
+/* Model name, used only for log messages; the weights themselves are embedded
+ * in the executable as RCDATA (see ffplay_res.rc) and loaded from memory. */
+#define RIFE_MODEL_NAME "rife-v4.6"
 
 /* Upper bound on what we hand to RIFE. Measured cost per generated frame on
  * an RTX 5080: 4.9 ms at 720p, 10.2 ms at 1080p, 45.9 ms at 4K - against a
@@ -55,24 +58,102 @@ extern "C" {
 static RIFE *rife_ctx;
 static int   rife_state;        /* 0 = untried, 1 = ready, -1 = unavailable */
 
-/* Absolute path of the model directory that sits beside ffplay.exe. Returns
- * an empty string if it cannot be determined. */
+/* Point at an embedded RCDATA resource; returns NULL and leaves *len untouched
+ * if the resource is missing. The returned pointer is owned by the loaded
+ * module image and stays valid for the process lifetime. */
 #ifdef _WIN32
-static std::wstring rife_model_dir(void)
+static const unsigned char *rife_resource(int id, size_t *len)
 {
-    wchar_t exe[MAX_PATH];
-    DWORD   n = GetModuleFileNameW(NULL, exe, MAX_PATH);
-    std::wstring p;
+    HMODULE mod = GetModuleHandleW(NULL);
+    HRSRC   res = FindResourceW(mod, MAKEINTRESOURCEW(id), (LPCWSTR)RT_RCDATA);
+    HGLOBAL h;
+
+    if (!res)
+        return NULL;
+    h = LoadResource(mod, res);
+    if (!h)
+        return NULL;
+    *len = SizeofResource(mod, res);
+    return (const unsigned char *)LockResource(h);
+}
+#endif
+
+#ifdef _WIN32
+/* Write one embedded blob to <dir>\<name>. Returns 0 on success. */
+static int rife_write_file(const std::wstring& dir, const wchar_t* name,
+                           const unsigned char* data, size_t len)
+{
+    std::wstring path = dir + L"\\" + name;
+    FILE *f = _wfopen(path.c_str(), L"wb");
+    size_t wrote;
+
+    if (!f)
+        return -1;
+    wrote = fwrite(data, 1, len, f);
+    fclose(f);
+    return wrote == len ? 0 : -1;
+}
+
+/* Extract the embedded flownet model to a private temp directory and return
+ * its path, so the validated file-based loader can read it. ncnn's in-memory
+ * loader references (and internally writes to) the buffer, which faults on the
+ * read-only resource section, so a real file is used instead. Empty on error. */
+static std::wstring rife_extract_model(const unsigned char* param, size_t param_len,
+                                       const unsigned char* bin, size_t bin_len)
+{
+    wchar_t tmp[MAX_PATH];
+    DWORD   n = GetTempPathW(MAX_PATH, tmp);
+    std::wstring dir;
 
     if (!n || n >= MAX_PATH)
-        return p;
-    p.assign(exe, n);
-    size_t slash = p.find_last_of(L"\\/");
-    if (slash == std::wstring::npos)
         return std::wstring();
-    p.resize(slash + 1);
-    p += L"" RIFE_MODEL_DIR;
-    return p;
+    dir.assign(tmp, n);
+    dir += L"ffplay-rife-v4.6";
+    /* ERROR_ALREADY_EXISTS is fine; any other failure is fatal below. */
+    CreateDirectoryW(dir.c_str(), NULL);
+
+    if (rife_write_file(dir, L"flownet.param", param, param_len) != 0 ||
+        rife_write_file(dir, L"flownet.bin",   bin,   bin_len)   != 0)
+        return std::wstring();
+    return dir;
+}
+#endif
+
+#ifdef _WIN32
+/* ncnn's Vulkan weight upload segfaults on some GPUs/drivers (observed on the
+ * GTX 1660 Ti) instead of returning an error. MinGW's GCC has no __try/__except,
+ * so a vectored exception handler catches the access violation and longjmps
+ * back, turning the crash into a clean failure; the player then falls back to
+ * optical-flow frame generation rather than dying at startup. Only faults on
+ * the loading thread are handled, so a stray fault elsewhere is left alone. */
+static jmp_buf       rife_crash_jmp;
+static DWORD         rife_load_tid;
+
+static LONG CALLBACK rife_crash_veh(EXCEPTION_POINTERS *info)
+{
+    if (info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION &&
+        GetCurrentThreadId() == rife_load_tid) {
+        longjmp(rife_crash_jmp, 1);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* Returns load()'s value, or -2 if the load crashed. Holds no C++ locals that
+ * would need unwinding across the longjmp. */
+static int rife_guarded_load(RIFE *ctx, const std::wstring &dir)
+{
+    PVOID h;
+    int   r;
+
+    rife_load_tid = GetCurrentThreadId();
+    h = AddVectoredExceptionHandler(1, rife_crash_veh);
+    if (setjmp(rife_crash_jmp))
+        r = -2;                 /* reached via longjmp after a crash */
+    else
+        r = ctx->load(dir);
+    if (h)
+        RemoveVectoredExceptionHandler(h);
+    return r;
 }
 #endif
 
@@ -83,16 +164,14 @@ int rife_init(void)
     rife_state = -1;
 
 #ifdef _WIN32
-    std::wstring dir = rife_model_dir();
+    size_t         param_len = 0, bin_len = 0;
+    const unsigned char *param = rife_resource(IDR_RIFE_FLOWNET_PARAM, &param_len);
+    const unsigned char *bin   = rife_resource(IDR_RIFE_FLOWNET_BIN,   &bin_len);
 
-    if (dir.empty()) {
-        av_log(NULL, AV_LOG_WARNING, "RIFE: cannot locate the executable\n");
-        return -1;
-    }
-    if (GetFileAttributesW(dir.c_str()) == INVALID_FILE_ATTRIBUTES) {
+    if (!param || !bin) {
         av_log(NULL, AV_LOG_WARNING,
-               "RIFE: model directory '%s' not found next to ffplay.exe; "
-               "using optical-flow frame generation\n", RIFE_MODEL_DIR);
+               "RIFE: embedded model missing from the executable; "
+               "using optical-flow frame generation\n");
         return -1;
     }
 
@@ -102,20 +181,36 @@ int rife_init(void)
         return -1;
     }
 
+    std::wstring dir = rife_extract_model(param, param_len, bin, bin_len);
+    if (dir.empty()) {
+        av_log(NULL, AV_LOG_WARNING,
+               "RIFE: could not stage the embedded model; "
+               "using optical-flow frame generation\n");
+        ncnn::destroy_gpu_instance();
+        return -1;
+    }
+
     /* v4 models take an arbitrary timestep, which is what lets a single
      * source interval be filled with more than one generated frame. */
     rife_ctx = new RIFE(0 /* gpu 0 */, false /* tta */, false /* tta temporal */,
                         false /* uhd */, 1 /* threads */, false /* v2 */,
                         true /* v4 */);
-    if (rife_ctx->load(dir) != 0) {
-        av_log(NULL, AV_LOG_WARNING, "RIFE: failed to load the model\n");
-        delete rife_ctx;
+    int lr = rife_guarded_load(rife_ctx, dir);
+    if (lr != 0) {
+        av_log(NULL, AV_LOG_WARNING,
+               "RIFE: model load %s on this GPU; using optical-flow frame generation\n",
+               lr == -2 ? "crashed" : "failed");
+        /* After a crash inside the Vulkan driver, do not touch ncnn again
+         * (delete/destroy could fault too); leak the instance and continue. */
+        if (lr != -2) {
+            delete rife_ctx;
+            ncnn::destroy_gpu_instance();
+        }
         rife_ctx = NULL;
-        ncnn::destroy_gpu_instance();
         return -1;
     }
 
-    av_log(NULL, AV_LOG_INFO, "RIFE: %s ready on %s\n", RIFE_MODEL_DIR,
+    av_log(NULL, AV_LOG_INFO, "RIFE: %s ready on %s\n", RIFE_MODEL_NAME,
            ncnn::get_gpu_info(0).device_name());
     rife_state = 1;
     return 0;

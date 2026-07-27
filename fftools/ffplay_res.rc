@@ -1,1 +1,10 @@
+#include "ffplay_res.h"
+
 1 ICON "fftools/ffplay.ico"
+
+/* RIFE v4.6 model embedded into the executable. Paths are relative to the
+ * build working directory (the FFmpeg source root), like the ICON above; the
+ * model is vendored outside the repo at ../bin/rife-v4.6/ alongside ncnn and
+ * SDL2. */
+IDR_RIFE_FLOWNET_PARAM RCDATA "../bin/rife-v4.6/flownet.param"
+IDR_RIFE_FLOWNET_BIN   RCDATA "../bin/rife-v4.6/flownet.bin"

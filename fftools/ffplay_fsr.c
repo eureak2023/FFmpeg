@@ -27,6 +27,7 @@
 
 #include <math.h>
 #include <string.h>
+#include <wchar.h>
 
 #include <SDL.h>
 #include <SDL_opengl.h>
