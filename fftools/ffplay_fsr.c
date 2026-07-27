@@ -3595,6 +3595,8 @@ static AVComplexFloat *vis_tout;    /* spectrum, VIS_FFT_LEN/2 + 1          */
 static float           vis_target[VIS_BARS];
 static float           vis_disp[VIS_BARS];
 static float           vis_rise[VIS_BARS];
+static uint32_t        vis_last_ticks;  /* for frame-rate-independent smoothing */
+static float           vis_accum;        /* elapsed-time accumulator for substeps */
 static uint32_t        vis_color_start;
 
 /* Mirror map: visual position p -> frequency-band index (0 = bass at the two
@@ -3718,30 +3720,45 @@ void fsr_vis_draw(SDL_Renderer *renderer, const float *mono, int nsamp,
         raw[b] = lvl;
     }
 
-    /* input smoothing + attack/release with a centre-out rise cascade */
+    /* input smoothing + attack/release with a centre-out rise cascade. */
     now = SDL_GetTicks();
     if (!vis_color_start)
         vis_color_start = now;
-    for (int p = 0; p < VIS_BARS; p++) {
-        int   fi     = vis_freq_idx(p);
-        float target = vis_target[p] * VIS_INPUT_SMOOTH +
-                       raw[fi] * (1.0f - VIS_INPUT_SMOOTH);
-        float delta;
+    /* Advance the bars on a FIXED 60fps timestep decoupled from the draw rate:
+     * accumulate the real time since the last call and run the original
+     * per-frame smoothing once per ~16ms of it. This makes the motion identical
+     * whether we are drawn at the album view's steady 60fps or at a video's
+     * lower / irregular present rate (the FG slot pacing is uneven) - the state
+     * evolves on its own steady clock, the draw just samples it. */
+    {
+        uint32_t d = vis_last_ticks ? now - vis_last_ticks : 16;
+        vis_last_ticks = now;
+        if (d > 200) d = 200;                 /* cap catch-up after a stall */
+        vis_accum += (float)d;
+    }
+    for (int step = 0; vis_accum >= 16.0f && step < 8; step++) {
+        vis_accum -= 16.0f;
+        for (int p = 0; p < VIS_BARS; p++) {
+            int   fi     = vis_freq_idx(p);
+            float target = vis_target[p] * VIS_INPUT_SMOOTH +
+                           raw[fi] * (1.0f - VIS_INPUT_SMOOTH);
+            float delta;
 
-        if (!playing)
-            target *= VIS_IDLE_DECAY;
-        vis_target[p] = target;
-        delta = target - vis_disp[p];
-        if (delta >= 0.0f) {
-            if (vis_rise[p] < fi * VIS_CASCADE)
-                vis_rise[p] += VIS_ATTACK;              /* still delayed */
-            else {
-                vis_rise[p] += VIS_ATTACK;
-                vis_disp[p] += delta * VIS_ATTACK;
+            if (!playing)
+                target *= VIS_IDLE_DECAY;
+            vis_target[p] = target;
+            delta = target - vis_disp[p];
+            if (delta >= 0.0f) {
+                if (vis_rise[p] < fi * VIS_CASCADE)
+                    vis_rise[p] += VIS_ATTACK;          /* still delayed */
+                else {
+                    vis_rise[p] += VIS_ATTACK;
+                    vis_disp[p] += delta * VIS_ATTACK;
+                }
+            } else {
+                vis_disp[p] += delta * VIS_RELEASE;
+                vis_rise[p]  = 0.0f;
             }
-        } else {
-            vis_disp[p] += delta * VIS_RELEASE;
-            vis_rise[p]  = 0.0f;
         }
     }
 

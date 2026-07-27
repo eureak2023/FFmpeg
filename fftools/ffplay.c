@@ -369,6 +369,9 @@ static enum ShowMode show_mode = SHOW_MODE_NONE;
 /* Show the album-art LP visualizer for audio-only files (no video, or only an
  * attached cover picture) instead of the classic waveform/RDFT. */
 static int album_view = 1;
+/* Show the bottom LineBar visualizer during *video* playback too (audio-only
+ * always shows it). Off by default, toggled with 'v', remembered in ffplay.ini. */
+static int video_vis = 0;
 static const char *audio_codec_name;
 static const char *subtitle_codec_name;
 static const char *video_codec_name;
@@ -1523,6 +1526,8 @@ static void load_settings(void)
             video_scaling = v;
         else if (sscanf(line, "fg_rife=%d", &v) == 1)
             fg_rife_pref = fsr_rife = !!v;
+        else if (sscanf(line, "video_vis=%d", &v) == 1)
+            video_vis = !!v;
     }
     fclose(f);
 }
@@ -1549,6 +1554,7 @@ static void save_settings(VideoState *is)
     fprintf(f, "audio_stereo=%d\n", audio_stereo);
     fprintf(f, "video_scaling=%d\n", video_scaling);
     fprintf(f, "fg_rife=%d\n", fg_rife_pref);
+    fprintf(f, "video_vis=%d\n", video_vis);
     fclose(f);
 }
 
@@ -1855,6 +1861,39 @@ static int audio_album_active(VideoState *is)
            (is->video_st->disposition & AV_DISPOSITION_ATTACHED_PIC);
 }
 
+/* Feed the newest samples to the bottom LineBar (FFT) visualizer. sample_array
+ * holds interleaved int16 samples written by the audio thread; gather a mono mix
+ * of the most recent VIS_MONO samples ending at the write head. Reading it
+ * unlocked is a benign race, matching stock ffplay's RDFT display. Shared by the
+ * album view and (when video_vis is on) video playback. */
+static void audio_vis_draw(VideoState *is)
+{
+    static float mono[VIS_MONO];
+    int ch  = is->audio_tgt.ch_layout.nb_channels;
+    int idx = is->sample_array_index;
+
+    if (!is->audio_st)
+        return;
+    if (ch < 1)
+        ch = 1;
+    for (int i = 0; i < VIS_MONO; i++) {
+        int base = idx - (VIS_MONO - i) * ch;
+        int acc  = 0;
+
+        base %= SAMPLE_ARRAY_SIZE;
+        if (base < 0)
+            base += SAMPLE_ARRAY_SIZE;
+        for (int k = 0; k < ch; k++) {
+            int j = base + k;
+            if (j >= SAMPLE_ARRAY_SIZE)
+                j -= SAMPLE_ARRAY_SIZE;
+            acc += is->sample_array[j];
+        }
+        mono[i] = (float)acc / (ch * 32768.0f);
+    }
+    fsr_vis_draw(renderer, mono, VIS_MONO, !is->paused);
+}
+
 /* Draw the album-art visualizer, extracting the embedded cover once (from the
  * single attached-picture frame) and handing it to the FSR module. */
 static void album_display(VideoState *is)
@@ -1901,35 +1940,7 @@ static void album_display(VideoState *is)
     if (!is->video_st)
         fsr_album_ensure_default(renderer);
     fsr_album_draw(renderer, !is->paused);
-
-    /* Feed the newest samples to the bottom FFT visualizer. sample_array holds
-     * interleaved int16 samples written by the audio thread; gather a mono mix
-     * of the most recent VIS_MONO samples ending at the write head. Reading it
-     * unlocked is a benign race, matching stock ffplay's RDFT display. */
-    if (is->audio_st) {
-        static float mono[VIS_MONO];
-        int ch  = is->audio_tgt.ch_layout.nb_channels;
-        int idx = is->sample_array_index;
-
-        if (ch < 1)
-            ch = 1;
-        for (int i = 0; i < VIS_MONO; i++) {
-            int base = idx - (VIS_MONO - i) * ch;
-            int acc  = 0;
-
-            base %= SAMPLE_ARRAY_SIZE;
-            if (base < 0)
-                base += SAMPLE_ARRAY_SIZE;
-            for (int k = 0; k < ch; k++) {
-                int j = base + k;
-                if (j >= SAMPLE_ARRAY_SIZE)
-                    j -= SAMPLE_ARRAY_SIZE;
-                acc += is->sample_array[j];
-            }
-            mono[i] = (float)acc / (ch * 32768.0f);
-        }
-        fsr_vis_draw(renderer, mono, VIS_MONO, !is->paused);
-    }
+    audio_vis_draw(is);
 }
 
 static void video_display(VideoState *is)
@@ -1945,6 +1956,8 @@ static void video_display(VideoState *is)
         video_audio_display(is);
     else if (is->video_st)
         video_image_display(is);
+    if (video_vis && is->video_st && is->audio_st)
+        audio_vis_draw(is);            /* LineBar over video when toggled on */
     ui_draw_overlay(is);
     fsr_toast_draw(renderer);
     fsr_hud_draw(renderer);
@@ -2285,6 +2298,8 @@ static void video_fg_display(VideoState *is, double phase)
          * display rate instead of dropping to the source frame rate. */
         video_image_display(is);
     }
+    if (video_vis && is->audio_st)
+        audio_vis_draw(is);            /* LineBar over video when toggled on */
     ui_draw_overlay(is);
     fsr_toast_draw(renderer);
     fsr_hud_draw(renderer);
@@ -2372,7 +2387,7 @@ retry:
                  * decided purely by there being room before the next display
                  * refresh slot (delay > fg_refresh * 1.5), so a 60 fps source
                  * interpolates on a >60 Hz panel and does nothing on a 60 Hz one. */
-                if (fsr_fg && !is->paused && !lada_active() &&
+                if (fsr_fg && !video_vis && !lada_active() && !is->paused &&
                     is->show_mode == SHOW_MODE_VIDEO && is->pictq.rindex_shown &&
                     frame_queue_nb_remaining(&is->pictq) > 0 &&
                     delay > fg_refresh * 1.5) {
@@ -2408,6 +2423,22 @@ retry:
                         *remaining_time = FFMIN(FFMAX(is->fg_next - time, 0.0),
                                                 *remaining_time);
                     }
+                } else if (video_vis && is->audio_st && !is->paused &&
+                           is->show_mode == SHOW_MODE_VIDEO &&
+                           is->pictq.rindex_shown) {
+                    /* LineBar overlay on video: present the current real frame
+                     * on a STEADY ~60fps cadence so the bars animate as smoothly
+                     * as they do over audio. Frame generation is intentionally
+                     * bypassed while the visualizer is on (its slot pacing is
+                     * uneven, which made the bars look jerky); the video plays at
+                     * its source rate, re-presented to fill the 60fps ticks. */
+                    time = av_gettime_relative() / 1000000.0;
+                    if (is->last_vis_time + ALBUM_REFRESH <= time) {
+                        is->force_refresh = 1;
+                        is->last_vis_time = time;
+                    }
+                    *remaining_time = FFMIN(*remaining_time,
+                                            is->last_vis_time + ALBUM_REFRESH - time);
                 }
                 goto display;
             }
@@ -3518,10 +3549,12 @@ static void sdl_audio_callback(void *opaque, Uint8 *stream, int len)
                is->audio_buf = NULL;
                is->audio_buf_size = SDL_AUDIO_MIN_BUFFER_SIZE / is->audio_tgt.frame_size * is->audio_tgt.frame_size;
            } else {
-               /* Feed the sample ring for any non-video display, and also for
-                * the album visualizer on attached-picture files (show_mode is
-                * VIDEO there, so it would otherwise never be filled). */
-               if (is->show_mode != SHOW_MODE_VIDEO || audio_album_active(is))
+               /* Feed the sample ring for any non-video display, for the album
+                * visualizer on attached-picture files (show_mode is VIDEO there,
+                * so it would otherwise never be filled), and for the LineBar
+                * overlaid on video when the 'v' toggle is on. */
+               if (is->show_mode != SHOW_MODE_VIDEO || audio_album_active(is) ||
+                   video_vis)
                    update_sample_display(is, (int16_t *)is->audio_buf, audio_size);
                is->audio_buf_size = audio_size;
            }
@@ -5220,7 +5253,12 @@ static void event_loop(VideoState *cur_stream)
                 stream_cycle_channel(cur_stream, AVMEDIA_TYPE_AUDIO);
                 break;
             case SDLK_v:
-                stream_cycle_channel(cur_stream, AVMEDIA_TYPE_VIDEO);
+                /* Toggle the bottom LineBar visualizer over video playback
+                 * (audio-only always shows it); remembered in ffplay.ini. */
+                video_vis = !video_vis;
+                if (renderer)
+                    fsr_toast_show(renderer, video_vis ? "VIS ON" : "VIS OFF");
+                cur_stream->force_refresh = 1;
                 break;
             case SDLK_c:
                 stream_cycle_channel(cur_stream, AVMEDIA_TYPE_VIDEO);
