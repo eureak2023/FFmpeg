@@ -3054,26 +3054,20 @@ static void alb_build_shine(SDL_Renderer *renderer)
 
             if (d <= R) {
                 float u = dx / R, v = dy / R;
-                float diag1 = u + v, diag2 = u - v;
-                /* A "<"-shaped gleam: an upper "/" arm (along diag1) and a
-                 * lower "\" arm (along diag2) that meet at a vertex left of
-                 * centre and open to the right. Each arm is faded into its own
-                 * half (upper/lower) so the two only join at the vertex. */
-                float off = 0.15f;
-                float a1  = diag1 + off;                 /* upper arm core */
-                float a2  = diag2 + off;                 /* lower arm core */
-                float vu  = v > 0.0f ? v : 0.0f;         /* spill into lower */
-                float vl  = v < 0.0f ? -v : 0.0f;        /* spill into upper */
-                float wu  = expf(-(vu * vu) / (2.0f * 0.30f * 0.30f));
-                float wl  = expf(-(vl * vl) / (2.0f * 0.30f * 0.30f));
+                /* Broad soft specular sweeps, like light reflecting off glossy
+                 * vinyl: a wide main band along one diagonal, a narrower and
+                 * brighter crossing streak, and a faint wide halo. Kept broad
+                 * and bright so the near-black platter reads as a shiny surface
+                 * and the fine grooves shimmer beneath it as the disc turns. */
+                float a1 = (u + v) * 0.70710678f;   /* signed dist to a diagonal */
+                float a2 = (u - v) * 0.70710678f;   /* to the crossing diagonal  */
                 float inten =
-                    wu * (0.30f * expf(-(a1 * a1) / (2.0f * 0.40f * 0.40f)) +
-                          0.55f * expf(-(a1 * a1) / (2.0f * 0.13f * 0.13f))) +
-                    wl * (0.30f * expf(-(a2 * a2) / (2.0f * 0.40f * 0.40f)) +
-                          0.55f * expf(-(a2 * a2) / (2.0f * 0.13f * 0.13f)));
+                    0.85f * expf(-(a1 * a1) / (2.0f * 0.20f * 0.20f)) +
+                    0.55f * expf(-(a2 * a2) / (2.0f * 0.09f * 0.09f)) +
+                    0.20f * expf(-(a1 * a1) / (2.0f * 0.50f * 0.50f));
                 uint8_t A;
 
-                if (d < labelR)   inten *= 0.35f;          /* softer on label */
+                if (d < labelR)   inten *= 0.30f;          /* softer on label */
                 if (d > R - 2.0f) inten *= (R - d) / 2.0f;  /* fade rim edge  */
                 if (inten < 0.0f) inten = 0.0f;
                 if (inten > 1.0f) inten = 1.0f;
@@ -3129,40 +3123,54 @@ static void alb_build_lp(SDL_Renderer *renderer,
                 out = 0xFF000000u | ((uint32_t)p[2] << 16) |
                       ((uint32_t)p[1] << 8) | p[0];
             } else if (d < labelR - 1.0f) {
-                out = 0xFF303030u;                  /* blank centre label */
+                out = 0xFFC01530u;                  /* blank label: crimson red */
             } else {
-                /* Glossy black platter with thin grooves grouped into irregular
-                 * track bands, like a real pressed record rather than a machine-
-                 * perfect comb: the ring phase is warped so the spacing drifts,
-                 * a slow envelope opens a few smooth inter-track gaps, and the
-                 * groove depth varies so not every ring is equally dark. */
-                float warp   = 3.0f * sinf(d * 0.010f) +
-                               1.5f * sinf(d * 0.031f + 1.3f);   /* uneven pitch */
-                float ring   = 0.5f + 0.5f * cosf(d * 0.14f + warp);
-                float groove = ring * ring;
-                groove *= groove;                              /* pow(ring, 4)  */
-                groove *= groove;                              /* pow(ring, 8)  */
-                groove *= groove;                              /* pow(ring, 16): very thin lines */
+                /* Deep glossy black. The vinyl is nearly pure black; the grooves
+                 * are fine, low-contrast concentric lines and the realism comes
+                 * from the broad specular reflection laid over it (alb_shine),
+                 * not from high groove contrast. A soft, rotation-symmetric
+                 * radial sheen gives the surface a smooth glossy body. */
+                float warp   = 1.5f * sinf(d * 0.012f);         /* slight drift */
 
-                float gate = sinf(d * 0.070f + 1.7f * sinf(d * 0.017f));
-                if (gate > 0.82f)                              /* smooth track gap */
-                    groove *= (1.0f - gate) / 0.18f;
-                groove *= 0.80f + 0.20f * (0.5f + 0.5f * sinf(d * 0.043f));
+                /* Grooved annulus from just outside the label to a thin outer
+                 * rim, split into exactly 5 dark-gray track bands separated by
+                 * thin black rings, like the reference. A small lead-in gap and
+                 * a thin rim stay black. */
+                float rInner = labelR + S * 0.020f;   /* first track starts here */
+                float rOuter = R - S * 0.020f;        /* thin outer rim */
+                float land   = 0.0f;                  /* black by default */
 
-                /* Smooth glossy black bands (no grooves): a thicker ring just
-                 * outside the centre label and a plain rim at the outer edge,
-                 * like a real pressed record. */
-                if (d < labelR + S * 0.045f || d > R - S * 0.055f)
-                    groove = 0.0f;
+                if (d >= rInner && d <= rOuter) {
+                    /* 5 tracks of unequal width (25/25/15/25/10%): the thin
+                     * black separators sit at these cumulative fractions. */
+                    static const float sepAt[4] = { 0.25f, 0.50f, 0.65f, 0.90f };
+                    float rn    = (d - rInner) / (rOuter - rInner);  /* 0..1 */
+                    float fine  = 0.5f + 0.5f * cosf(d * 0.55f + warp); /* grooves */
+                    float track = 8.0f + fine * 3.0f;                /* darker gray */
+                    float sep   = 0.0f;
 
-                float sh1 = 1.0f - fabsf(dx + dy) / (S * 0.9f);
-                float sh2 = 1.0f - fabsf(dx - dy) / (S * 0.9f);
-                int   base = 14 - (int)(groove * 10.0f);       /* near-black platter, thin dark cuts */
+                    for (int k = 0; k < 4; k++) {
+                        float dd = fabsf(rn - sepAt[k]);
+                        if (dd < 0.018f) {           /* thin black separator ring */
+                            float s = 1.0f - dd / 0.018f;
+                            if (s > sep) sep = s;
+                        }
+                    }
+                    land = track * (1.0f - sep);   /* gray track, 0 at separator */
+                }
+
+                /* Soft radial tone so the black body looks shaded, not flat. */
+                float rr     = (d - labelR) / (R - labelR);     /* 0..1 */
+                if (rr < 0.0f) rr = 0.0f;
+                if (rr > 1.0f) rr = 1.0f;
+                float radial = 3.0f * (0.5f + 0.5f * cosf(rr * 12.566371f));
+
+                int   base = 6                       /* deep black floor/separator */
+                           + (int)land               /* dark-gray track band */
+                           + (int)radial;            /* smooth radial sheen 0..3 */
                 uint8_t A = 255;
 
-                if (sh1 > 0) base += (int)(sh1 * 7.0f);        /* subtle diagonal gloss */
-                if (sh2 > 0) base += (int)(sh2 * 7.0f);
-                if (d < labelR + 1.5f)   base += 35;      /* subtle label lip */
+                if (d < labelR + 1.5f)   base += 10;   /* faint label lip */
                 if (base < 0)   base = 0;
                 if (base > 255) base = 255;
                 if (d > R - 1.0f) {                        /* AA outer edge */
