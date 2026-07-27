@@ -388,10 +388,15 @@ static int enable_vulkan = 0;
 static char *vulkan_params = NULL;
 static char *video_background = NULL;
 static const char *hwaccel = NULL;
-static int fsr = -1; /* -1 = auto: on for any source resolution */
+static int fsr = -1; /* -1 = auto: on for any source resolution. Remembered in
+                      * ffplay.ini once the user has toggled it with 'x'. */
 static float fsr_sharpness = 0.0f; /* RCAS attenuation stops, 0 = maximum sharpness */
 static int fsr_denoise = 0;
-static int fsr_fg = 1;             /* frame generation (hardware optical flow) */
+static int fsr_fg = 1;             /* frame generation (hardware optical flow),
+                                    * remembered in ffplay.ini. Neither this nor
+                                    * fsr is ever cleared on a boot failure (that
+                                    * only warns), so the saved value is always
+                                    * the user's own choice. */
 static int fsr_rife = 0;           /* FG engine: 0 = optical-flow warp (default),
                                     * 1 = RIFE where it fits. RIFE still boots for
                                     * any video (see below) so 'r' can switch to
@@ -1524,6 +1529,10 @@ static void load_settings(void)
             audio_stereo = !!v;
         else if (sscanf(line, "video_scaling=%d", &v) == 1 && v >= 0 && v <= 2)
             video_scaling = v;
+        else if (sscanf(line, "fsr=%d", &v) == 1)
+            fsr = !!v;             /* a remembered pick replaces the -1 auto */
+        else if (sscanf(line, "fsr_fg=%d", &v) == 1)
+            fsr_fg = !!v;
         else if (sscanf(line, "fg_rife=%d", &v) == 1)
             fg_rife_pref = fsr_rife = !!v;
         else if (sscanf(line, "video_vis=%d", &v) == 1)
@@ -1553,6 +1562,9 @@ static void save_settings(VideoState *is)
     fprintf(f, "volume=%d\n", av_clip(vol, 0, 100));
     fprintf(f, "audio_stereo=%d\n", audio_stereo);
     fprintf(f, "video_scaling=%d\n", video_scaling);
+    /* fsr is still -1 if no video stream ever opened; auto resolves to on. */
+    fprintf(f, "fsr=%d\n", fsr != 0);
+    fprintf(f, "fsr_fg=%d\n", !!fsr_fg);
     fprintf(f, "fg_rife=%d\n", fg_rife_pref);
     fprintf(f, "video_vis=%d\n", video_vis);
     fclose(f);
@@ -5766,10 +5778,10 @@ static const OptionDef options[] = {
     { "vulkan_params",      OPT_TYPE_STRING, OPT_EXPERT, { &vulkan_params }, "vulkan configuration using a list of key=value pairs separated by ':'" },
     { "video_bg",           OPT_TYPE_STRING, OPT_EXPERT, { &video_background }, "set video background for transparent videos" },
     { "hwaccel",            OPT_TYPE_STRING, OPT_EXPERT, { &hwaccel }, "HW accelerated decoding: d3d11va (default), auto, dxva2, cuda, ..., none disables", "type" },
-    { "fsr",                OPT_TYPE_BOOL,            0, { &fsr }, "upscale video output with FSR1 (EASU+RCAS); default: on for sources up to 1080p, off above; toggle at runtime with 'x'" },
+    { "fsr",                OPT_TYPE_BOOL,            0, { &fsr }, "upscale video output with FSR1 (EASU+RCAS); default: on for sources up to 1080p, off above; toggle at runtime with 'x' (remembered across runs)" },
     { "fsr_sharpness",      OPT_TYPE_FLOAT, OPT_EXPERT, { &fsr_sharpness }, "FSR RCAS sharpness attenuation in stops (0=sharpest, adjust at runtime with +/-)", "stops" },
     { "fsr_denoise",        OPT_TYPE_BOOL,  OPT_EXPERT, { &fsr_denoise }, "reduce FSR sharpening of noise and film grain; toggle at runtime with 'd'" },
-    { "fsr_fg",             OPT_TYPE_BOOL,  OPT_EXPERT, { &fsr_fg }, "frame generation via NVIDIA hardware optical flow, on by default (-nofsr_fg disables); toggle at runtime with 'g'" },
+    { "fsr_fg",             OPT_TYPE_BOOL,  OPT_EXPERT, { &fsr_fg }, "frame generation via NVIDIA hardware optical flow, on by default (-nofsr_fg disables); toggle at runtime with 'g' (remembered across runs)" },
     { "rife",               OPT_TYPE_BOOL,  OPT_EXPERT, { &fsr_rife }, "start with RIFE (per-pixel, ncnn+Vulkan) as the frame-generation engine instead of the block-grid optical flow; off by default (optical flow), remembered per session; RIFE still loads so 'r' toggles it at runtime" },
     { "fg_mult",            OPT_TYPE_INT,   OPT_EXPERT, { &fg_mult }, "frame generation factor: 2, 3 or 4 (source x2/x3/x4, capped by display refresh); pick at runtime from the right-click menu", "N" },
     { "lada",               OPT_TYPE_BOOL,           0, { &lada }, "real-time mosaic (JAV) restoration via the lada sidecar; off by default, toggle at runtime with 'L'" },

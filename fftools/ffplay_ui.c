@@ -713,48 +713,6 @@ int ui_context_menu(int fsr_on, int nr_on, int fg_on, int lada_on, int jasna_on,
 #endif
 }
 
-#ifdef _WIN32
-/* The open dialog, when its owner is a fullscreen (topmost) player window, can
- * be created behind it. gofn() blocks the calling thread, so a short-lived
- * helper thread waits for the modal dialog to appear (the owner's enabled
- * popup) and lifts it to the top of the topmost band — keeping the player
- * fullscreen while the dialog shows in front. */
-struct ui_raise_ctx { HWND owner; volatile LONG stop; };
-
-static DWORD WINAPI ui_raise_dialog(LPVOID p)
-{
-    struct ui_raise_ctx *c = (struct ui_raise_ctx *)p;
-    int i, forced = 0;
-
-    for (i = 0; i < 120 && !c->stop; i++) {
-        HWND dlg = GetWindow(c->owner, GW_ENABLEDPOPUP);
-
-        if (dlg && dlg != c->owner) {
-            /* Keep the dialog at the top of the topmost band (SetWindowPos is
-             * not thread-restricted), above the fullscreen owner. */
-            SetWindowPos(dlg, HWND_TOPMOST, 0, 0, 0, 0,
-                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-            if (!forced) {
-                /* Force the foreground once via AttachThreadInput, which
-                 * bypasses the foreground lock that otherwise leaves the
-                 * dialog behind a fullscreen player launched from the button
-                 * (the right-click menu happens to clear this lock itself). */
-                DWORD tgt = GetWindowThreadProcessId(dlg, NULL);
-                DWORD me  = GetCurrentThreadId();
-
-                AttachThreadInput(me, tgt, TRUE);
-                BringWindowToTop(dlg);
-                SetForegroundWindow(dlg);
-                AttachThreadInput(me, tgt, FALSE);
-                forced = 1;
-            }
-        }
-        Sleep(20);
-    }
-    return 0;
-}
-#endif
-
 /* Native "open file" dialog; returns an av_strdup'ed UTF-8 path or NULL. */
 char *ui_open_file_dialog(void)
 {
@@ -771,8 +729,7 @@ char *ui_open_file_dialog(void)
     char utf8[MAX_PATH * 3];
     SDL_SysWMinfo wm;
     HWND owner = NULL;
-    HANDLE raise_th = NULL;
-    struct ui_raise_ctx rc = { NULL, 0 };
+    void *raise;
     BOOL ok;
 
     if (!dlg)
@@ -790,21 +747,12 @@ char *ui_open_file_dialog(void)
     ofn.lpstrFilter = filter;
     ofn.Flags       = OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
 
-    /* Keep the player fullscreen, but lift the dialog above it: a helper thread
-     * finds the modal dialog once it appears and makes it topmost. */
-    if (owner) {
-        SetForegroundWindow(owner);
-        rc.owner = owner;
-        raise_th = CreateThread(NULL, 0, ui_raise_dialog, &rc, 0, NULL);
-    }
-
+    /* Keep the player fullscreen, but lift the dialog above it (gofn() blocks,
+     * so a helper thread does the raising — see fsr_raise_modal_begin). */
+    raise = fsr_raise_modal_begin(owner);
     ok = gofn(&ofn);
+    fsr_raise_modal_end(raise);
 
-    if (raise_th) {                    /* stop and join the helper thread */
-        rc.stop = 1;
-        WaitForSingleObject(raise_th, 1000);
-        CloseHandle(raise_th);
-    }
     if (!ok)
         return NULL;
     if (!WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8, sizeof(utf8),
