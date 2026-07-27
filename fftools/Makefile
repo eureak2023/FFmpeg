@@ -69,7 +69,7 @@ fftools/ffplay_rife.o fftools/rife/rife.o fftools/rife/warp.o: \
     CXXFLAGS += -I$(SRC_PATH)/fftools/rife -I$(NCNN_DIR)/include/ncnn -fopenmp
 EXTRALIBS-ffplay += -L$(NCNN_DIR)/lib -lncnn -lglslang -lSPIRV \
     -lMachineIndependent -lGenericCodeGen -lOSDependent \
-    -lglslang-default-resource-limits -fopenmp
+    -lglslang-default-resource-limits -fopenmp -lstdc++
 OBJS-ffplay-$(HAVE_GNU_WINDRES) += fftools/ffplay_res.o
 # GUI subsystem: no console window flashes on double-click launches;
 # fsr_detach_console() re-attaches to the parent console when run from one.
