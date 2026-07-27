@@ -4028,6 +4028,77 @@ done:
     return result;
 }
 
+/* A modal dialog owned by a fullscreen (topmost) player window can be created
+ * behind it, and the call that shows it blocks the calling thread — so nothing
+ * on this thread can lift it afterwards. A short-lived helper thread waits for
+ * the dialog to appear (the owner's enabled popup) and pulls it to the front,
+ * keeping the player fullscreen while the dialog shows on top.
+ *
+ * Used by both the open-file dialog (ffplay_ui.c) and the delete confirmation
+ * below: begin() before the blocking call, end() right after it. */
+struct fsr_raise_ctx { HWND owner; volatile LONG stop; HANDLE th; };
+
+static DWORD WINAPI fsr_raise_modal_thread(LPVOID p)
+{
+    struct fsr_raise_ctx *c = (struct fsr_raise_ctx *)p;
+    int i, forced = 0;
+
+    for (i = 0; i < 120 && !c->stop; i++) {
+        HWND dlg = GetWindow(c->owner, GW_ENABLEDPOPUP);
+
+        if (dlg && dlg != c->owner) {
+            /* Keep the dialog at the top of the topmost band (SetWindowPos is
+             * not thread-restricted), above the fullscreen owner. */
+            SetWindowPos(dlg, HWND_TOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            if (!forced) {
+                /* Force the foreground once via AttachThreadInput, which
+                 * bypasses the foreground lock that otherwise leaves the
+                 * dialog behind a fullscreen player. MB_SETFOREGROUND and
+                 * MB_TOPMOST alone do not beat that lock. */
+                DWORD tgt = GetWindowThreadProcessId(dlg, NULL);
+                DWORD me  = GetCurrentThreadId();
+
+                AttachThreadInput(me, tgt, TRUE);
+                BringWindowToTop(dlg);
+                SetForegroundWindow(dlg);
+                AttachThreadInput(me, tgt, FALSE);
+                forced = 1;
+            }
+        }
+        Sleep(20);
+    }
+    return 0;
+}
+
+void *fsr_raise_modal_begin(void *owner_hwnd)
+{
+    HWND owner = (HWND)owner_hwnd;
+    struct fsr_raise_ctx *c;
+
+    if (!owner || !(c = av_mallocz(sizeof(*c))))
+        return NULL;
+    c->owner = owner;
+    SetForegroundWindow(owner);
+    if (!(c->th = CreateThread(NULL, 0, fsr_raise_modal_thread, c, 0, NULL))) {
+        av_free(c);
+        return NULL;
+    }
+    return c;
+}
+
+void fsr_raise_modal_end(void *handle)
+{
+    struct fsr_raise_ctx *c = (struct fsr_raise_ctx *)handle;
+
+    if (!c)
+        return;
+    c->stop = 1;
+    WaitForSingleObject(c->th, 1000);
+    CloseHandle(c->th);
+    av_free(c);
+}
+
 /* Modal "delete this file?" confirmation, owned by the player window so it
  * comes to front even over a fullscreen window. Returns 1 if the user chose
  * OK. utf8_path is shown so it is clear which file is about to go. */
@@ -4035,6 +4106,8 @@ int fsr_confirm_delete(SDL_Window *window, const char *utf8_path)
 {
     wchar_t wpath[1024], wmsg[1200];
     HWND    owner = NULL;
+    void   *raise;
+    int     ok;
 
     if (!utf8_path || !utf8_path[0])
         return 0;
@@ -4052,9 +4125,14 @@ int fsr_confirm_delete(SDL_Window *window, const char *utf8_path)
 
     _snwprintf(wmsg, sizeof(wmsg) / sizeof(wmsg[0]),
                L"이 파일을 삭제하시겠습니까?\n\n%ls", wpath);
-    return MessageBoxW(owner, wmsg, L"파일 삭제",
-                       MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2 |
-                       MB_SETFOREGROUND | MB_TOPMOST) == IDOK;
+    /* MB_SETFOREGROUND|MB_TOPMOST is not enough over a fullscreen player (the
+     * foreground lock denies it), so raise the box from a helper thread. */
+    raise = fsr_raise_modal_begin(owner);
+    ok = MessageBoxW(owner, wmsg, L"파일 삭제",
+                     MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2 |
+                     MB_SETFOREGROUND | MB_TOPMOST) == IDOK;
+    fsr_raise_modal_end(raise);
+    return ok;
 }
 
 /* Send utf8_path to the Recycle Bin (FOF_ALLOWUNDO, so a mistaken delete is
@@ -4087,6 +4165,8 @@ void  fsr_single_instance_setup(SDL_Window *w)    { (void)w; }
 char *fsr_single_instance_take_path(void)         { return NULL; }
 char *fsr_sibling_media_path(const char *p, int d){ (void)p; (void)d; return NULL; }
 int   fsr_confirm_delete(SDL_Window *w, const char *p) { (void)w; (void)p; return 0; }
+void *fsr_raise_modal_begin(void *o)              { (void)o; return NULL; }
+void  fsr_raise_modal_end(void *h)                { (void)h; }
 int   fsr_delete_file(const char *p)              { (void)p; return -1; }
 #endif
 

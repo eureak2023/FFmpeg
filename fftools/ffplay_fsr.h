@@ -183,6 +183,13 @@ char *fsr_sibling_media_path(const char *cur_path, int dir);
 int   fsr_confirm_delete(SDL_Window *window, const char *utf8_path);
 int   fsr_delete_file(const char *utf8_path);
 
+/* Lift a modal dialog above a fullscreen (topmost) player window. The call
+ * that shows such a dialog blocks, so a helper thread does it: call begin()
+ * with the owner HWND before the blocking call and end() with its return value
+ * right after. Both tolerate NULL. Non-Windows builds are no-ops. */
+void *fsr_raise_modal_begin(void *owner_hwnd);
+void  fsr_raise_modal_end(void *handle);
+
 /* Destroy GL programs and intermediate textures. Call before the renderer
  * is destroyed. */
 void fsr_uninit(void);
