@@ -5225,7 +5225,18 @@ static void event_loop(VideoState *cur_stream)
         }
         switch (event.type) {
         case SDL_KEYDOWN:
-            /* ESC intentionally does NOT quit; use 'q' to quit. */
+            /* ESC leaves fullscreen (toggle_full_screen restores the windowed
+             * geometry it saved on the way in). It intentionally does NOT
+             * quit, in fullscreen or out of it; use 'q' to quit. Checked
+             * before the cur_stream->width guard below so it still works
+             * while the stream is opening. */
+            if (event.key.keysym.sym == SDLK_ESCAPE && !exit_on_keydown) {
+                if (is_full_screen) {
+                    toggle_full_screen(cur_stream);
+                    cur_stream->force_refresh = 1;
+                }
+                break;
+            }
             if (exit_on_keydown || event.key.keysym.sym == SDLK_q) {
                 do_exit(cur_stream);
                 break;
