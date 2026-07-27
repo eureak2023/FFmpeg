@@ -389,8 +389,11 @@ static int fsr = -1; /* -1 = auto: on for any source resolution */
 static float fsr_sharpness = 0.0f; /* RCAS attenuation stops, 0 = maximum sharpness */
 static int fsr_denoise = 0;
 static int fsr_fg = 1;             /* frame generation (hardware optical flow) */
-static int fsr_rife = 1;           /* ...using RIFE instead, where it fits */
-static int fg_rife_pref = 1;       /* persisted RIFE/FLOW choice; only the 'r'
+static int fsr_rife = 0;           /* FG engine: 0 = optical-flow warp (default),
+                                    * 1 = RIFE where it fits. RIFE still boots for
+                                    * any video (see below) so 'r' can switch to
+                                    * it; this only sets which engine starts. */
+static int fg_rife_pref = 0;       /* persisted RIFE/FLOW choice; only the 'r'
                                     * hotkey changes it, so an audio-only file or
                                     * a failed RIFE boot (which force fsr_rife off
                                     * for the session) don't overwrite the user's
@@ -5729,7 +5732,7 @@ static const OptionDef options[] = {
     { "fsr_sharpness",      OPT_TYPE_FLOAT, OPT_EXPERT, { &fsr_sharpness }, "FSR RCAS sharpness attenuation in stops (0=sharpest, adjust at runtime with +/-)", "stops" },
     { "fsr_denoise",        OPT_TYPE_BOOL,  OPT_EXPERT, { &fsr_denoise }, "reduce FSR sharpening of noise and film grain; toggle at runtime with 'd'" },
     { "fsr_fg",             OPT_TYPE_BOOL,  OPT_EXPERT, { &fsr_fg }, "frame generation via NVIDIA hardware optical flow, on by default (-nofsr_fg disables); toggle at runtime with 'g'" },
-    { "rife",               OPT_TYPE_BOOL,  OPT_EXPERT, { &fsr_rife }, "generate frames with RIFE (per-pixel, ncnn+Vulkan) instead of the block-grid optical flow where it fits the time budget, on by default (-norife disables); toggle at runtime with 'r'" },
+    { "rife",               OPT_TYPE_BOOL,  OPT_EXPERT, { &fsr_rife }, "start with RIFE (per-pixel, ncnn+Vulkan) as the frame-generation engine instead of the block-grid optical flow; off by default (optical flow), remembered per session; RIFE still loads so 'r' toggles it at runtime" },
     { "fg_mult",            OPT_TYPE_INT,   OPT_EXPERT, { &fg_mult }, "frame generation factor: 2, 3 or 4 (source x2/x3/x4, capped by display refresh); pick at runtime from the right-click menu", "N" },
     { "lada",               OPT_TYPE_BOOL,           0, { &lada }, "real-time mosaic (JAV) restoration via the lada sidecar; off by default, toggle at runtime with 'L'" },
     { "lada_home",          OPT_TYPE_STRING, OPT_EXPERT, { &lada_home }, "path to the lada project root (contains .venv and lada_sidecar.py)", "dir" },
@@ -5947,14 +5950,16 @@ int main(int argc, char **argv)
             if (fsr)
                 SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
             /* Before the renderer: ncnn's Vulkan device must exist first or
-             * the SDL OpenGL renderer is left broken (see fsr_rife_boot).
-             * Skip it entirely for audio-only input - frame generation never
-             * runs behind the album view, so the model load would be wasted. */
-            if (fsr_rife && !input_has_video(input_filename)) {
+             * the SDL OpenGL renderer is left broken (see fsr_rife_boot), and
+             * it can only be brought up here - not later. So boot RIFE for any
+             * video input regardless of which engine starts active, so the 'r'
+             * hotkey can switch to it; skip only for audio-only input, where
+             * frame generation never runs and the model load would be wasted. */
+            if (!input_has_video(input_filename)) {
                 av_log(NULL, AV_LOG_INFO,
                        "RIFE: audio-only input, skipping the model load\n");
                 fsr_rife = 0;
-            } else if (fsr_rife && fsr_rife_boot() < 0) {
+            } else if (fsr_rife_boot() < 0) {
                 av_log(NULL, AV_LOG_WARNING,
                        "RIFE: unavailable, using optical-flow frame generation\n");
                 fsr_rife = 0;
