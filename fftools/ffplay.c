@@ -397,9 +397,11 @@ static int fsr_fg = 1;             /* frame generation (hardware optical flow),
                                     * only warns), so the saved value is always
                                     * the user's own choice. */
 static int fsr_rife = 0;           /* FG engine: 0 = optical-flow warp (default),
-                                    * 1 = RIFE where it fits. RIFE still boots for
-                                    * any video (see below) so 'r' can switch to
-                                    * it; this only sets which engine starts. */
+                                    * 1 = RIFE where it fits. RIFE only boots when
+                                    * chosen at launch (its ~0.6s Vulkan+model load
+                                    * can't run later), so starting from FLOW, 'r'
+                                    * applies on the next launch. */
+static int rife_booted = 0;        /* RIFE's Vulkan/model came up this session */
 static int fg_rife_pref = 0;       /* persisted RIFE/FLOW choice; only the 'r'
                                     * hotkey changes it, so an audio-only file or
                                     * a failed RIFE boot (which force fsr_rife off
@@ -5156,7 +5158,9 @@ static void event_loop(VideoState *cur_stream)
                 av_log(NULL, AV_LOG_INFO, "Frame generation: %s\n",
                        fsr_rife ? "RIFE" : "optical flow");
                 if (renderer)
-                    fsr_toast_show(renderer, fsr_rife ? "FG RIFE" : "FG FLOW");
+                    fsr_toast_show(renderer,
+                                   fsr_rife && !rife_booted ? "FG RIFE (restart)" :
+                                   fsr_rife ? "FG RIFE" : "FG FLOW");
                 if (show_fps)
                     status_hud_update(-1);   /* reflect the switch right away */
                 cur_stream->force_refresh = 1;
@@ -5826,7 +5830,14 @@ int main(int argc, char **argv)
              * video input regardless of which engine starts active, so the 'r'
              * hotkey can switch to it; skip only for audio-only input, where
              * frame generation never runs and the model load would be wasted. */
-            if (!input_has_video(input_filename)) {
+            /* RIFE's Vulkan device + model load costs ~0.6s and must run before
+             * the renderer (it cannot be brought up later). Only pay it when
+             * RIFE is the chosen engine (-rife or the remembered fg_rife=1);
+             * with the default optical-flow engine, skip it entirely for a fast
+             * start. Starting from FLOW, 'r' therefore takes effect next launch. */
+            if (!fsr_rife) {
+                /* FLOW engine: no RIFE boot */
+            } else if (!input_has_video(input_filename)) {
                 av_log(NULL, AV_LOG_INFO,
                        "RIFE: audio-only input, skipping the model load\n");
                 fsr_rife = 0;
@@ -5834,6 +5845,8 @@ int main(int argc, char **argv)
                 av_log(NULL, AV_LOG_WARNING,
                        "RIFE: unavailable, using optical-flow frame generation\n");
                 fsr_rife = 0;
+            } else {
+                rife_booted = 1;
             }
             renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
             if (!renderer) {
