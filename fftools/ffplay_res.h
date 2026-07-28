@@ -28,4 +28,12 @@
 #define IDR_RIFE_FLOWNET_PARAM 101
 #define IDR_RIFE_FLOWNET_BIN   102
 
+/* Noto Sans KR (variable TTF), embedded so the on-screen text (subtitles,
+ * title bar, badges) renders with a bundled font instead of depending on a
+ * system font being installed. Registered at runtime with AddFontMemResourceEx
+ * (see ffplay_ui.c). */
+#define IDR_FONT_NOTOSANS      110
+/* HMFMPYUN (family "Pyunji R"), embedded and used for text subtitles only. */
+#define IDR_FONT_HMFMPYUN      111
+
 #endif /* FFTOOLS_FFPLAY_RES_H */

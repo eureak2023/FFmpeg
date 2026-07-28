@@ -8,3 +8,8 @@
  * SDL2. */
 IDR_RIFE_FLOWNET_PARAM RCDATA "../bin/rife-v4.6/flownet.param"
 IDR_RIFE_FLOWNET_BIN   RCDATA "../bin/rife-v4.6/flownet.bin"
+
+/* Bundled UI font (Noto Sans KR) and the subtitle font (HMFMPYUN / "Pyunji R").
+ * Vendored in the FFmpeg source root. */
+IDR_FONT_NOTOSANS      RCDATA "NotoSansKR-Regular.ttf"
+IDR_FONT_HMFMPYUN      RCDATA "HMFMPYUN.TTF"
