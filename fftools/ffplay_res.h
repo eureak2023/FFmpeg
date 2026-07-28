@@ -33,7 +33,5 @@
  * system font being installed. Registered at runtime with AddFontMemResourceEx
  * (see ffplay_ui.c). */
 #define IDR_FONT_NOTOSANS      110
-/* HMFMPYUN (family "Pyunji R"), embedded and used for text subtitles only. */
-#define IDR_FONT_HMFMPYUN      111
 
 #endif /* FFTOOLS_FFPLAY_RES_H */
