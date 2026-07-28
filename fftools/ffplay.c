@@ -1700,10 +1700,16 @@ static void status_hud_update(int fps)
                  fsr_denoise ? "ON" : "OFF", fg_state);
     }
     fsr_hud_set(renderer, buf);
-    {   /* restore-engine status on the left (e.g. "JASNA ACTIVE" / "LADA WAIT") */
-        char lbuf[24];
-        snprintf(lbuf, sizeof(lbuf), "%s %s", lada_engine_name(), lada_status());
-        fsr_hud_left_set(renderer, lbuf);
+    {   /* restore-engine status on the left (e.g. "JASNA ACTIVE" / "LADA WAIT"),
+         * shown only while an engine is engaged - nothing when it is off, so no
+         * stray "JASNA OFF" sits in the corner. */
+        if (strcmp(lada_status(), "OFF")) {
+            char lbuf[24];
+            snprintf(lbuf, sizeof(lbuf), "%s %s", lada_engine_name(), lada_status());
+            fsr_hud_left_set(renderer, lbuf);
+        } else {
+            fsr_hud_left_set(renderer, "");
+        }
     }
 }
 
