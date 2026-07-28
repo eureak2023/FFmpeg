@@ -1695,9 +1695,15 @@ static const char *fg_src =
     /* tolerance grows with motion but is capped: unlimited slack let large
      * shaky motion pass garbage through (image tearing) */
     "    float w = clamp(1.0 - err / (3.0 + 0.25 * min(mag, 32.0)), 0.0, 1.0);\n"
-    "    vec3 fallback = phase < 0.5 ? texture(prevTex, uv).rgb\n"
-    "                                : texture(curTex, uv).rgb;\n"
-    "    vec3 mid = mix(fallback, mix(cPrev, cCur, phase), w);\n"
+    /* Motion-adaptive: fast regions are where the block-grid warp shimmers most
+     * (a cell straddling a moving edge averages subject and background motion).
+     * Ease the warp off there so a temporally-stable crossfade shows through
+     * instead of a wobbling edge - trades a little edge sharpness on fast motion
+     * for much less shimmer. Static/slow areas keep the full warp. */
+    "    float motion = clamp((mag - 8.0) / 24.0, 0.0, 1.0);\n"
+    "    w *= 1.0 - 0.6 * motion;\n"
+    "    vec3 xfade = mix(texture(prevTex, uv).rgb, texture(curTex, uv).rgb, phase);\n"
+    "    vec3 mid = mix(xfade, mix(cPrev, cCur, phase), w);\n"
     "    if (hdrMode > 0.5)\n"
     "        mid = hdr_tonemap(mid);\n"
     "    fragColor = vec4(mid, 1.0);\n"
