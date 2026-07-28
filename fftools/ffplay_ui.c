@@ -508,8 +508,8 @@ void ui_sub_draw(SDL_Renderer *renderer, int win_w, int win_h, double now)
         }
     }
 
-    px = win_h * 7 / 160;                 /* ~70% of the former win_h/16 */
-    px = px < 13 ? 13 : px > 112 ? 112 : px;
+    px = win_h * 49 / 1600;               /* ~49% of win_h/16 (70% of former) */
+    px = px < 9 ? 9 : px > 78 ? 78 : px;
     if (strcmp(text, subs.cur) || px != subs.font_px) {
         char *line, *save = NULL;
 
