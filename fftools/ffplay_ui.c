@@ -163,23 +163,8 @@ static const wchar_t *ui_font_name(void)
     return name;
 }
 
-/* Subtitle font: bundled HMFMPYUN ("Pyunji R"); falls back to the default UI
- * font if it is unavailable. */
-static const wchar_t *ui_sub_font_name(void)
-{
-    static const wchar_t *name;
-    static int tried;
-
-    if (!tried) {
-        tried = 1;
-        if (ui_register_font(IDR_FONT_HMFMPYUN))
-            name = L"Pyunji R";
-    }
-    return name ? name : ui_font_name();
-}
 #else
-static const wchar_t *ui_font_name(void)     { return NULL; }
-static const wchar_t *ui_sub_font_name(void) { return NULL; }
+static const wchar_t *ui_font_name(void) { return NULL; }
 #endif
 
 /* Rasterize UTF-8 text with the bundled font via GDI (handles Korean and
@@ -538,8 +523,7 @@ void ui_sub_draw(SDL_Renderer *renderer, int win_w, int win_h, double now)
 
                 subs.line_tex[li] = render_text_sys(renderer, line, px,
                                                     &subs.line_w[li],
-                                                    &subs.line_h[li], 0,
-                                                    ui_sub_font_name());
+                                                    &subs.line_h[li], 0, NULL);
                 if (subs.line_tex[li])
                     subs.nlines++;
             }
