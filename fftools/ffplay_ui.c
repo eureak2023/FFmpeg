@@ -41,6 +41,7 @@
 #include "ffplay_fsr.h"
 #include "ffplay_ui.h"
 #include "ffplay_thumb.h"
+#include "ffplay_res.h"
 
 #define BAR_H          48       /* control bar height, px */
 #define SEEK_H         28       /* seek row hit-area height, px (taller = easier to click) */
@@ -128,12 +129,65 @@ static struct {
     int last_drawn_hover;
 } ui;
 
-/* Rasterize UTF-8 text with the system font via GDI (handles Korean and
+/* Register an embedded TTF (RCDATA) with GDI - process-private, no install and
+ * no admin rights. Returns 1 if it became available under its family name. */
+#ifdef _WIN32
+static int ui_register_font(int resid)
+{
+    HMODULE mod = GetModuleHandleW(NULL);
+    HRSRC   res = FindResourceW(mod, MAKEINTRESOURCEW(resid), (LPCWSTR)RT_RCDATA);
+    HGLOBAL h;
+    DWORD   sz, n = 0;
+    void   *p;
+
+    if (!res)
+        return 0;
+    h  = LoadResource(mod, res);
+    sz = SizeofResource(mod, res);
+    p  = h ? LockResource(h) : NULL;
+    return p && sz && AddFontMemResourceEx(p, sz, NULL, &n) && n;
+}
+
+/* Default UI font (title bar, badges, thumbnails, HUD): bundled Noto Sans KR if
+ * it registered, else the system Malgun Gothic. */
+static const wchar_t *ui_font_name(void)
+{
+    static const wchar_t *name = L"Malgun Gothic";
+    static int tried;
+
+    if (!tried) {
+        tried = 1;
+        if (ui_register_font(IDR_FONT_NOTOSANS))
+            name = L"Noto Sans KR";
+    }
+    return name;
+}
+
+/* Subtitle font: bundled HMFMPYUN ("Pyunji R"); falls back to the default UI
+ * font if it is unavailable. */
+static const wchar_t *ui_sub_font_name(void)
+{
+    static const wchar_t *name;
+    static int tried;
+
+    if (!tried) {
+        tried = 1;
+        if (ui_register_font(IDR_FONT_HMFMPYUN))
+            name = L"Pyunji R";
+    }
+    return name ? name : ui_font_name();
+}
+#else
+static const wchar_t *ui_font_name(void)     { return NULL; }
+static const wchar_t *ui_sub_font_name(void) { return NULL; }
+#endif
+
+/* Rasterize UTF-8 text with the bundled font via GDI (handles Korean and
  * everything else the pixel font cannot). White glyphs, alpha from
  * coverage. Returns NULL on failure (caller falls back to the pixel font). */
 static SDL_Texture *render_text_sys(SDL_Renderer *r, const char *utf8,
                                     int px_h, int *out_w, int *out_h,
-                                    int multiline)
+                                    int multiline, const wchar_t *face)
 {
 #ifdef _WIN32
     const UINT dtflags = (multiline ? 0u : (UINT)DT_SINGLELINE) | DT_NOPREFIX;
@@ -156,7 +210,7 @@ static SDL_Texture *render_text_sys(SDL_Renderer *r, const char *utf8,
     font = CreateFontW(-px_h, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                        ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-                       L"Malgun Gothic");
+                       face ? face : ui_font_name());
     if (!font)
         goto out;
     old_font = (HFONT)SelectObject(dc, font);
@@ -221,7 +275,7 @@ out:
 SDL_Texture *ui_render_text(SDL_Renderer *r, const char *utf8, int px_h,
                             int *out_w, int *out_h)
 {
-    return render_text_sys(r, utf8, px_h, out_w, out_h, 1);
+    return render_text_sys(r, utf8, px_h, out_w, out_h, 1, NULL);
 }
 
 /* ---- text subtitles (SRT/SMI/ASS events rendered with the system font) */
@@ -456,8 +510,21 @@ void ui_sub_draw(SDL_Renderer *renderer, int win_w, int win_h, double now)
     }
     SDL_UnlockMutex(subs.lock);
 
-    px = win_h / 16;
-    px = px < 18 ? 18 : px > 64 ? 64 : px;
+    /* Size and place the subtitle against the actual render canvas, not the
+     * passed window size: the latter comes from window events in logical points
+     * and can lag or mismatch the physical drawable (High-DPI, fullscreen), so
+     * the text ended up small on fullscreen. */
+    {
+        int ow = 0, oh = 0;
+        SDL_GetRendererOutputSize(renderer, &ow, &oh);
+        if (ow > 0 && oh > 0) {
+            win_w = ow;
+            win_h = oh;
+        }
+    }
+
+    px = win_h * 7 / 160;                 /* ~70% of the former win_h/16 */
+    px = px < 13 ? 13 : px > 112 ? 112 : px;
     if (strcmp(text, subs.cur) || px != subs.font_px) {
         char *line, *save = NULL;
 
@@ -471,7 +538,8 @@ void ui_sub_draw(SDL_Renderer *renderer, int win_w, int win_h, double now)
 
                 subs.line_tex[li] = render_text_sys(renderer, line, px,
                                                     &subs.line_w[li],
-                                                    &subs.line_h[li], 0);
+                                                    &subs.line_h[li], 0,
+                                                    ui_sub_font_name());
                 if (subs.line_tex[li])
                     subs.nlines++;
             }
@@ -491,7 +559,7 @@ void ui_sub_draw(SDL_Renderer *renderer, int win_w, int win_h, double now)
         dst.y = y;
         dst.w = subs.line_w[i];
         dst.h = subs.line_h[i];
-        /* outline: the same texture tinted black around, then white on top */
+        /* outline: the same texture tinted black around, then yellow on top */
         SDL_SetTextureColorMod(t, 0, 0, 0);
         for (int dy = -2; dy <= 2; dy += 2)
             for (int dx = -2; dx <= 2; dx += 2) {
@@ -500,7 +568,7 @@ void ui_sub_draw(SDL_Renderer *renderer, int win_w, int win_h, double now)
                 if (dx || dy)
                     SDL_RenderCopy(renderer, t, NULL, &od);
             }
-        SDL_SetTextureColorMod(t, 245, 245, 245);
+        SDL_SetTextureColorMod(t, 255, 235, 0);
         SDL_RenderCopy(renderer, t, NULL, &dst);
         y -= 4;
     }
@@ -1213,7 +1281,7 @@ static void draw_seek_thumb(SDL_Renderer *r, int win_w, int seek_top,
         if (ui.thumb_label_tex)
             SDL_DestroyTexture(ui.thumb_label_tex);
         ui.thumb_label_tex = render_text_sys(r, tc, 15,
-                                             &ui.thumb_label_w, &ui.thumb_label_h, 0);
+                                             &ui.thumb_label_w, &ui.thumb_label_h, 0, NULL);
         av_strlcpy(ui.thumb_label, tc, sizeof(ui.thumb_label));
     }
     if (ui.thumb_label_tex) {
@@ -1337,7 +1405,7 @@ void ui_draw(SDL_Renderer *renderer, int win_w, int win_h,
     if (!ui.title_tex && ui.title[0]) {
         ui.title_scale = 1; /* system font renders at final size */
         ui.title_tex = render_text_sys(renderer, ui.title, TITLE_H - 14,
-                                       &ui.title_w, &ui.title_h, 0);
+                                       &ui.title_w, &ui.title_h, 0, NULL);
         if (!ui.title_tex) { /* fallback: pixel font (ASCII only), drawn x2 */
             ui.title_scale = 2;
             ui.title_tex = render_text(renderer, ui.title,
@@ -1415,7 +1483,7 @@ controls:
             if (ui.badge_str[i][0])
                 ui.badge_tex[i] = render_text_sys(renderer, ui.badge_str[i],
                                                   16, &ui.badge_w[i],
-                                                  &ui.badge_h[i], 0);
+                                                  &ui.badge_h[i], 0, NULL);
         }
         ui.badges_dirty = 0;
     }
