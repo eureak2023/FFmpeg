@@ -1711,6 +1711,18 @@ static const char *fg_src =
     "    vec2 d = vec2(texelFetch(t, g1, 0).xy);\n"
     "    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y) / 32.0;\n"
     "}\n"
+    /* Warp confidence at a flow-grid position: forward/backward consistency
+     * relative to motion, then eased off hard on fast motion (that is where the
+     * block-grid warp shimmers). Low -> prefer the stable crossfade. */
+    "float conf(vec2 pg) {\n"
+    "    vec2 F = sampleFlow(flowFwd, pg);\n"
+    "    vec2 B = sampleFlow(flowBwd, pg);\n"
+    "    float err = length(F + B);\n"
+    "    float mag = length(F) + length(B);\n"
+    "    float w = clamp(1.0 - err / (3.0 + 0.25 * min(mag, 32.0)), 0.0, 1.0);\n"
+    "    float motion = clamp((mag - 5.0) / 24.0, 0.0, 1.0);\n"
+    "    return w * (1.0 - 0.8 * motion);\n"
+    "}\n"
     "void main() {\n"
     "    vec2 ts = vec2(textureSize(curTex, 0));\n"
     "    vec2 uv = gl_FragCoord.xy / outSize;\n"
@@ -1719,21 +1731,17 @@ static const char *fg_src =
     "    vec2 B = sampleFlow(flowBwd, pg);\n"
     "    vec3 cPrev = texture(prevTex, uv - phase * F / ts).rgb;\n"
     "    vec3 cCur  = texture(curTex,  uv - (1.0 - phase) * B / ts).rgb;\n"
-    /* Confidence from forward/backward consistency, relative to the motion
-     * magnitude; where flow disagrees (occlusions, errors) fall back to the
-     * unwarped temporally-nearer frame instead of ghosting. */
-    "    float err = length(F + B);\n"
-    "    float mag = length(F) + length(B);\n"
-    /* tolerance grows with motion but is capped: unlimited slack let large
-     * shaky motion pass garbage through (image tearing) */
-    "    float w = clamp(1.0 - err / (3.0 + 0.25 * min(mag, 32.0)), 0.0, 1.0);\n"
-    /* Motion-adaptive: fast regions are where the block-grid warp shimmers most
-     * (a cell straddling a moving edge averages subject and background motion).
-     * Ease the warp off there so a temporally-stable crossfade shows through
-     * instead of a wobbling edge - trades a little edge sharpness on fast motion
-     * for much less shimmer. Static/slow areas keep the full warp. */
-    "    float motion = clamp((mag - 8.0) / 24.0, 0.0, 1.0);\n"
-    "    w *= 1.0 - 0.6 * motion;\n"
+    /* Dilated motion-adaptive confidence: take the lowest confidence over a
+     * one-cell neighbourhood so the stable crossfade covers the whole wobbling
+     * edge halo (the block-grid smear is ~1 cell wide), not just the exact
+     * disagreement pixels. This suppresses shimmer on moving objects more
+     * thoroughly, at the cost of a little softening on fast motion. Static and
+     * slow areas keep conf~1 and so the full warp. */
+    "    float w = conf(pg);\n"
+    "    w = min(w, conf(pg + vec2( 1.0, 0.0)));\n"
+    "    w = min(w, conf(pg + vec2(-1.0, 0.0)));\n"
+    "    w = min(w, conf(pg + vec2( 0.0, 1.0)));\n"
+    "    w = min(w, conf(pg + vec2( 0.0,-1.0)));\n"
     "    vec3 xfade = mix(texture(prevTex, uv).rgb, texture(curTex, uv).rgb, phase);\n"
     "    vec3 mid = mix(xfade, mix(cPrev, cCur, phase), w);\n"
     "    if (hdrMode > 0.5)\n"
