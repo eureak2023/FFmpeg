@@ -402,6 +402,8 @@ static int fsr_rife = 0;           /* FG engine: 0 = optical-flow warp (default)
                                     * can't run later), so starting from FLOW, 'r'
                                     * applies on the next launch. */
 static int rife_booted = 0;        /* RIFE's Vulkan/model came up this session */
+static int fg_debug = 0;           /* 'i': top-left red marker that blinks only on
+                                    * a genuinely interpolated frame (see below) */
 static int fg_rife_pref = 0;       /* persisted RIFE/FLOW choice; only the 'r'
                                     * hotkey changes it, so an audio-only file or
                                     * a failed RIFE boot (which force fsr_rife off
@@ -1926,6 +1928,55 @@ static void album_display(VideoState *is)
     audio_vis_draw(is);
 }
 
+/* Debug marker (toggled with 'i'): a top-left red square that appears ONLY on a
+ * generated frame whose content actually differs from the previous presented
+ * frame - i.e. a genuine interpolated frame. It hashes a centre patch of the
+ * finished frame and compares it to the previous one (every frame, to keep the
+ * baseline current); a generated frame identical to what came before (a no-op
+ * duplicate, e.g. on static content) draws nothing. So a blinking red box means
+ * FG is doing useful work; no box means no useful generation. */
+static void fg_debug_marker(int generated)
+{
+    static uint32_t prev_hash;
+    static uint32_t buf[96 * 96];
+    int ow = 0, oh = 0, s, sw, sh;
+    uint32_t hash = 2166136261u;
+    int changed = 1;
+    SDL_Rect r, sample;
+
+    if (!fg_debug || !renderer)
+        return;
+    SDL_GetRendererOutputSize(renderer, &ow, &oh);
+    if (ow <= 0 || oh <= 0)
+        return;
+
+    sw = ow < 96 ? ow : 96;
+    sh = oh < 96 ? oh : 96;
+    sample.x = (ow - sw) / 2;
+    sample.y = (oh - sh) / 2;
+    sample.w = sw;
+    sample.h = sh;
+    if (SDL_RenderReadPixels(renderer, &sample, SDL_PIXELFORMAT_ARGB8888,
+                             buf, sw * 4) == 0) {
+        for (int i = 0; i < sw * sh; i++)
+            hash = (hash ^ buf[i]) * 16777619u;   /* FNV-1a over the patch */
+        changed = hash != prev_hash;
+        prev_hash = hash;
+    }
+
+    if (!generated || !changed)                   /* only real interpolated frames */
+        return;
+    s = oh / 36;
+    if (s < 14)
+        s = 14;
+    r.x = 14;
+    r.y = 14;
+    r.w = s;
+    r.h = s;
+    SDL_SetRenderDrawColor(renderer, 255, 40, 40, 255);
+    SDL_RenderFillRect(renderer, &r);
+}
+
 static void video_display(VideoState *is)
 {
     if (!is->width)
@@ -1944,6 +1995,7 @@ static void video_display(VideoState *is)
     ui_draw_overlay(is);
     fsr_toast_draw(renderer);
     fsr_hud_draw(renderer);
+    fg_debug_marker(0);                /* this path only ever shows a real frame */
     SDL_RenderPresent(renderer);
     fps_tick();
 }
@@ -2212,6 +2264,7 @@ static void video_fg_display(VideoState *is, double phase)
     ui_draw_overlay(is);
     fsr_toast_draw(renderer);
     fsr_hud_draw(renderer);
+    fg_debug_marker(drew);             /* red = generated frame, green = repeat */
     SDL_RenderPresent(renderer);
     fps_tick();
 }
@@ -5148,6 +5201,16 @@ static void event_loop(VideoState *cur_stream)
                 av_log(NULL, AV_LOG_INFO, "FG %s\n", fsr_fg ? "enabled" : "disabled");
                 if (renderer)
                     fsr_toast_show(renderer, fsr_fg ? "FG ON" : "FG OFF");
+                cur_stream->force_refresh = 1;
+                break;
+            case SDLK_i:
+                /* Debug: corner marker blinks red (generated) / green (real) so
+                 * you can see whether FG is actually producing frames. */
+                fg_debug = !fg_debug;
+                av_log(NULL, AV_LOG_INFO, "FG debug marker %s\n",
+                       fg_debug ? "on" : "off");
+                if (renderer)
+                    fsr_toast_show(renderer, fg_debug ? "FG DEBUG ON" : "FG DEBUG OFF");
                 cur_stream->force_refresh = 1;
                 break;
             case SDLK_r:
