@@ -431,7 +431,15 @@ static int64_t audio_callback_time;
 static SDL_Window *window;
 static SDL_Renderer *renderer;
 static SDL_RendererInfo renderer_info = {0};
+/* The audio device is opened once and then kept open and running for the whole
+ * session, across every file switch - see audio_open() and audio_owner. It is
+ * not started the moment it is opened, but once decoded samples are queued; see
+ * audio_prebuffer_check(). */
 static SDL_AudioDeviceID audio_dev;
+static SDL_AudioSpec     audio_dev_spec;   /* format the open device runs with */
+static VideoState       *audio_owner;      /* stream the callback feeds from   */
+static int               audio_dev_started;
+static int64_t           audio_dev_deadline;
 
 static VkRenderer *vk_renderer;
 
@@ -1393,8 +1401,16 @@ static void stream_component_close(VideoState *is, int stream_index)
 
     switch (codecpar->codec_type) {
     case AVMEDIA_TYPE_AUDIO:
+        /* Detach the callback from this stream, but leave the device open and
+         * running (it emits silence with no owner). Closing it here - what
+         * stock ffplay does - tears down and re-creates the output stream on
+         * every file switch, and the endpoint needs a moment to come back:
+         * with PgDn through a music folder that swallows the opening of each
+         * track. The device is closed for good in do_exit(). */
+        SDL_LockAudioDevice(audio_dev);
+        audio_owner = NULL;
+        SDL_UnlockAudioDevice(audio_dev);
         decoder_abort(&is->auddec, &is->sampq);
-        SDL_CloseAudioDevice(audio_dev);
         decoder_destroy(&is->auddec);
         swr_free(&is->swr_ctx);
         av_freep(&is->audio_buf1);
@@ -1583,6 +1599,9 @@ static void do_exit(VideoState *is)
     if (is) {
         stream_close(is);
     }
+    /* kept open across file switches (see audio_open), so close it here */
+    if (audio_dev)
+        SDL_CloseAudioDevice(audio_dev);
     ui_uninit();
     fsr_uninit();
     if (renderer)
@@ -3609,9 +3628,16 @@ static int audio_decode_frame(VideoState *is)
 /* prepare a new audio buffer */
 static void sdl_audio_callback(void *opaque, Uint8 *stream, int len)
 {
-    VideoState *is = opaque;
+    /* Not the userdata handed to SDL_OpenAudioDevice: the device outlives the
+     * VideoState it was opened for, so the stream to read from is whatever
+     * audio_owner currently points at (NULL between files -> silence). */
+    VideoState *is = audio_owner;
     int audio_size, len1;
 
+    if (!is) {
+        memset(stream, 0, len);
+        return;
+    }
     audio_callback_time = av_gettime_relative();
 
     while (len > 0) {
@@ -3664,6 +3690,14 @@ static int audio_open(void *opaque, AVChannelLayout *wanted_channel_layout, int 
     int next_sample_rate_idx = FF_ARRAY_ELEMS(next_sample_rates) - 1;
     int wanted_nb_channels = wanted_channel_layout->nb_channels;
 
+    /* An already-open device is reused as-is (see audio_dev_spec): the output
+     * endpoint is shared-mode WASAPI, so its format does not follow the file
+     * anyway - SDL was asked with ALLOW_FREQUENCY_CHANGE|ALLOW_CHANNELS_CHANGE
+     * and hands back the endpoint's own mix format, which reopening would only
+     * hand back again. swr converts whatever the new file decodes into it. */
+    if (audio_dev)
+        goto reuse;
+
     env = SDL_getenv("SDL_AUDIO_CHANNELS");
     if (env) {
         wanted_nb_channels = atoi(env);
@@ -3708,7 +3742,11 @@ static int audio_open(void *opaque, AVChannelLayout *wanted_channel_layout, int 
                "SDL advised audio format %d is not supported!\n", spec.format);
         return -1;
     }
-    if (spec.channels != wanted_spec.channels) {
+    audio_dev_spec = spec;
+
+reuse:
+    spec = audio_dev_spec;
+    if (spec.channels != wanted_channel_layout->nb_channels) {
         av_channel_layout_uninit(wanted_channel_layout);
         av_channel_layout_default(wanted_channel_layout, spec.channels);
         if (wanted_channel_layout->order != AV_CHANNEL_ORDER_NATIVE) {
@@ -3947,6 +3985,11 @@ static int stream_component_open(VideoState *is, int stream_index)
 
     if (!av_dict_get(opts, "threads", NULL, 0))
         av_dict_set(&opts, "threads", "auto", 0);
+    /* A cover picture is a single still frame: frame-threading it only spawns
+     * and tears down a thread per core on every file open, delaying the start
+     * of playback for nothing. */
+    if (ic->streams[stream_index]->disposition & AV_DISPOSITION_ATTACHED_PIC)
+        av_dict_set(&opts, "threads", "1", 0);
     if (stream_lowres)
         av_dict_set_int(&opts, "lowres", stream_lowres, 0);
 
@@ -4017,7 +4060,10 @@ static int stream_component_open(VideoState *is, int stream_index)
         }
         if ((ret = decoder_start(&is->auddec, audio_thread, "audio_decoder", is)) < 0)
             goto out;
-        SDL_PauseAudioDevice(audio_dev, 0);
+        /* Leave the device paused for now: the read thread starts it once the
+         * first samples are decoded (audio_prebuffer_check). */
+        audio_dev_started  = 0;
+        audio_dev_deadline = av_gettime_relative() + 300000;
         {
             char aname[16], chans[8];
             int ch = avctx->ch_layout.nb_channels;
@@ -4169,6 +4215,35 @@ static int find_stream_by_language(AVFormatContext *ic, enum AVMediaType type,
         }
     }
     return best;
+}
+
+/* Start the SDL audio device once a few decoded frames are waiting, instead of
+ * the moment the audio stream is opened (what stock ffplay does).
+ *
+ * The device runs on a ~43ms buffer and, on Windows, audio_decode_frame()
+ * busy-waits half a buffer for samples before giving up and emitting silence.
+ * Starting it at stream-open time means it asks for samples while the rest of
+ * the open is still running - the attached cover picture is decoded, lyrics and
+ * subtitles are set up, the first packets have not even been read - so the
+ * opening of the file comes out chopped: fragments of real audio interleaved
+ * with silence. Most audible on a PgDn track switch, where that whole sequence
+ * runs again with the device already live.
+ *
+ * Four frames cover about two hardware buffers at the usual frame sizes (1152
+ * samples for MP3, 1024 for AAC). The EOF test and the deadline make sure a
+ * file that decodes little or no audio still gets its device running. */
+static void audio_prebuffer_check(VideoState *is)
+{
+    if (audio_dev_started || is->audio_stream < 0)
+        return;
+    if (frame_queue_nb_remaining(&is->sampq) < 4 && !is->eof &&
+        av_gettime_relative() < audio_dev_deadline)
+        return;
+    SDL_LockAudioDevice(audio_dev);
+    audio_owner = is;
+    SDL_UnlockAudioDevice(audio_dev);
+    SDL_PauseAudioDevice(audio_dev, 0);   /* only does anything the first time */
+    audio_dev_started = 1;
 }
 
 /* this thread gets the stream from the disk or the network */
@@ -4438,8 +4513,14 @@ static int read_thread(void *arg)
         infinite_buffer = 1;
 
     /* Seek-bar hover previews: a private software decoder on the same file.
-     * Only worthwhile with a real, seekable, non-realtime video stream. */
-    if (is->video_stream >= 0 && !display_disable && !is->realtime)
+     * Only worthwhile with a real, seekable, non-realtime video stream. A
+     * music file's cover art is a video stream too, and thumb_open() would
+     * reject it - but only after a second avformat_open_input() plus
+     * avformat_find_stream_info() on the same file. That is dead weight on
+     * every track switch, right where the audio is trying to start, so skip
+     * it here instead. */
+    if (is->video_stream >= 0 && !display_disable && !is->realtime &&
+        !(is->video_st->disposition & AV_DISPOSITION_ATTACHED_PIC))
         thumb_open(is->filename,
                    ic->duration != AV_NOPTS_VALUE ?
                    ic->duration / (double)AV_TIME_BASE : 0.0);
@@ -4447,6 +4528,7 @@ static int read_thread(void *arg)
     for (;;) {
         if (is->abort_request)
             break;
+        audio_prebuffer_check(is);
         if (is->paused != is->last_paused) {
             is->last_paused = is->paused;
             if (is->paused)
