@@ -455,7 +455,9 @@ int lada_default_on(void)
  * that restores with jasna's GPU/TensorRT pipeline and emits the SAME raw-RGB wire format
  * as lada_sidecar, so the whole display path is reused. Enabled with -jasna. g_jasna_home
  * is the jasna source checkout (holds .venv + model_weights + the importable jasna pkg). */
-#define JASNA_SIDECAR_PY "D:/Source_AI/ffplay-fsr1/jasna_sidecar.py"
+/* The script lives inside the checkout (it is versioned with the jasna fork), so it moves
+ * with -jasna_home instead of being pinned to one absolute path. */
+#define JASNA_SIDECAR_PY "jasna_sidecar.py"
 /* jasna is the only restoration engine (the older lada_sidecar path was removed). Default
  * ON so restoration works without any extra flag; -jasna_home can relocate the checkout. */
 static int  g_use_jasna = 1;
@@ -525,9 +527,9 @@ static void resolve_sidecar(char *cmdline, size_t cmdsz, char *workdir, size_t w
         return;
     }
     snprintf(cmdline, cmdsz,
-             "\"%s\\.venv\\Scripts\\python.exe\" \"%s\" "
+             "\"%s\\.venv\\Scripts\\python.exe\" \"%s\\" JASNA_SIDECAR_PY "\" "
              "--model-weights \"%s\\model_weights\" --log \"%s\\jasna_sidecar.log\"",
-             g_jasna_home, JASNA_SIDECAR_PY, g_jasna_home, g_jasna_home);
+             g_jasna_home, g_jasna_home, g_jasna_home, g_jasna_home);
     av_strlcpy(workdir, g_jasna_home, wdsz);
     snprintf(torchlib, tlsz, "%s\\.venv\\Lib\\site-packages\\torch\\lib", g_jasna_home);
     if (!dir_exists(torchlib)) torchlib[0] = 0;
