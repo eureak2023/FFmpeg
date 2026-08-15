@@ -44,7 +44,16 @@
 #include "ffplay_res.h"
 
 #define BAR_H          48       /* control bar height, px */
-#define SEEK_H         28       /* seek row hit-area height, px (taller = easier to click) */
+#define SEEK_H         28       /* seek row height used for layout, px */
+#define SEEK_HIT_H     46       /* how far the seek/volume hit area reaches up
+                                 * over the video from the control bar, px.
+                                 * Larger than SEEK_H so the thin track is easy
+                                 * to hit without the overlay getting taller. */
+#define SEEK_HIT_DOWN  (BAR_H / 2 - 10)
+                                /* ...and how far it reaches down into the
+                                 * control bar: to just above the timecode text
+                                 * and the button icons, which both start at
+                                 * BAR_H / 2 - 9 (see ui_draw). */
 #define BTN_W          52       /* control button width, px */
 #define SEEK_PAD       10       /* seek track horizontal padding, px */
 #define TITLE_H        34       /* title bar height, px */
@@ -882,7 +891,12 @@ static int ui_visible_now(void)
 static int element_at(int x, int y)
 {
     int bar_top  = ui.win_h - BAR_H;
-    int seek_top = bar_top - SEEK_H;
+    /* The seek row reacts well beyond where it is drawn: up over the video (on
+     * a window too short to give that away, stop at the title bar) and down
+     * into the control bar as far as the timecode text. The buttons keep the
+     * rest of the bar - their icons sit below hit_bot, untouched. */
+    int hit_top  = FFMAX(bar_top - SEEK_HIT_H, TITLE_H);
+    int hit_bot  = bar_top + SEEK_HIT_DOWN;
 
     if (y < TITLE_H) {
         int from_right = (ui.win_w - x) / WBTN_W;
@@ -894,9 +908,9 @@ static int element_at(int x, int y)
         default: return EL_TITLE;
         }
     }
-    if (y >= seek_top && y < bar_top)
+    if (y >= hit_top && y < hit_bot)
         return x >= ui.win_w - VOL_AREA ? EL_VOL : EL_SEEK;
-    if (y >= bar_top && y < ui.win_h) {
+    if (y >= hit_bot && y < ui.win_h) {
         int i = x / BTN_W;
 
         switch (i) {
