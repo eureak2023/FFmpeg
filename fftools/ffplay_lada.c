@@ -67,6 +67,13 @@
  * has stopped moving for this long. */
 #define LADA_SEEK_DEBOUNCE_MS 350
 
+/* Give up on a pause-to-buffer that stops making progress. A healthy restorer emits its
+ * first frame ~1-2 s after a SEEK and then streams continuously, so this many ms with the
+ * buffered-ahead count never once growing means the sidecar is not coming back (a wedged
+ * pass, or one that died without closing the stream). Rather than hold the picture frozen
+ * in "BUFFER", we disengage and play the originals - degrade, never stall. */
+#define LADA_BUFFER_STALL_MS 10000
+
 typedef struct LadaFrame {
     uint32_t gen;
     double   pts;
@@ -107,6 +114,8 @@ static struct {
     int        toast_ready;
     int        announced;    /* "LADA ACTIVE" already toasted this enable session */
     int        buffering;    /* pause-to-buffer state (hysteresis for lada_should_buffer) */
+    Uint32     buffer_since; /* when the current buffer-pause last grew (stall watchdog) */
+    int        buffer_best;  /* deepest `ahead` seen during the current buffer-pause     */
     int        warmed;       /* restoration for the current generation has started arriving
                              * (or been applied) since the last OPEN/SEEK; gates pause-to-
                              * buffer so it engages only once the restorer is actually live */
@@ -191,8 +200,22 @@ static int reader_thread(void *arg)
             SDL_UnlockMutex(L.mtx);
             continue;
         }
-        if (len == 0)          /* EOF marker for this generation */
+        if (len == 0) {        /* EOF marker: this generation produced its last frame */
+            SDL_LockMutex(L.mtx);
+            /* No more frames will ever arrive for this generation - either the file
+             * ended, or the restore pass died (jasna logs "pass error" and keeps the
+             * process alive, so the stream does NOT close and `died` never trips).
+             * Either way, holding playback to wait for a refill would freeze the
+             * picture in "BUFFER" forever, so disarm the gate here and let playback
+             * continue on the original frames. `warmed` re-arms by itself as soon as
+             * the next OPEN/SEEK starts delivering again. */
+            if (gen == L.gen) {
+                L.warmed    = 0;
+                L.buffering = 0;
+            }
+            SDL_UnlockMutex(L.mtx);
             continue;
+        }
         if (w <= 0 || h <= 0 || len != w * h * 3) {
             av_log(NULL, AV_LOG_WARNING, "lada: bad frame header %dx%d len=%d\n", w, h, len);
             break;
@@ -326,6 +349,89 @@ static int file_exists(const char *path)
     return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
 }
 
+static int dir_exists(const char *path)
+{
+    DWORD a = GetFileAttributesA(path);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+/* Build the sidecar's environment with ITS OWN torch\lib as the only cuDNN on PATH.
+ *
+ * cudnn64_9.dll does not link its sublibraries (cudnn_graph/ops/cnn/engines_*64_9.dll) -
+ * it LoadLibrary()s them lazily, by BARE NAME, which searches the exe dir, system32 and
+ * then PATH, but never torch\lib (torch registers that via os.add_dll_directory, which
+ * bare-name loads ignore). So a CUDA Toolkit on the player's PATH can answer that load
+ * with a DIFFERENT cuDNN than the sidecar bundles.
+ *
+ * That is not hypothetical: installing CUDA v13.3 (cuDNN 9.24) broke restoration on this
+ * box. Its bin\x64 carries cudnn_engines_tensor_ir64_9.dll, a sublibrary the bundled 9.20
+ * does not ship - so before that install the lazy load simply found nothing and 9.20 ran
+ * fine without it, but afterwards it loads the 9.24 file, the version check fails, and
+ * EVERY convolution dies with "CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH". The sidecar
+ * catches that per pass and stays alive, so it just stops emitting frames (the "pass
+ * error" lines in jasna_sidecar.log) - which is what used to strand playback in "BUFFER".
+ * Note this cannot be fixed by putting torch\lib first: the file is not there at all, so
+ * the search falls through to the toolkit. The foreign directories must be REMOVED.
+ *
+ * The child gets its own copy of PATH, so the player's own stays untouched.
+ * Returns an av_malloc'd "K=V\0...\0" block for CreateProcess, or NULL to inherit ours. */
+static char *make_sidecar_env(const char *torchlib)
+{
+    char *env, *out, *w;
+    const char *p;
+    size_t total = 0;
+    int patched = 0;
+
+    if (!torchlib || !torchlib[0])
+        return NULL;
+    env = GetEnvironmentStringsA();
+    if (!env)
+        return NULL;
+    for (p = env; *p; p += strlen(p) + 1)
+        total += strlen(p) + 1;
+    out = av_malloc(total + strlen(torchlib) + 32);
+    if (!out) {
+        FreeEnvironmentStringsA(env);
+        return NULL;
+    }
+    w = out;
+    for (p = env; *p; p += strlen(p) + 1) {
+        if (!patched && !_strnicmp(p, "PATH=", 5)) {
+            /* Rebuild PATH as: our torch\lib, then every inherited entry that does NOT
+             * carry a cuDNN of its own. Dropping whole directories (rather than trying to
+             * match individual files) is what keeps a toolkit-only sublibrary like
+             * cudnn_engines_tensor_ir64_9.dll from being found at all. */
+            char *dirs = av_strdup(p + 5), *dir, *save = NULL;
+            w += sprintf(w, "PATH=%s", torchlib);
+            for (dir = dirs ? av_strtok(dirs, ";", &save) : NULL; dir;
+                 dir = av_strtok(NULL, ";", &save)) {
+                char probe[4096];
+                if (!*dir)
+                    continue;
+                snprintf(probe, sizeof(probe), "%s\\cudnn64_9.dll", dir);
+                if (file_exists(probe)) {
+                    av_log(NULL, AV_LOG_VERBOSE,
+                           "lada: hiding foreign cuDNN from the sidecar: %s\n", dir);
+                    continue;
+                }
+                w += sprintf(w, ";%s", dir);
+            }
+            av_free(dirs);
+            w++;                        /* step over the NUL sprintf wrote */
+            patched = 1;
+        } else {
+            size_t n = strlen(p) + 1;
+            memcpy(w, p, n);
+            w += n;
+        }
+    }
+    if (!patched)                       /* no PATH inherited: give the child just ours */
+        w += sprintf(w, "PATH=%s", torchlib) + 1;
+    *w = 0;                             /* env blocks end with a second NUL */
+    FreeEnvironmentStringsA(env);
+    return out;
+}
+
 int lada_default_on(void)
 {
     char exepath[4096], *base, *p;
@@ -375,11 +481,15 @@ const char *lada_engine_name(void)
     return g_use_jasna ? "JASNA" : "LADA";
 }
 
+/* torchlib receives the sidecar's own torch\lib for make_sidecar_env() (empty if absent). */
 static void resolve_sidecar(char *cmdline, size_t cmdsz, char *workdir, size_t wdsz,
+                            char *torchlib, size_t tlsz,
                             const char *lada_home, const char *device)
 {
     char exedir[4096] = {0}, cand[4096];
     (void)lada_home; (void)device;   /* jasna is the only restoration engine now */
+
+    torchlib[0] = 0;
 
     DWORD n = GetModuleFileNameA(NULL, exedir, sizeof(exedir));
     if (n > 0 && n < sizeof(exedir)) {
@@ -399,6 +509,8 @@ static void resolve_sidecar(char *cmdline, size_t cmdsz, char *workdir, size_t w
                      "\"%s\" --model-weights \"%s\\jasna_sidecar\\model_weights\" "
                      "--log \"%s\\jasna_sidecar.log\"", cand, exedir, exedir);
             av_strlcpy(workdir, exedir, wdsz);
+            snprintf(torchlib, tlsz, "%s\\jasna_sidecar\\_internal\\torch\\lib", exedir);
+            if (!dir_exists(torchlib)) torchlib[0] = 0;
             return;
         }
     }
@@ -408,6 +520,8 @@ static void resolve_sidecar(char *cmdline, size_t cmdsz, char *workdir, size_t w
                  "\"%s\" --model-weights \"%s\\dist\\jasna_sidecar\\model_weights\" "
                  "--log \"%s\\jasna_sidecar.log\"", cand, g_jasna_home, g_jasna_home);
         av_strlcpy(workdir, g_jasna_home, wdsz);
+        snprintf(torchlib, tlsz, "%s\\dist\\jasna_sidecar\\_internal\\torch\\lib", g_jasna_home);
+        if (!dir_exists(torchlib)) torchlib[0] = 0;
         return;
     }
     snprintf(cmdline, cmdsz,
@@ -415,12 +529,16 @@ static void resolve_sidecar(char *cmdline, size_t cmdsz, char *workdir, size_t w
              "--model-weights \"%s\\model_weights\" --log \"%s\\jasna_sidecar.log\"",
              g_jasna_home, JASNA_SIDECAR_PY, g_jasna_home, g_jasna_home);
     av_strlcpy(workdir, g_jasna_home, wdsz);
+    snprintf(torchlib, tlsz, "%s\\.venv\\Lib\\site-packages\\torch\\lib", g_jasna_home);
+    if (!dir_exists(torchlib)) torchlib[0] = 0;
 }
 
 int lada_start(const char *input_path, const char *lada_home, const char *device)
 {
     char cmdline[8192];
     char workdir[4096];
+    char torchlib[4096];
+    char *envblk;
     STARTUPINFOA si;
     PROCESS_INFORMATION pi;
     SECURITY_ATTRIBUTES sa;
@@ -449,7 +567,9 @@ int lada_start(const char *input_path, const char *lada_home, const char *device
     SetHandleInformation(child_stdin_wr,  HANDLE_FLAG_INHERIT, 0);
 
     resolve_sidecar(cmdline, sizeof(cmdline), workdir, sizeof(workdir),
+                    torchlib, sizeof(torchlib),
                     lada_home, device && *device ? device : "cuda");
+    envblk = make_sidecar_env(torchlib);   /* pin its cuDNN - see make_sidecar_env() */
 
     memset(&si, 0, sizeof(si));
     si.cb = sizeof(si);
@@ -460,11 +580,13 @@ int lada_start(const char *input_path, const char *lada_home, const char *device
     memset(&pi, 0, sizeof(pi));
 
     if (!CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, CREATE_NO_WINDOW,
-                        NULL, workdir, &si, &pi)) {
+                        envblk, workdir, &si, &pi)) {
+        av_free(envblk);
         av_log(NULL, AV_LOG_WARNING,
                "lada: could not launch sidecar (%s) - restoration disabled\n", cmdline);
         goto fail;
     }
+    av_free(envblk);   /* CreateProcess copied it into the child */
     /* Put the sidecar in a kill-on-close job object: if this player exits for ANY
      * reason (including a crash or being force-killed, when our cleanup never runs),
      * Windows closes the job handle and terminates the sidecar with it - so a multi-GB
@@ -655,9 +777,27 @@ int lada_should_buffer(double display_pts)
     if (high > cap) high = cap;
     if (high < 1)   high = 1;
     if (L.buffering) {
-        if (ahead >= high) L.buffering = 0;   /* refilled -> resume */
+        if (ahead >= high) {
+            L.buffering = 0;                  /* refilled -> resume */
+        } else if (ahead > L.buffer_best) {
+            L.buffer_best  = ahead;           /* still filling -> keep waiting */
+            L.buffer_since = SDL_GetTicks();
+        } else if ((int)(SDL_GetTicks() - L.buffer_since) >= LADA_BUFFER_STALL_MS) {
+            /* Nothing new for LADA_BUFFER_STALL_MS: the restorer is not coming back.
+             * Backstop for a sidecar that wedges without even closing its stream (the
+             * EOF marker handles the cases where it does) - see LADA_BUFFER_STALL_MS. */
+            L.buffering = 0;
+            L.warmed    = 0;                  /* keep the gate off until it delivers again */
+            av_log(NULL, AV_LOG_WARNING,
+                   "lada: no restored frames for %d s while buffering at %.2f - "
+                   "resuming on the original video\n", LADA_BUFFER_STALL_MS / 1000, display_pts);
+        }
     } else {
-        if (ahead <= 0)    L.buffering = 1;   /* drained -> pause (still on held frame) */
+        if (ahead <= 0) {                     /* drained -> pause (still on held frame) */
+            L.buffering    = 1;
+            L.buffer_best  = ahead;
+            L.buffer_since = SDL_GetTicks();
+        }
     }
     ahead = L.buffering;
     SDL_UnlockMutex(L.mtx);
@@ -731,6 +871,8 @@ int lada_frame_for(double pts_sec, double dur_sec, const uint8_t **rgb, int *w, 
         L.seek_pending = 0;
         L.warmed    = 1;   /* engage the gate now... */
         L.buffering = 1;   /* ...and hold playback at the seek point until it refills */
+        L.buffer_best  = 0;             /* arm the stall watchdog for this fresh pause, */
+        L.buffer_since = SDL_GetTicks(); /* else a stale timestamp fires it immediately */
     }
 
     if (!isnan(L.last_pts)) {
