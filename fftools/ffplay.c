@@ -1727,8 +1727,13 @@ static void status_hud_update(int fps)
          * shown only while an engine is engaged - nothing when it is off, so no
          * stray "JASNA OFF" sits in the corner. */
         if (strcmp(lada_status(), "OFF")) {
-            char lbuf[24];
-            snprintf(lbuf, sizeof(lbuf), "%s %s", lada_engine_name(), lada_status());
+            /* Append the detection model once the sidecar has reported it - which model runs
+             * depends on the weights installed beside the sidecar, and they differ enough in
+             * speed that it is worth seeing on screen rather than only in the log. */
+            const char *model = lada_model_name();
+            char lbuf[64];
+            snprintf(lbuf, sizeof(lbuf), "%s %s%s%s", lada_engine_name(), lada_status(),
+                     *model ? " " : "", model);
             fsr_hud_left_set(renderer, lbuf);
         } else {
             fsr_hud_left_set(renderer, "");
@@ -5198,9 +5203,13 @@ static void apply_engine(VideoState *is, int to_jasna)
         }
     }
     if (renderer) {
-        char tmsg[24];
-        snprintf(tmsg, sizeof(tmsg), "%s %s", lada_engine_name(),
-                 lada_active() ? "LOADING" : "OFF");
+        /* Name the detection model when it is already known (re-enabling an engine that has
+         * loaded once); on a first enable the sidecar has not reported it yet, so the toast
+         * is just "<ENGINE> LOADING" and the status overlay fills the model in shortly. */
+        const char *model = lada_active() ? lada_model_name() : "";
+        char tmsg[64];
+        snprintf(tmsg, sizeof(tmsg), "%s %s%s%s", lada_engine_name(),
+                 lada_active() ? "LOADING" : "OFF", *model ? " " : "", model);
         fsr_toast_show(renderer, tmsg);
     }
     if (is)
@@ -5466,9 +5475,10 @@ static void event_loop(VideoState *cur_stream)
                 av_log(NULL, AV_LOG_INFO, "lada mosaic restoration %s\n",
                        lada_active() ? "enabled" : "disabled");
                 if (renderer) {
-                    char tmsg[24];
-                    snprintf(tmsg, sizeof(tmsg), "%s %s", lada_engine_name(),
-                             lada_active() ? "LOADING" : "OFF");
+                    const char *model = lada_active() ? lada_model_name() : "";
+                    char tmsg[64];
+                    snprintf(tmsg, sizeof(tmsg), "%s %s%s%s", lada_engine_name(),
+                             lada_active() ? "LOADING" : "OFF", *model ? " " : "", model);
                     fsr_toast_show(renderer, tmsg);
                 }
                 cur_stream->force_refresh = 1;

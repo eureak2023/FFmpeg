@@ -76,6 +76,10 @@ int  lada_is_jasna(void);
  * overlay/toasts so the two are distinguishable on screen. */
 const char *lada_engine_name(void);
 
+/* Detection model the sidecar reported at READY (e.g. "rfdetr-v6"), "" if not known yet.
+ * Which one runs depends on the weights installed, so the overlay names it. */
+const char *lada_model_name(void);
+
 /* Short state word for the status overlay: "OFF", "LOADING" (models loading),
  * "WAIT" (ready, buffering the lead), "ACTIVE" (restored frames showing),
  * "BUFFER" (paused to refill), "FAILED". */

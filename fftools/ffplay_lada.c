@@ -105,6 +105,7 @@ static struct {
     LadaFrame *held;         /* frame locked to the current displayed pts */
     uint32_t   gen;          /* generation of the current OPEN/SEEK        */
     int        ready;        /* sidecar has finished loading models        */
+    char       model[32];    /* detection model it picked, from READY      */
     int        opened;       /* OPEN already sent                          */
     double     last_pts;     /* previous requested pts (seek detection)    */
 
@@ -194,9 +195,23 @@ static int reader_thread(void *arg)
         memcpy(&pts, hdr + 16, 8);
         memcpy(&len, hdr + 24, 4);
 
-        if (w < 0) {           /* READY marker: models finished loading */
+        if (w < 0) {           /* w==-1 READY (models loaded), w==-2 INFO (model known) */
+            /* Payload (may be absent) is the detection model the sidecar chose - it depends
+             * on which weights are installed, so this is the only way we learn it. INFO
+             * arrives before the slow load so the overlay can name the model while it still
+             * says LOADING. Read the payload unconditionally: leaving bytes in the pipe
+             * would desync the next header. */
+            char name[32] = {0};
+            if (len > 0) {
+                if (len >= (int)sizeof(name) || !read_full((uint8_t *)name, len))
+                    break;
+                name[len] = 0;
+            }
             SDL_LockMutex(L.mtx);
-            L.ready = 1;
+            if (w == -1)
+                L.ready = 1;
+            if (name[0])
+                av_strlcpy(L.model, name, sizeof(L.model));
             SDL_UnlockMutex(L.mtx);
             continue;
         }
@@ -481,6 +496,14 @@ int lada_is_jasna(void) { return g_use_jasna; }
 const char *lada_engine_name(void)
 {
     return g_use_jasna ? "JASNA" : "LADA";
+}
+
+/* Detection model the sidecar picked (from the READY marker), "" until it reports one.
+ * Which model runs depends on the weights installed next to the sidecar, so this is worth
+ * showing: it is the difference between the fast 576px detector and the legacy 768px one. */
+const char *lada_model_name(void)
+{
+    return L.model;
 }
 
 /* torchlib receives the sidecar's own torch\lib for make_sidecar_env() (empty if absent). */
@@ -956,6 +979,7 @@ void lada_set_jasna(const char *jasna_home) { (void)jasna_home; }
 void lada_set_engine(int use_jasna, const char *jasna_home) { (void)use_jasna; (void)jasna_home; }
 int  lada_is_jasna(void) { return 0; }
 const char *lada_engine_name(void) { return "LADA"; }
+const char *lada_model_name(void) { return ""; }
 const char *lada_status(void) { return "OFF"; }
 int  lada_should_buffer(double display_pts) { (void)display_pts; return 0; }
 int  lada_poll_toast(char *buf, int buflen) { (void)buf; (void)buflen; return 0; }
