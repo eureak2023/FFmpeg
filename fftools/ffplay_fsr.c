@@ -2939,6 +2939,24 @@ void fsr_hud_set(SDL_Renderer *renderer, const char *text)
         hud_tex = toast_render(renderer, text, &hud_w, &hud_h);
 }
 
+/* Dark translucent plate behind HUD text: white glyphs alone wash out over
+ * bright video. Drawn before the text so the glyphs sit on top of it. */
+static void hud_plate(SDL_Renderer *renderer, const SDL_Rect *dst, int pad)
+{
+    SDL_Rect bg = { dst->x - pad, dst->y - pad,
+                    dst->w + 2 * pad, dst->h + 2 * pad };
+    SDL_BlendMode prev_bm;
+    uint8_t r, g, b, a;
+
+    SDL_GetRenderDrawBlendMode(renderer, &prev_bm);
+    SDL_GetRenderDrawColor(renderer, &r, &g, &b, &a);
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 150);
+    SDL_RenderFillRect(renderer, &bg);
+    SDL_SetRenderDrawColor(renderer, r, g, b, a);
+    SDL_SetRenderDrawBlendMode(renderer, prev_bm);
+}
+
 int fsr_hud_draw(SDL_Renderer *renderer)
 {
     int ow = 0, oh = 0, scale;
@@ -2959,24 +2977,7 @@ int fsr_hud_draw(SDL_Renderer *renderer)
      * the TAB status readout does not overlap it. */
     dst.y = 50;
 
-    /* Dark translucent plate behind the text: white glyphs alone wash out
-     * over bright video. Drawn first so the text sits on top of it. */
-    {
-        int pad = scale * 6;
-        SDL_Rect bg = { dst.x - pad, dst.y - pad,
-                        dst.w + 2 * pad, dst.h + 2 * pad };
-        SDL_BlendMode prev_bm;
-        uint8_t r, g, b, a;
-
-        SDL_GetRenderDrawBlendMode(renderer, &prev_bm);
-        SDL_GetRenderDrawColor(renderer, &r, &g, &b, &a);
-        SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
-        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 150);
-        SDL_RenderFillRect(renderer, &bg);
-        SDL_SetRenderDrawColor(renderer, r, g, b, a);
-        SDL_SetRenderDrawBlendMode(renderer, prev_bm);
-    }
-
+    hud_plate(renderer, &dst, scale * 6);
     SDL_RenderCopy(renderer, hud_tex, NULL, &dst);
     return 1;
 }
@@ -2984,14 +2985,34 @@ int fsr_hud_draw(SDL_Renderer *renderer)
 /* Second persistent HUD, top-LEFT corner (used for the lada status line). */
 static SDL_Texture *hud_left_tex;
 static int          hud_left_w, hud_left_h;
+static int          hud_left_sys;   /* the texture came from the system font */
 
 void fsr_hud_left_set(SDL_Renderer *renderer, const char *text)
 {
+    int ow = 0, oh = 0;
+
     if (hud_left_tex) {
         SDL_DestroyTexture(hud_left_tex);
         hud_left_tex = NULL;
     }
-    if (text && text[0])
+    if (!text || !text[0])
+        return;
+    /* Same reasoning as the right-hand HUD: the pixel font carries capitals and
+     * a handful of symbols only, so anything else silently loses letters (a
+     * lowercase model name came out blank). Sized off the output height so the
+     * two readouts match. */
+    SDL_GetRendererOutputSize(renderer, &ow, &oh);
+    hud_left_sys = 0;
+    if (oh > 0) {
+        int px = oh / 45;
+
+        if (px < 12)
+            px = 12;
+        hud_left_tex = ui_render_text(renderer, text, px,
+                                      &hud_left_w, &hud_left_h);
+        hud_left_sys = hud_left_tex != NULL;
+    }
+    if (!hud_left_tex)                  /* GDI unavailable: pixel font */
         hud_left_tex = toast_render(renderer, text, &hud_left_w, &hud_left_h);
 }
 
@@ -3003,13 +3024,16 @@ int fsr_hud_left_draw(SDL_Renderer *renderer)
     if (!hud_left_tex)
         return 0;
     SDL_GetRendererOutputSize(renderer, &ow, &oh);
-    scale = oh / 300;
+    /* Only the pixel-font fallback needs scaling up; the system font is already
+     * rasterized at the intended size. */
+    scale = hud_left_sys ? 1 : oh / 300;
     if (scale < 1)
         scale = 1;
     dst.w = hud_left_w * scale;
     dst.h = hud_left_h * scale;
     dst.x = 16;
     dst.y = 50;   /* below the UI title bar (34px) so the status doesn't overlap it */
+    hud_plate(renderer, &dst, scale * 6);
     SDL_RenderCopy(renderer, hud_left_tex, NULL, &dst);
     return 1;
 }

@@ -1716,24 +1716,30 @@ static void status_hud_update(int fps)
                      av_clip(fg_mult, 2, 4));
         else
             snprintf(fg_state, sizeof(fg_state), "OFF");
+        /* Name the restoration detection model alongside the rest of the pipeline
+         * state: which one runs depends on the weights installed beside the sidecar,
+         * and they differ enough in speed that it is worth seeing on screen rather
+         * than only in the log. Empty until the sidecar reports it (and while the
+         * engine is off), and then the line is omitted entirely. */
+        const char *model = strcmp(lada_status(), "OFF") ? lada_model_name() : "";
+
         snprintf(buf + n, sizeof(buf) - n,
-                 "FSR %s\nSHARP %d\nNR %s\nFG %s",
+                 "FSR %s\nSHARP %d\nNR %s\nFG %s%s%s",
                  fsr ? "ON" : "OFF",
                  (int)lrint((2.0f - fsr_sharpness) / 2.0f * 100.0f),
-                 fsr_denoise ? "ON" : "OFF", fg_state);
+                 fsr_denoise ? "ON" : "OFF", fg_state,
+                 *model ? "\nMODEL " : "", model);
     }
     fsr_hud_set(renderer, buf);
     {   /* restore-engine status on the left (e.g. "JASNA ACTIVE" / "LADA WAIT"),
          * shown only while an engine is engaged - nothing when it is off, so no
          * stray "JASNA OFF" sits in the corner. */
         if (strcmp(lada_status(), "OFF")) {
-            /* Append the detection model once the sidecar has reported it - which model runs
-             * depends on the weights installed beside the sidecar, and they differ enough in
-             * speed that it is worth seeing on screen rather than only in the log. */
-            const char *model = lada_model_name();
+            /* Engine and state only - the detection model goes in the right-hand
+             * readout above, next to the other pipeline state. */
             char lbuf[64];
-            snprintf(lbuf, sizeof(lbuf), "%s %s%s%s", lada_engine_name(), lada_status(),
-                     *model ? " " : "", model);
+            snprintf(lbuf, sizeof(lbuf), "%s %s",
+                     lada_engine_name(), lada_status());
             fsr_hud_left_set(renderer, lbuf);
         } else {
             fsr_hud_left_set(renderer, "");
