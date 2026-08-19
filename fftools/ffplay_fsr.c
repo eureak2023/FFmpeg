@@ -298,6 +298,7 @@ static struct {
     void      (APIENTRY *ReadPixels)(GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *);
     void      (APIENTRY *GetTexImage)(GLenum, GLint, GLenum, GLenum, void *);
     void      (APIENTRY *TexImage2D)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *);
+    void      (APIENTRY *PixelStorei)(GLenum, GLint);
 } gl;
 
 static int          fsr_state;      /* 0 = uninitialized, 1 = ready, -1 = unavailable */
@@ -590,6 +591,7 @@ static int load_gl_functions(void)
     LOAD(ReadPixels);
     LOAD(GetTexImage);
     LOAD(TexImage2D);
+    LOAD(PixelStorei);
 #undef LOAD
     return 0;
 }
@@ -1679,18 +1681,15 @@ static const char *fg_src =
     "    vec2 d = vec2(texelFetch(t, g1, 0).xy);\n"
     "    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y) / 32.0;\n"
     "}\n"
-    /* Warp confidence at a flow-grid position: forward/backward consistency
-     * relative to motion, then eased off hard on fast motion (that is where the
-     * block-grid warp shimmers). Low -> prefer the stable crossfade. */
-    "float conf(vec2 pg) {\n"
-    "    vec2 F = sampleFlow(flowFwd, pg);\n"
-    "    vec2 B = sampleFlow(flowBwd, pg);\n"
-    "    float err = length(F + B);\n"
-    "    float mag = length(F) + length(B);\n"
-    "    float w = clamp(1.0 - err / (3.0 + 0.25 * min(mag, 32.0)), 0.0, 1.0);\n"
-    "    float motion = clamp((mag - 5.0) / 24.0, 0.0, 1.0);\n"
-    "    return w * (1.0 - 0.8 * motion);\n"
-    "}\n"
+    /* Warp confidence: forward/backward consistency relative to motion, eased
+     * off hard on fast motion (that is where the block-grid warp shimmers),
+     * min-dilated one cell so the stable crossfade covers the whole wobbling
+     * edge halo. All of that is baked once per frame *pair* on the CPU into
+     * confTex (see fg_bake_conf()) - it is a pure function of the flow field -
+     * so this pass reads a single bilinear tap instead of the ~40 integer
+     * fetches the inline version cost, and the bilinear filtering also smooths
+     * the warp/crossfade transition across cell borders. */
+    "uniform sampler2D confTex;\n"
     "void main() {\n"
     "    vec2 ts = vec2(textureSize(curTex, 0));\n"
     "    vec2 uv = gl_FragCoord.xy / outSize;\n"
@@ -1699,17 +1698,7 @@ static const char *fg_src =
     "    vec2 B = sampleFlow(flowBwd, pg);\n"
     "    vec3 cPrev = texture(prevTex, uv - phase * F / ts).rgb;\n"
     "    vec3 cCur  = texture(curTex,  uv - (1.0 - phase) * B / ts).rgb;\n"
-    /* Dilated motion-adaptive confidence: take the lowest confidence over a
-     * one-cell neighbourhood so the stable crossfade covers the whole wobbling
-     * edge halo (the block-grid smear is ~1 cell wide), not just the exact
-     * disagreement pixels. This suppresses shimmer on moving objects more
-     * thoroughly, at the cost of a little softening on fast motion. Static and
-     * slow areas keep conf~1 and so the full warp. */
-    "    float w = conf(pg);\n"
-    "    w = min(w, conf(pg + vec2( 1.0, 0.0)));\n"
-    "    w = min(w, conf(pg + vec2(-1.0, 0.0)));\n"
-    "    w = min(w, conf(pg + vec2( 0.0, 1.0)));\n"
-    "    w = min(w, conf(pg + vec2( 0.0,-1.0)));\n"
+    "    float w = texture(confTex, uv).r;\n"
     "    vec3 xfade = mix(texture(prevTex, uv).rgb, texture(curTex, uv).rgb, phase);\n"
     "    vec3 mid = mix(xfade, mix(cPrev, cCur, phase), w);\n"
     "    if (hdrMode > 0.5)\n"
@@ -1723,12 +1712,23 @@ static struct {
     CUcontext ctx;
     NV_OF_CUDA_API_FUNCTION_LIST of;
     NvOFHandle hof;
+    NvOFHandle hof2;              /* backward-direction session (may be NULL).
+                                   * NVOF temporal hints reuse the previous
+                                   * Execute's flow as the next one's starting
+                                   * point; alternating fwd/bwd on one session
+                                   * would poison them, so each direction gets
+                                   * its own session and the hints stay on. */
+    int dual;                     /* hof2 initialized for the current size */
     int w, h, gw, gh;             /* session and flow-grid dimensions */
     int grid;                     /* flow-grid size actually in use (2 or 4) */
     NvOFGPUBufferHandle in_buf[2];
+    NvOFGPUBufferHandle in2_buf[2];       /* hof2's copies of the inputs */
     NvOFGPUBufferHandle flow_buf[2];      /* [0] = forward, [1] = backward */
     NV_OF_CUDA_BUFFER_STRIDE_INFO flow_stride[2];
-    int16_t *flow_host[2];   /* host copy (every 2nd row) for shake stats */
+    int16_t *flow_host[2];   /* host copy of the flow fields (conf + stats) */
+    int cgw, cgh, cstep;     /* confidence-grid dims; cstep flow cells apart */
+    uint8_t *conf_host, *conf_tmp;        /* baked confidence + scratch */
+    GLuint conf_tex;         /* R8 confidence texture, cgw x cgh, bilinear */
     int pair_skip;           /* current pair too shaky to interpolate */
     /* CUDA-registered staging texture. The VideoProcessor writes with the
      * GPU video engine, which must never touch a CUDA-registered resource
@@ -1763,29 +1763,39 @@ static void fg_destroy(void)
                 gl.DeleteTextures(1, &fg.flow_tex[i]);
             if (fg.in_buf[i])
                 fg.of.nvOFDestroyGPUBufferCuda(fg.in_buf[i]);
+            if (fg.in2_buf[i])
+                fg.of.nvOFDestroyGPUBufferCuda(fg.in2_buf[i]);
             if (fg.flow_buf[i])
                 fg.of.nvOFDestroyGPUBufferCuda(fg.flow_buf[i]);
             av_freep(&fg.flow_host[i]);
         }
+        if (fg.conf_tex)
+            gl.DeleteTextures(1, &fg.conf_tex);
         if (fg.vp_res)
             fg.cu->cuGraphicsUnregisterResource(fg.vp_res);
         if (fg.cuda_tex)
             ID3D11Texture2D_Release(fg.cuda_tex);
-        /* fg.hof and fg.ctx are boot-owned and live for the process. */
+        /* fg.hof/hof2 and fg.ctx are boot-owned and live for the process. */
         if (fg.fg_tex)
             SDL_DestroyTexture(fg.fg_tex);
     }
+    av_freep(&fg.conf_host);
+    av_freep(&fg.conf_tmp);
     for (int i = 0; i < 2; i++) {
         fg.flow_res[i] = NULL;
         fg.flow_tex[i] = 0;
         fg.in_buf[i]   = NULL;
+        fg.in2_buf[i]  = NULL;
         fg.flow_buf[i] = NULL;
         fg.in_frame[i] = NULL;
     }
     fg.vp_res   = NULL;
     fg.cuda_tex = NULL;
     fg.fg_tex   = NULL;
+    fg.conf_tex = 0;
+    fg.dual     = 0;
     fg.w = fg.h = fg.fg_w = fg.fg_h = 0;
+    fg.cgw = fg.cgh = 0;
     fg.pair_a = fg.pair_b = NULL;
     if (fg.state == 1)
         fg.state = 0;
@@ -1817,6 +1827,7 @@ static void fg_on_convert(AVFrame *frame, int slot)
     }
     if (fg.cu->cuGraphicsSubResourceGetMappedArray(&arr, fg.vp_res, 0, 0) == CUDA_SUCCESS) {
         NV_OF_CUDA_BUFFER_STRIDE_INFO si;
+        int ok;
 
         fg.of.nvOFGPUBufferGetStrideInfo(fg.in_buf[slot], &si);
         cp.srcMemoryType = CU_MEMORYTYPE_ARRAY;
@@ -1826,7 +1837,16 @@ static void fg_on_convert(AVFrame *frame, int slot)
         cp.dstPitch      = si.strideInfo[0].strideXInBytes;
         cp.WidthInBytes  = (size_t)fg.w * 4;
         cp.Height        = fg.h;
-        if (fg.cu->cuMemcpy2D(&cp) == CUDA_SUCCESS) {
+        ok = fg.cu->cuMemcpy2D(&cp) == CUDA_SUCCESS;
+        /* The backward session reads its own input buffers; a device-to-device
+         * copy of ~8 MB is well under 0.1 ms, so just duplicate. */
+        if (ok && fg.dual && fg.in2_buf[slot]) {
+            fg.of.nvOFGPUBufferGetStrideInfo(fg.in2_buf[slot], &si);
+            cp.dstDevice = fg.of.nvOFGPUBufferGetCUdeviceptr(fg.in2_buf[slot]);
+            cp.dstPitch  = si.strideInfo[0].strideXInBytes;
+            ok = fg.cu->cuMemcpy2D(&cp) == CUDA_SUCCESS;
+        }
+        if (ok) {
             fg.in_frame[slot] = frame;
             fg.in_pts[slot]   = frame->pts;
         }
@@ -1892,13 +1912,23 @@ static int fg_boot(void)
     }
     if (fg.cu->cuCtxCreate(&fg.ctx, 0, cudev) != CUDA_SUCCESS)
         return -1;
-    /* Create the optical flow session while no decoding is running; doing
-     * this with an active D3D11 decoder crashes inside the driver. */
+    /* Create the optical flow sessions while no decoding is running; doing
+     * this with an active D3D11 decoder crashes inside the driver. Two
+     * sessions, one per direction, so NVOF's temporal hints (previous flow
+     * seeds the next computation - steadier vectors on continuous video) can
+     * stay enabled; alternating fwd/bwd on a single session would feed each
+     * call the *opposite* direction as its hint. */
     if (fg.of.nvCreateOpticalFlowCuda(fg.ctx, &fg.hof) != NV_OF_SUCCESS) {
         av_log(NULL, AV_LOG_WARNING, "FG: optical flow session creation failed\n");
         return -1;
     }
     fg.of.nvOFSetIOCudaStreams(fg.hof, 0, 0);
+    if (fg.of.nvCreateOpticalFlowCuda(fg.ctx, &fg.hof2) != NV_OF_SUCCESS) {
+        fg.hof2 = NULL; /* single-session fallback, hints off */
+        av_log(NULL, AV_LOG_INFO, "FG: backward session unavailable, temporal hints off\n");
+    } else {
+        fg.of.nvOFSetIOCudaStreams(fg.hof2, 0, 0);
+    }
     /* Keep the CUDA context off this (GL) thread except around our calls. */
     {
         CUcontext dummy;
@@ -1970,29 +2000,61 @@ static int fg_init_body(void)
         av_log(NULL, AV_LOG_INFO,
                "FG: grid %d unsupported here, using grid %d\n", FG_GRID, fg.grid);
 
-    /* Flow-buffer dimensions follow the grid actually granted. */
-    fg.gw = (fg.w + fg.grid - 1) / fg.grid;
-    fg.gh = (fg.h + fg.grid - 1) / fg.grid;
+    /* Bring the backward session up on the same parameters. If it fails, the
+     * forward session computes both directions with temporal hints off, as a
+     * single session used to. */
+    fg.dual = 0;
+    if (fg.hof2) {
+        ip.outGridSize = (NV_OF_OUTPUT_VECTOR_GRID_SIZE)fg.grid;
+        if (fg.of.nvOFInit(fg.hof2, &ip) == NV_OF_SUCCESS)
+            fg.dual = 1;
+        else
+            av_log(NULL, AV_LOG_INFO,
+                   "FG: backward session init failed, temporal hints off\n");
+    }
+
+    /* Flow-buffer dimensions follow the grid actually granted. The baked
+     * confidence texture caps its own resolution at one cell per 4 source
+     * pixels (grid 2 halves the sampling): confidence is a smooth mask, and
+     * this keeps the per-pair CPU bake and host copy bounded at 4K. */
+    fg.gw    = (fg.w + fg.grid - 1) / fg.grid;
+    fg.gh    = (fg.h + fg.grid - 1) / fg.grid;
+    fg.cstep = fg.grid == 2 ? 2 : 1;
+    fg.cgw   = (fg.gw + fg.cstep - 1) / fg.cstep;
+    fg.cgh   = (fg.gh + fg.cstep - 1) / fg.cstep;
 
     bd.width        = fg.w;
     bd.height       = fg.h;
     bd.bufferUsage  = NV_OF_BUFFER_USAGE_INPUT;
     bd.bufferFormat = NV_OF_BUFFER_FORMAT_ABGR8;
-    for (int i = 0; i < 2; i++)
+    for (int i = 0; i < 2; i++) {
         if (fg.of.nvOFCreateGPUBufferCuda(fg.hof, &bd, NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR,
                                           &fg.in_buf[i]) != NV_OF_SUCCESS)
             return -1;
+        if (fg.dual &&
+            fg.of.nvOFCreateGPUBufferCuda(fg.hof2, &bd, NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR,
+                                          &fg.in2_buf[i]) != NV_OF_SUCCESS)
+            return -1;
+    }
     bd.width        = fg.gw;
     bd.height       = fg.gh;
     bd.bufferUsage  = NV_OF_BUFFER_USAGE_OUTPUT;
     bd.bufferFormat = NV_OF_BUFFER_FORMAT_SHORT2;
     for (int i = 0; i < 2; i++) {
-        if (fg.of.nvOFCreateGPUBufferCuda(fg.hof, &bd, NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR,
+        NvOFHandle hof = i == 1 && fg.dual ? fg.hof2 : fg.hof;
+
+        if (fg.of.nvOFCreateGPUBufferCuda(hof, &bd, NV_OF_CUDA_BUFFER_TYPE_CUDEVICEPTR,
                                           &fg.flow_buf[i]) != NV_OF_SUCCESS)
             return -1;
         fg.of.nvOFGPUBufferGetStrideInfo(fg.flow_buf[i], &fg.flow_stride[i]);
-        fg.flow_host[i] = av_malloc((size_t)fg.gw * 4 * (fg.gh / 2 + 1));
+        /* Full rows (gw cells), fg.cgh of them (every cstep-th flow row). */
+        fg.flow_host[i] = av_malloc((size_t)fg.gw * 4 * fg.cgh);
     }
+    fg.conf_host = av_malloc((size_t)fg.cgw * fg.cgh);
+    fg.conf_tmp  = av_malloc((size_t)fg.cgw * fg.cgh);
+    if (!fg.conf_host || !fg.conf_tmp)
+        return -1;
+    memset(fg.conf_host, 255, (size_t)fg.cgw * fg.cgh);
 
     {
         D3D11_TEXTURE2D_DESC tdesc = { 0 };
@@ -2036,6 +2098,18 @@ static int fg_init_body(void)
             gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
             gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         }
+        /* Baked warp confidence, uploaded per pair; starts all-255 (full
+         * warp) so a failed bake never leaves undefined contents. */
+        gl.GenTextures(1, &fg.conf_tex);
+        gl.BindTexture(GL_TEXTURE_2D, fg.conf_tex);
+        gl.PixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        gl.TexImage2D(GL_TEXTURE_2D, 0, GL_R8, fg.cgw, fg.cgh, 0,
+                      GL_RED, GL_UNSIGNED_BYTE, fg.conf_host);
+        gl.PixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         gl.BindTexture(GL_TEXTURE_2D, prev_tex0);
         gl.ActiveTexture(prev_active);
     }
@@ -2051,11 +2125,12 @@ static int fg_init_body(void)
         return -1;
     {
         GLint prev_prog = 0, loc;
-        static const char *const names[4] = { "prevTex", "curTex", "flowFwd", "flowBwd" };
+        static const char *const names[5] = { "prevTex", "curTex", "flowFwd", "flowBwd",
+                                              "confTex" };
 
         gl.GetIntegerv(GL_CURRENT_PROGRAM, &prev_prog);
         gl.UseProgram(fg.prog);
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 5; i++) {
             loc = gl.GetUniformLocation(fg.prog, names[i]);
             if (loc >= 0)
                 gl.Uniform1i(loc, i);
@@ -2093,16 +2168,20 @@ static int fg_compute_flow_body(int sp, int sn)
     NV_OF_EXECUTE_INPUT_PARAMS ein = { 0 };
     NV_OF_EXECUTE_OUTPUT_PARAMS eout = { 0 };
 
-    ein.disableTemporalHints = 1;
+    /* Temporal hints stay on when each direction runs on its own session
+     * (see fg_boot()); the single-session fallback alternates directions,
+     * which would feed each call the opposite flow as its hint, so hints are
+     * disabled there. */
+    ein.disableTemporalHints = !fg.dual;
     ein.inputFrame     = fg.in_buf[sp];
     ein.referenceFrame = fg.in_buf[sn];
     eout.outputBuffer  = fg.flow_buf[0];
     if (fg.of.nvOFExecute(fg.hof, &ein, &eout) != NV_OF_SUCCESS)
         return -1;
-    ein.inputFrame     = fg.in_buf[sn];
-    ein.referenceFrame = fg.in_buf[sp];
+    ein.inputFrame     = fg.dual ? fg.in2_buf[sn] : fg.in_buf[sn];
+    ein.referenceFrame = fg.dual ? fg.in2_buf[sp] : fg.in_buf[sp];
     eout.outputBuffer  = fg.flow_buf[1];
-    if (fg.of.nvOFExecute(fg.hof, &ein, &eout) != NV_OF_SUCCESS)
+    if (fg.of.nvOFExecute(fg.dual ? fg.hof2 : fg.hof, &ein, &eout) != NV_OF_SUCCESS)
         return -1;
 
     if (fg.cu->cuGraphicsMapResources(2, fg.flow_res, 0) != CUDA_SUCCESS)
@@ -2124,42 +2203,80 @@ static int fg_compute_flow_body(int sp, int sn)
     }
     fg.cu->cuGraphicsUnmapResources(2, fg.flow_res, 0);
 
-    /* Shake detector: pull both flow fields to the host (every 2nd grid
-     * row) and measure the average motion magnitude and forward/backward
-     * inconsistency. Violent shake produces huge, inconsistent flow - the
-     * warp would tear the image apart, and interpolation buys nothing
-     * there anyway, so such pairs are flagged and skipped. */
+    /* Confidence bake + shake detector: pull both flow fields to the host
+     * (every fg.cstep-th grid row), bake the warp-confidence mask the shader
+     * used to evaluate per pixel (fwd/bwd consistency, motion ease-off, then
+     * a one-cell min dilate) into conf_tex, and measure the average motion
+     * magnitude and forward/backward inconsistency. Violent shake produces
+     * huge, inconsistent flow - the warp would tear the image apart, and
+     * interpolation buys nothing there anyway, so such pairs are flagged and
+     * skipped. All of this is per *pair*, so the cost does not scale with the
+     * FG multiplier. */
     fg.pair_skip = 0;
-    if (fg.flow_host[0] && fg.flow_host[1]) {
+    if (fg.flow_host[0] && fg.flow_host[1] && fg.conf_host && fg.conf_tmp) {
         double sum_mag = 0, sum_err = 0;
-        int rows = fg.gh / 2, n = 0;
+        int n = 0, copied = 1;
 
         for (int i = 0; i < 2; i++) {
             CUDA_MEMCPY2D cp = { 0 };
 
             cp.srcMemoryType = CU_MEMORYTYPE_DEVICE;
             cp.srcDevice     = fg.of.nvOFGPUBufferGetCUdeviceptr(fg.flow_buf[i]);
-            cp.srcPitch      = fg.flow_stride[i].strideInfo[0].strideXInBytes * 2;
+            cp.srcPitch      = fg.flow_stride[i].strideInfo[0].strideXInBytes * fg.cstep;
             cp.dstMemoryType = CU_MEMORYTYPE_HOST;
             cp.dstHost       = fg.flow_host[i];
             cp.dstPitch      = (size_t)fg.gw * 4;
             cp.WidthInBytes  = (size_t)fg.gw * 4;
-            cp.Height        = rows;
-            if (fg.cu->cuMemcpy2D(&cp) != CUDA_SUCCESS)
-                goto stats_done;
-        }
-        for (int y = 0; y < rows; y++) {
-            const int16_t *f = fg.flow_host[0] + (size_t)y * fg.gw * 2;
-            const int16_t *b = fg.flow_host[1] + (size_t)y * fg.gw * 2;
-
-            for (int x = 0; x < fg.gw * 2; x += 4) { /* every 2nd cell */
-                double fx = f[x] / 32.0, fy = f[x + 1] / 32.0;
-                double bx = b[x] / 32.0, by = b[x + 1] / 32.0;
-
-                sum_mag += fabs(fx) + fabs(fy);
-                sum_err += fabs(fx + bx) + fabs(fy + by);
-                n++;
+            cp.Height        = fg.cgh;
+            if (fg.cu->cuMemcpy2D(&cp) != CUDA_SUCCESS) {
+                copied = 0;
+                break;
             }
+        }
+        if (copied) {
+            for (int y = 0; y < fg.cgh; y++) {
+                const int16_t *f = fg.flow_host[0] + (size_t)y * fg.gw * 2;
+                const int16_t *b = fg.flow_host[1] + (size_t)y * fg.gw * 2;
+                uint8_t *dst = fg.conf_tmp + (size_t)y * fg.cgw;
+
+                for (int cx = 0; cx < fg.cgw; cx++) {
+                    int x = cx * fg.cstep * 2;
+                    float fx = f[x] / 32.0f, fy = f[x + 1] / 32.0f;
+                    float bx = b[x] / 32.0f, by = b[x + 1] / 32.0f;
+                    float err = sqrtf((fx + bx) * (fx + bx) + (fy + by) * (fy + by));
+                    float mag = sqrtf(fx * fx + fy * fy) + sqrtf(bx * bx + by * by);
+                    float w   = av_clipf(1.0f - err / (3.0f + 0.25f * FFMIN(mag, 32.0f)),
+                                         0.0f, 1.0f);
+                    float motion = av_clipf((mag - 5.0f) / 24.0f, 0.0f, 1.0f);
+
+                    dst[cx] = (uint8_t)(w * (1.0f - 0.8f * motion) * 255.0f + 0.5f);
+                    sum_mag += fabsf(fx) + fabsf(fy);
+                    sum_err += fabsf(fx + bx) + fabsf(fy + by);
+                    n++;
+                }
+            }
+            /* One-cell min dilate: low confidence must cover the whole
+             * wobbling edge halo (the block-grid smear is ~1 cell wide),
+             * not just the exact disagreement cells. */
+            for (int y = 0; y < fg.cgh; y++) {
+                const uint8_t *row  = fg.conf_tmp + (size_t)y * fg.cgw;
+                const uint8_t *up   = y > 0          ? row - fg.cgw : row;
+                const uint8_t *down = y < fg.cgh - 1 ? row + fg.cgw : row;
+                uint8_t *dst = fg.conf_host + (size_t)y * fg.cgw;
+
+                for (int x = 0; x < fg.cgw; x++) {
+                    uint8_t m = row[x];
+
+                    if (x > 0          && row[x - 1] < m) m = row[x - 1];
+                    if (x < fg.cgw - 1 && row[x + 1] < m) m = row[x + 1];
+                    if (up[x]   < m) m = up[x];
+                    if (down[x] < m) m = down[x];
+                    dst[x] = m;
+                }
+            }
+        } else {
+            /* No flow on the host: neutral mask (full warp) beats stale data. */
+            memset(fg.conf_host, 255, (size_t)fg.cgw * fg.cgh);
         }
         if (n) {
             double mag = sum_mag / n, err = sum_err / n;
@@ -2175,8 +2292,21 @@ static int fg_compute_flow_body(int sp, int sn)
                        "FG: shaky pair skipped (flow %.1f px, inconsistency %.1f px)\n",
                        mag, err);
         }
+        {
+            GLint prev_tex = 0, prev_active = 0;
+
+            gl.GetIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
+            gl.ActiveTexture(GL_TEXTURE0);
+            gl.GetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+            gl.BindTexture(GL_TEXTURE_2D, fg.conf_tex);
+            gl.PixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            gl.TexImage2D(GL_TEXTURE_2D, 0, GL_R8, fg.cgw, fg.cgh, 0,
+                          GL_RED, GL_UNSIGNED_BYTE, fg.conf_host);
+            gl.PixelStorei(GL_UNPACK_ALIGNMENT, 4);
+            gl.BindTexture(GL_TEXTURE_2D, prev_tex);
+            gl.ActiveTexture(prev_active);
+        }
     }
-stats_done:
     return 0;
 }
 
@@ -2194,10 +2324,11 @@ static int fg_compute_flow(int sp, int sn)
 static int fg_warp(SDL_Renderer *renderer, int sp, int sn, float phase,
                    int ow, int oh, int tonemap)
 {
-    GLint prev_prog = 0, prev_active = 0, prev_tex[4] = { 0 };
+    GLint prev_prog = 0, prev_active = 0, prev_tex[5] = { 0 };
     GLboolean blend, scissor;
     HANDLE objs[2] = { hwgl.gl_object[sp], hwgl.gl_object[sn] };
-    GLuint texs[4] = { hwgl.gl_tex[sp], hwgl.gl_tex[sn], fg.flow_tex[0], fg.flow_tex[1] };
+    GLuint texs[5] = { hwgl.gl_tex[sp], hwgl.gl_tex[sn], fg.flow_tex[0], fg.flow_tex[1],
+                       fg.conf_tex };
 
     if (fg.fg_w != ow || fg.fg_h != oh || !fg.fg_tex) {
         if (fg.fg_tex)
@@ -2225,7 +2356,7 @@ static int fg_warp(SDL_Renderer *renderer, int sp, int sn, float phase,
     gl.GetIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
     blend   = gl.IsEnabled(GL_BLEND);
     scissor = gl.IsEnabled(GL_SCISSOR_TEST);
-    for (int i = 3; i >= 0; i--) {
+    for (int i = 4; i >= 0; i--) {
         gl.ActiveTexture(GL_TEXTURE0 + i);
         gl.GetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex[i]);
         gl.BindTexture(GL_TEXTURE_2D, texs[i]);
@@ -2241,7 +2372,7 @@ static int fg_warp(SDL_Renderer *renderer, int sp, int sn, float phase,
     gl.Uniform1f(fg.peak_loc, hdr_peak);
     gl.DrawArrays(GL_TRIANGLES, 0, 3);
     gl.UseProgram(prev_prog);
-    for (int i = 3; i >= 0; i--) {
+    for (int i = 4; i >= 0; i--) {
         gl.ActiveTexture(GL_TEXTURE0 + i);
         gl.BindTexture(GL_TEXTURE_2D, prev_tex[i]);
     }
