@@ -1401,23 +1401,26 @@ static int hwgl_convert(AVFrame *frame, int slot)
                        "FSR: HDR10 input, PQ tone mapping in the shader\n");
         }
         hdr_active = frame->color_trc == AVCOL_TRC_SMPTE2084;
-        /* Content peak for the shader tone mapper: the mastering display
-         * peak when present, otherwise MaxCLL, otherwise 1000 nits. The
-         * BT.2446-A curve is referenced to the nominal grading peak, and
-         * MaxCLL is often bogus in the wild (e.g. written equal to MaxFALL),
-         * so the mastering metadata is the more reliable anchor - it also
-         * matches what hardware tone mappers key off. */
+        /* Content peak for the shader tone mapper: MaxCLL when present,
+         * otherwise the mastering display peak, otherwise 1000 nits. The
+         * BT.2446-A curve normalises by this, so it has to be the peak the
+         * content actually reaches, not the display it was graded on. On a
+         * title carrying MaxCLL 209 with a 1000-nit mastering display,
+         * normalising by 1000 leaves the picture in the bottom third of the
+         * curve: measured against libplacebo's bt.2446a render of the same
+         * frames, MaxCLL lands within 4% of it while the mastering peak comes
+         * out 24-30% dark. */
         if (hdr_active && hwgl.hdr_md_state < 2) {
             AVFrameSideData *sd_m =
                 av_frame_get_side_data(frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
             AVFrameSideData *sd_c =
                 av_frame_get_side_data(frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
 
-            if (sd_m && ((AVMasteringDisplayMetadata *)sd_m->data)->has_luminance &&
-                av_q2d(((AVMasteringDisplayMetadata *)sd_m->data)->max_luminance) > 0)
-                hdr_peak = (float)av_q2d(((AVMasteringDisplayMetadata *)sd_m->data)->max_luminance);
-            else if (sd_c && ((AVContentLightMetadata *)sd_c->data)->MaxCLL)
+            if (sd_c && ((AVContentLightMetadata *)sd_c->data)->MaxCLL)
                 hdr_peak = (float)((AVContentLightMetadata *)sd_c->data)->MaxCLL;
+            else if (sd_m && ((AVMasteringDisplayMetadata *)sd_m->data)->has_luminance &&
+                     av_q2d(((AVMasteringDisplayMetadata *)sd_m->data)->max_luminance) > 0)
+                hdr_peak = (float)av_q2d(((AVMasteringDisplayMetadata *)sd_m->data)->max_luminance);
             if (sd_c || sd_m) {
                 hwgl.hdr_md_state = 2;
                 av_log(NULL, AV_LOG_INFO, "FSR: HDR content peak %.0f nits\n",
