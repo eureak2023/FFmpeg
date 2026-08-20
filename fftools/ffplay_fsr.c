@@ -306,6 +306,8 @@ static char         gl_renderer_str[256];
 static GLuint       easu_prog, rcas_prog, copy_prog;
 static GLint        easu_con0_loc, rcas_sharp_loc, rcas_dns_loc, copy_invout_loc;
 static GLint        rcas_hdr_loc, rcas_peak_loc, copy_hdr_loc, copy_peak_loc;
+static const char  *fsr_dump_prefix;  /* FSR_DEBUG_DUMP, see fsr_dump_ppm() */
+static int          fsr_dump_n, fsr_dump_done;
 static int          hdr_active;       /* zero-copy stream is PQ BT.2020 */
 static float        hdr_peak = 1000.0f; /* content peak, nits */
 static int          rcas_denoise;
@@ -440,8 +442,12 @@ static const char *easu_src =
 
 /* RCAS: robust contrast-adaptive sharpening, port of FsrRcasF().
  * Small epsilons keep the flat-black / flat-white limiters away from 0/0. */
-/* HDR10 (PQ/BT.2020) to SDR BT.709: PQ EOTF, gamut map, white-preserving
- * extended-Reinhard tone map against the content peak, 2.2 gamma encode.
+/* HDR10 (PQ/BT.2020) to SDR BT.709: PQ EOTF, then the ITU-R BT.2446-A
+ * HDR-to-SDR down-conversion (log tone map of the gamma-domain luma with a
+ * knee, plus the chroma reduction that keeps saturated highlights from
+ * clipping), then a BT.2020 to BT.709 primary conversion in linear light.
+ * BT.2446-A is the broadcast down-mapping, so the result lands where other
+ * players put it; verified against libplacebo's own bt.2446a output.
  * Appended to the shaders that produce final SDR output. */
 #define HDR_TM_GLSL \
     "uniform float hdrMode;\n" /* 0 = passthrough, 1 = PQ BT.2020 input */ \
@@ -452,33 +458,34 @@ static const char *easu_src =
     "    vec3 p = pow(max(v, vec3(0.0)), vec3(1.0 / m2));\n" \
     "    vec3 lin = pow(max(p - c1, vec3(0.0)) / (c2 - c3 * p),\n" \
     "               vec3(1.0 / m1)) * 10000.0;\n" \
-    "    lin = mat3(1.6605, -0.1246, -0.0182,\n" \
-    "               -0.5876, 1.1329, -0.1006,\n" \
-    "               -0.0728, -0.0083, 1.1187) * lin;\n" \
-    /* Hue-preserving gamut compression. A BT.2020 colour outside the smaller \
-     * BT.709 gamut converts to a negative channel here; hard-clipping that to \
-     * zero (the old max(lin,0)) leaves the other channels untouched, which \
-     * over-saturates the colour and shifts its hue - deep reds and blues come \
-     * out far too heavy on an SDR display. Instead desaturate toward the \
-     * equal-luminance grey just enough to bring the colour back to the gamut \
-     * boundary. In-gamut colours (no negative channel) are left untouched. */ \
-    "    float luma = dot(max(lin, vec3(0.0)), vec3(0.2126, 0.7152, 0.0722));\n" \
-    "    float mn = min(lin.r, min(lin.g, lin.b));\n" \
-    "    if (mn < 0.0)\n" \
-    "        lin = mix(lin, vec3(luma), -mn / (luma - mn + 1e-4));\n" \
-    /* Normalise by the 100-nit SDR reference white and tone-map against the \
-     * real content peak (MaxCLL). The old code divided by 230 and forced the \
-     * peak up to at least 400 nits; on the many titles graded to a low peak \
-     * (e.g. MaxCLL ~200) that squeezed the whole image into the bottom of the \
-     * range, so it came out dark and, with the saturation preserved, heavy on \
-     * reds and blues. Matching the 100-nit white keeps diffuse white bright \
-     * while highlights above it roll off toward the peak. */ \
-    "    vec3 n = max(lin, vec3(0.0)) / 100.0;\n" \
-    "    float L = max(max(n.r, n.g), n.b);\n" \
-    "    float Lp = max(hdrPeak, 100.0) / 100.0;\n" \
-    "    float Lt = L * (1.0 + L / (Lp * Lp)) / (1.0 + L);\n" \
-    "    n *= L > 1e-6 ? Lt / L : 0.0;\n" \
-    "    return pow(clamp(n, 0.0, 1.0), vec3(1.0 / 2.2));\n" \
+    /* BT.2446-A operates on gamma-corrected BT.2020 components normalised \
+     * to the content peak. */ \
+    "    float Lw = max(hdrPeak, 100.0);\n" \
+    "    vec3 g = pow(clamp(lin / Lw, 0.0, 1.0), vec3(1.0 / 2.4));\n" \
+    "    float y = dot(g, vec3(0.2627, 0.6780, 0.0593));\n" \
+    "    float rho = 1.0 + 32.0 * pow(Lw / 10000.0, 1.0 / 2.4);\n" \
+    "    float yp = log(1.0 + (rho - 1.0) * y) / log(rho);\n" \
+    "    float yc = yp <= 0.7399 ? 1.0770 * yp :\n" \
+    "               yp < 0.9909 ? (-1.1510 * yp + 2.7811) * yp - 0.6302 :\n" \
+    "                             0.5000 * yp + 0.5000;\n" \
+    /* rho_sdr = 1 + 32 * (100/10000)^(1/2.4) */ \
+    "    float ysdr = (pow(5.6969568, yc) - 1.0) / 4.6969568;\n" \
+    "    float f = ysdr / (1.1 * max(y, 1e-4));\n" \
+    "    float cb = f * (g.b - y) / 1.8814;\n" \
+    "    float cr = f * (g.r - y) / 1.4746;\n" \
+    "    float yt = ysdr - max(0.1 * cr, 0.0);\n" \
+    "    vec3 sdr;\n" \
+    "    sdr.r = yt + 1.4746 * cr;\n" \
+    "    sdr.b = yt + 1.8814 * cb;\n" \
+    "    sdr.g = (yt - 0.2627 * sdr.r - 0.0593 * sdr.b) / 0.6780;\n" \
+    /* Back to linear light for the primary conversion: a gamut matrix is \
+     * only valid on linear tristimulus values, and running it on the \
+     * gamma-domain signal shifts hues of saturated colours. */ \
+    "    vec3 l = pow(max(sdr, vec3(0.0)), vec3(2.4));\n" \
+    "    l = mat3(1.6605, -0.1246, -0.0182,\n" \
+    "             -0.5876, 1.1329, -0.1006,\n" \
+    "             -0.0728, -0.0083, 1.1187) * l;\n" \
+    "    return pow(clamp(l, 0.0, 1.0), vec3(1.0 / 2.4));\n" \
     "}\n"
 
 static const char *rcas_src =
@@ -1167,6 +1174,8 @@ static int hwgl_init(AVFrame *frame)
     LOADWGL(DXUnlockObjects);
 #undef LOADWGL
 
+    fsr_dump_prefix = getenv("FSR_DEBUG_DUMP");
+
     if (!d3d->video_device || !d3d->video_context)
         return -1;
 
@@ -1355,11 +1364,16 @@ static int hwgl_convert(AVFrame *frame, int slot)
         if (frame->color_trc == AVCOL_TRC_SMPTE2084) {
             /* Keep PQ/BT.2020 through the VP and tone-map in the GL shaders
              * (the driver's own PQ->G22 conversion is NOT a tone map and
-             * crushes everything dark). Tagging both sides as G22 makes the
-             * transfer function a no-op, so the VP only de-matrixes YCbCr
-             * and the PQ code values pass through untouched. */
-            cs = DXGI_COLOR_SPACE_YCBCR_STUDIO_G22_LEFT_P2020;
-            out_cs = DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P2020;
+             * crushes everything dark). Both sides must be tagged PQ/P2020:
+             * with the transfer and the primaries identical the VP has
+             * nothing to convert and only de-matrixes YCbCr, so the PQ code
+             * values reach the shader untouched. Mislabelling the pair as
+             * G22 instead made the NVIDIA VP apply a BT.2020->BT.709 primary
+             * conversion of its own, which the shader then applied a second
+             * time - the double conversion over-saturated everything and
+             * pushed warm tones hard toward red. */
+            cs = DXGI_COLOR_SPACE_YCBCR_STUDIO_G2084_LEFT_P2020;
+            out_cs = DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
         } else if (frame->color_trc == AVCOL_TRC_ARIB_STD_B67)
             cs = DXGI_COLOR_SPACE_YCBCR_STUDIO_GHLG_TOPLEFT_P2020;
         else if (frame->colorspace == AVCOL_SPC_BT2020_NCL)
@@ -1387,18 +1401,23 @@ static int hwgl_convert(AVFrame *frame, int slot)
                        "FSR: HDR10 input, PQ tone mapping in the shader\n");
         }
         hdr_active = frame->color_trc == AVCOL_TRC_SMPTE2084;
-        /* Content peak for the shader tone mapper: MaxCLL when present,
-         * otherwise the mastering display peak, otherwise 1000 nits. */
+        /* Content peak for the shader tone mapper: the mastering display
+         * peak when present, otherwise MaxCLL, otherwise 1000 nits. The
+         * BT.2446-A curve is referenced to the nominal grading peak, and
+         * MaxCLL is often bogus in the wild (e.g. written equal to MaxFALL),
+         * so the mastering metadata is the more reliable anchor - it also
+         * matches what hardware tone mappers key off. */
         if (hdr_active && hwgl.hdr_md_state < 2) {
             AVFrameSideData *sd_m =
                 av_frame_get_side_data(frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA);
             AVFrameSideData *sd_c =
                 av_frame_get_side_data(frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL);
 
-            if (sd_c && ((AVContentLightMetadata *)sd_c->data)->MaxCLL)
-                hdr_peak = (float)((AVContentLightMetadata *)sd_c->data)->MaxCLL;
-            else if (sd_m && ((AVMasteringDisplayMetadata *)sd_m->data)->has_luminance)
+            if (sd_m && ((AVMasteringDisplayMetadata *)sd_m->data)->has_luminance &&
+                av_q2d(((AVMasteringDisplayMetadata *)sd_m->data)->max_luminance) > 0)
                 hdr_peak = (float)av_q2d(((AVMasteringDisplayMetadata *)sd_m->data)->max_luminance);
+            else if (sd_c && ((AVContentLightMetadata *)sd_c->data)->MaxCLL)
+                hdr_peak = (float)((AVContentLightMetadata *)sd_c->data)->MaxCLL;
             if (sd_c || sd_m) {
                 hwgl.hdr_md_state = 2;
                 av_log(NULL, AV_LOG_INFO, "FSR: HDR content peak %.0f nits\n",
@@ -1495,6 +1514,38 @@ int fsr_hw_interop_failed(void)
     return hwgl.state < 0;
 }
 
+/* Debug instrumentation: with FSR_DEBUG_DUMP=<prefix> set, dump one frame of
+ * the video-processor output (i.e. the exact texture the tone-map shader
+ * samples) as <prefix>_src.ppm and the tone-mapped result as <prefix>_out.ppm.
+ * Comparing the source dump against the decoder's own YCbCr->RGB output tells
+ * a video-processor colour conversion apart from a shader bug. */
+static void fsr_dump_ppm(const char *path, const void *data, int w, int h,
+                         int bytes)
+{
+    FILE *f = fopen(path, "wb");
+    int n = w * h;
+
+    if (!f)
+        return;
+    fprintf(f, "P6\n%d %d\n%d\n", w, h, bytes == 2 ? 65535 : 255);
+    if (bytes == 2) {
+        const unsigned short *p = data;
+
+        for (int i = 0; i < n; i++)
+            for (int c = 0; c < 3; c++) { /* PPM is big-endian */
+                fputc(p[i * 4 + c] >> 8, f);
+                fputc(p[i * 4 + c] & 0xff, f);
+            }
+    } else {
+        const unsigned char *p = data;
+
+        for (int i = 0; i < n; i++)
+            fwrite(p + i * 4, 1, 3, f);
+    }
+    fclose(f);
+    av_log(NULL, AV_LOG_INFO, "FSR: dumped %s (%dx%d)\n", path, w, h);
+}
+
 int fsr_hw_draw(SDL_Renderer *renderer, AVFrame *frame, const SDL_Rect *rect,
                 int fsr_on, float sharpness)
 {
@@ -1573,6 +1624,21 @@ int fsr_hw_draw(SDL_Renderer *renderer, AVFrame *frame, const SDL_Rect *rect,
             goto fail_soft;
         }
     }
+    if (fsr_dump_prefix && ++fsr_dump_n > 40 && !(fsr_dump_done & 1)) {
+        unsigned short *src = av_malloc((size_t)hwgl.w * hwgl.h * 4 * 2);
+        char path[512];
+
+        fsr_dump_done |= 1;
+        if (src) {
+            gl.BindTexture(GL_TEXTURE_2D, hwgl.gl_tex[hwgl.cur_slot]);
+            gl.GetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_SHORT, src);
+            gl.BindTexture(GL_TEXTURE_2D, 0);
+            snprintf(path, sizeof(path), "%s_src.ppm", fsr_dump_prefix);
+            fsr_dump_ppm(path, src, hwgl.w, hwgl.h, 2);
+            av_free(src);
+        }
+    }
+
     hwgl.DXUnlockObjects(hwgl.gl_device, 1, &hwgl.gl_object[hwgl.cur_slot]);
     hwgl_unlock();
 
@@ -1612,6 +1678,21 @@ int fsr_hw_draw(SDL_Renderer *renderer, AVFrame *frame, const SDL_Rect *rect,
                        px[0], px[1], px[2], n ? sum / n : 0, n);
                 av_free(buf);
             }
+        }
+    }
+
+    if (fsr_dump_prefix && fsr_dump_n > 40 && !(fsr_dump_done & 2) &&
+        SDL_SetRenderTarget(renderer, out_tex) == 0) {
+        unsigned char *out = av_malloc((size_t)rect->w * rect->h * 4);
+        char path[512];
+
+        fsr_dump_done |= 2;
+        if (out) {
+            SDL_RenderFlush(renderer);
+            gl.ReadPixels(0, 0, rect->w, rect->h, GL_RGBA, GL_UNSIGNED_BYTE, out);
+            snprintf(path, sizeof(path), "%s_out.ppm", fsr_dump_prefix);
+            fsr_dump_ppm(path, out, rect->w, rect->h, 1);
+            av_free(out);
         }
     }
 
