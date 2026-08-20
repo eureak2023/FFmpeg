@@ -391,6 +391,10 @@ static int fsr = -1; /* -1 = auto: on for any source resolution. Remembered in
                       * ffplay.ini once the user has toggled it with 'x'. */
 static float fsr_sharpness = 0.0f; /* RCAS attenuation stops, 0 = maximum sharpness */
 static int fsr_denoise = 0;
+static int hdr_bright = 100;       /* HDR->SDR tone map exposure, percent:
+                                    * 0 = BT.2446-A as specified, 100 = HDR
+                                    * diffuse white exposed to SDR white.
+                                    * Adjusted with 'h'/'H'. */
 static int fsr_fg = 1;             /* frame generation (hardware optical flow),
                                     * remembered in ffplay.ini. Neither this nor
                                     * fsr is ever cleared on a boot failure (that
@@ -1690,11 +1694,14 @@ static void status_hud_update(int fps)
                      av_clip(fg_mult, 2, 4));
         else
             snprintf(fg_state, sizeof(fg_state), "OFF");
-        snprintf(buf + n, sizeof(buf) - n,
-                 "FSR %s\nSHARP %d\nNR %s\nFG %s",
-                 fsr ? "ON" : "OFF",
-                 (int)lrint((2.0f - fsr_sharpness) / 2.0f * 100.0f),
-                 fsr_denoise ? "ON" : "OFF", fg_state);
+        n += snprintf(buf + n, sizeof(buf) - n,
+                      "FSR %s\nSHARP %d\nNR %s\nFG %s",
+                      fsr ? "ON" : "OFF",
+                      (int)lrint((2.0f - fsr_sharpness) / 2.0f * 100.0f),
+                      fsr_denoise ? "ON" : "OFF", fg_state);
+        /* only worth a line while there is a tone map to tune */
+        if (fsr_hdr_active() && n < (int)sizeof(buf))
+            snprintf(buf + n, sizeof(buf) - n, "\nHDR %d", hdr_bright);
     }
     fsr_hud_set(renderer, buf);
 }
@@ -5310,6 +5317,23 @@ static void event_loop(VideoState *cur_stream)
                     status_hud_update(-1);   /* reflect the switch right away */
                 cur_stream->force_refresh = 1;
                 break;
+            case SDLK_h: {
+                /* HDR->SDR exposure, in 25% steps. 'h' brighter, shift+'h'
+                 * darker; clamped rather than wrapped so holding one key
+                 * settles at an end instead of jumping back. */
+                int up = !(event.key.keysym.mod & KMOD_SHIFT);
+                char toast[16];
+
+                hdr_bright = av_clip(hdr_bright + (up ? 25 : -25), 0, 200);
+                fsr_set_hdr_brightness(hdr_bright / 100.0f);
+                av_log(NULL, AV_LOG_INFO, "HDR->SDR brightness: %d%%%s\n",
+                       hdr_bright, fsr_hdr_active() ? "" : " (SDR source)");
+                snprintf(toast, sizeof(toast), "HDR %d", hdr_bright);
+                if (renderer)
+                    fsr_toast_show(renderer, toast);
+                cur_stream->force_refresh = 1;
+                break;
+            }
             case SDLK_d:
                 fsr_denoise = !fsr_denoise;
                 fsr_set_denoise(renderer, fsr_denoise);
@@ -5757,6 +5781,7 @@ static const OptionDef options[] = {
     { "fsr",                OPT_TYPE_BOOL,            0, { &fsr }, "upscale video output with FSR1 (EASU+RCAS); default: on for sources up to 1080p, off above; toggle at runtime with 'x' (remembered across runs)" },
     { "fsr_sharpness",      OPT_TYPE_FLOAT, OPT_EXPERT, { &fsr_sharpness }, "FSR RCAS sharpness attenuation in stops (0=sharpest, adjust at runtime with +/-)", "stops" },
     { "fsr_denoise",        OPT_TYPE_BOOL,  OPT_EXPERT, { &fsr_denoise }, "reduce FSR sharpening of noise and film grain; toggle at runtime with 'd'" },
+    { "hdr_brightness",     OPT_TYPE_INT,   OPT_EXPERT, { &hdr_bright }, "brightness of HDR sources tone-mapped to SDR, percent: 0 = BT.2446-A as specified, 100 (default) exposes HDR diffuse white to SDR white like a studio SDR grade, up to 200; adjust at runtime with 'h'/'H'", "percent" },
     { "fsr_fg",             OPT_TYPE_BOOL,  OPT_EXPERT, { &fsr_fg }, "frame generation via NVIDIA hardware optical flow, on by default (-nofsr_fg disables); toggle at runtime with 'g' (remembered across runs)" },
     { "rife",               OPT_TYPE_BOOL,  OPT_EXPERT, { &fsr_rife }, "start with RIFE (per-pixel, ncnn+Vulkan) as the frame-generation engine instead of the block-grid optical flow; off by default (optical flow), remembered per session; RIFE still loads so 'r' toggles it at runtime" },
     { "fg_mult",            OPT_TYPE_INT,   OPT_EXPERT, { &fg_mult }, "frame generation factor: 2, 3 or 4 (source x2/x3/x4, capped by display refresh); pick at runtime from the right-click menu", "N" },
@@ -5799,6 +5824,7 @@ void show_help_default(const char *opt, const char *arg)
            "+, -                increase and decrease FSR sharpness respectively\n"
            "d                   toggle FSR noise/grain-aware sharpening (denoise)\n"
            "g                   toggle 2x frame generation (NVIDIA optical flow)\n"
+           "h, shift+h          increase and decrease the brightness of HDR tone-mapped to SDR\n"
            "tab                 toggle the status overlay (FPS, FSR, sharpness, denoise, FG)\n"
            "1, 2, 3, 4          scale window to 0.5x, 1x, 1.5x, 2x of the video size\n"
            "left/right          seek backward/forward by 10 seconds or a custom interval if -seek_interval is set\n"
@@ -6013,6 +6039,8 @@ int main(int argc, char **argv)
                 av_log(NULL, AV_LOG_WARNING,
                        "FSR: OpenGL pipeline unavailable, falling back to standard SDL rendering\n");
             fsr_set_denoise(renderer, fsr_denoise);
+            hdr_bright = av_clip(hdr_bright, 0, 200);
+            fsr_set_hdr_brightness(hdr_bright / 100.0f);
             if (fsr_fg && fsr_fg_boot() < 0)
                 av_log(NULL, AV_LOG_WARNING,
                        "FG: hardware optical flow unavailable, frame generation disabled\n");

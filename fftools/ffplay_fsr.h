@@ -64,6 +64,19 @@ int  fsr_available(void);
  * film grain). Safe to call any time from the main thread. */
 void fsr_set_denoise(SDL_Renderer *renderer, int enable);
 
+/* Exposure of the HDR10 -> SDR tone map, as a 0..2 factor:
+ *   0   BT.2446-A by the book - the signal is referred to the content peak,
+ *       which is faithful but lands well below a studio SDR grade;
+ *   1   diffuse white (203 nits, BT.2408) is exposed to SDR white, i.e. the
+ *       brightness an SDR release of the same title would show (default);
+ *   >1  brighter still.
+ * Highlights roll off instead of clipping, so raising it trades highlight
+ * separation for midtone brightness. No effect on SDR sources. Takes effect
+ * on the next frame; safe to call from the main thread at any time. */
+void fsr_set_hdr_brightness(float level);
+/* Nonzero while the displayed stream is being tone-mapped from HDR10. */
+int  fsr_hdr_active(void);
+
 /* Zero-copy display of AV_PIX_FMT_D3D11 hardware frames: the decoded NV12
  * texture is converted to RGBA by the D3D11 VideoProcessor on the GPU and
  * shared into GL via WGL_NV_DX_interop2, then flows through the FSR passes
