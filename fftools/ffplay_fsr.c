@@ -1056,10 +1056,14 @@ int fsr_d3d11_adapter_index(void)
  * can decode in software, so they are never gated (return 1). */
 int fsr_d3d11_supports_codec(struct AVBufferRef *hw_device_ctx, int codec_id)
 {
-    /* DXVA_ModeAV1_VLD_Profile0 (not defined by the mingw d3d11.h headers). */
+    /* DXVA_ModeAV1_VLD_Profile0 (not defined by the mingw d3d11.h headers).
+     * Must match libavcodec/dxva2.c's ff_DXVA2_ModeAV1_VLD_Profile0 exactly -
+     * an earlier transcription of this GUID was wrong, so the probe never
+     * matched and every AV1 title silently fell back to libdav1d (4K10 HDR
+     * then also lost the shader tone map, which only runs on the D3D11 path). */
     static const GUID av1_vld_profile0 =
-        { 0xb8be4cce, 0xcf65, 0x4682,
-          { 0x8b, 0xe8, 0x9c, 0x8b, 0x25, 0x6f, 0xa3, 0xd3 } };
+        { 0xb8be4ccb, 0xcf53, 0x46ba,
+          { 0x8d, 0x59, 0xd6, 0xb8, 0xa6, 0xda, 0x5d, 0x2a } };
     AVHWDeviceContext *devctx;
     AVD3D11VADeviceContext *d3d;
     ID3D11VideoDevice *vdev;
