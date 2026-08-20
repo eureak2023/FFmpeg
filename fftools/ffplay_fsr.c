@@ -306,10 +306,32 @@ static char         gl_renderer_str[256];
 static GLuint       easu_prog, rcas_prog, copy_prog;
 static GLint        easu_con0_loc, rcas_sharp_loc, rcas_dns_loc, copy_invout_loc;
 static GLint        rcas_hdr_loc, rcas_peak_loc, copy_hdr_loc, copy_peak_loc;
+static GLint        rcas_gain_loc, copy_gain_loc;
 static const char  *fsr_dump_prefix;  /* FSR_DEBUG_DUMP, see fsr_dump_ppm() */
 static int          fsr_dump_n, fsr_dump_done;
 static int          hdr_active;       /* zero-copy stream is PQ BT.2020 */
 static float        hdr_peak = 1000.0f; /* content peak, nits */
+/* HDR->SDR exposure, see HDR_TM_GLSL. hdr_bright is the user setting (0 =
+ * BT.2446-A as specified, 1 = diffuse white lands at SDR white); hdr_gain is
+ * the shader uniform derived from it and the content peak. */
+static float        hdr_bright = 1.0f;
+static float        hdr_gain = 1.0f;
+
+/* HDR diffuse ("graphics") white, BT.2408. The level HDR grades put a lit
+ * wall or a sheet of paper at, and what an SDR grade of the same shot would
+ * show at full signal. */
+#define HDR_DIFFUSE_WHITE 203.0f
+
+static void hdr_update_gain(void)
+{
+    /* Anchor: at hdr_bright = 1 the exposure is exactly what it takes to put
+     * HDR diffuse white where the tone map's nominal peak used to be. Content
+     * that never goes brighter than diffuse white (a MaxCLL of ~200 nits) is
+     * already SDR-bright, so the gain lands at 1 and nothing changes for it. */
+    float full = FFMAX(hdr_peak / HDR_DIFFUSE_WHITE, 1.0f);
+
+    hdr_gain = av_clipf(1.0f + hdr_bright * (full - 1.0f), 1.0f, 64.0f);
+}
 static int          rcas_denoise;
 static SDL_Texture *native_tex, *easu_tex, *out_tex;
 static int          native_w, native_h, out_w, out_h;
@@ -452,6 +474,7 @@ static const char *easu_src =
 #define HDR_TM_GLSL \
     "uniform float hdrMode;\n" /* 0 = passthrough, 1 = PQ BT.2020 input */ \
     "uniform float hdrPeak;\n" /* content peak, nits */ \
+    "uniform float hdrGain;\n" /* exposure, 1 = BT.2446-A as specified */ \
     "vec3 hdr_tonemap(vec3 v) {\n" \
     "    const float m1 = 0.1593017578125, m2 = 78.84375;\n" \
     "    const float c1 = 0.8359375, c2 = 18.8515625, c3 = 18.6875;\n" \
@@ -459,9 +482,22 @@ static const char *easu_src =
     "    vec3 lin = pow(max(p - c1, vec3(0.0)) / (c2 - c3 * p),\n" \
     "               vec3(1.0 / m1)) * 10000.0;\n" \
     /* BT.2446-A operates on gamma-corrected BT.2020 components normalised \
-     * to the content peak. */ \
+     * to the content peak. That normalisation is the whole reason a \
+     * tone-mapped HDR picture comes out darker than the studio's own SDR \
+     * release of the same title: HDR grades put diffuse white (skin, paper, \
+     * a lit wall) at ~203 nits per BT.2408 and spend everything above it on \
+     * speculars, so on a 1000-nit master diffuse white enters the curve at \
+     * 20% and leaves it around 69% signal - roughly 40% of the luminance an \
+     * SDR grade would give the same wall. hdrGain re-refers the signal to \
+     * diffuse white instead of the peak (see hdr_update_gain); the Reinhard \
+     * term folds the now over-range highlights back into [0,1] rather than \
+     * clipping them, and collapses to the identity at hdrGain = 1, which is \
+     * the by-the-book BT.2446-A behaviour. */ \
     "    float Lw = max(hdrPeak, 100.0);\n" \
-    "    vec3 g = pow(clamp(lin / Lw, 0.0, 1.0), vec3(1.0 / 2.4));\n" \
+    "    float gn = max(hdrGain, 1.0);\n" \
+    "    vec3 e = lin * (gn / Lw);\n" \
+    "    e = e * (1.0 + e / (gn * gn)) / (1.0 + e);\n" \
+    "    vec3 g = pow(clamp(e, 0.0, 1.0), vec3(1.0 / 2.4));\n" \
     "    float y = dot(g, vec3(0.2627, 0.6780, 0.0593));\n" \
     "    float rho = 1.0 + 32.0 * pow(Lw / 10000.0, 1.0 / 2.4);\n" \
     "    float yp = log(1.0 + (rho - 1.0) * y) / log(rho);\n" \
@@ -701,6 +737,9 @@ int fsr_init(SDL_Renderer *renderer)
     rcas_peak_loc   = gl.GetUniformLocation(rcas_prog, "hdrPeak");
     copy_hdr_loc    = gl.GetUniformLocation(copy_prog, "hdrMode");
     copy_peak_loc   = gl.GetUniformLocation(copy_prog, "hdrPeak");
+    rcas_gain_loc   = gl.GetUniformLocation(rcas_prog, "hdrGain");
+    copy_gain_loc   = gl.GetUniformLocation(copy_prog, "hdrGain");
+    hdr_update_gain();   /* for the default peak, until a frame carries one */
 
     /* Bind the sampler uniforms to texture unit 0 once. */
     gl.GetIntegerv(GL_CURRENT_PROGRAM, &prev_prog);
@@ -721,6 +760,17 @@ int fsr_init(SDL_Renderer *renderer)
     fsr_state = 1;
     av_log(NULL, AV_LOG_INFO, "FSR: EASU+RCAS OpenGL pipeline initialized\n");
     return 0;
+}
+
+void fsr_set_hdr_brightness(float level)
+{
+    hdr_bright = av_clipf(level, 0.0f, 2.0f);
+    hdr_update_gain();
+}
+
+int fsr_hdr_active(void)
+{
+    return hdr_active;
 }
 
 void fsr_set_denoise(SDL_Renderer *renderer, int enable)
@@ -831,11 +881,13 @@ static int run_pass2(SDL_Renderer *renderer, GLuint prog, SDL_Texture *src,
         gl.Uniform1f(rcas_sharp_loc, sharp);
         gl.Uniform1f(rcas_hdr_loc, hdr_active ? 1.0f : 0.0f);
         gl.Uniform1f(rcas_peak_loc, hdr_peak);
+        gl.Uniform1f(rcas_gain_loc, hdr_gain);
     }
     if (prog == copy_prog) {
         gl.Uniform2f(copy_invout_loc, 1.0f / dw, 1.0f / dh);
         gl.Uniform1f(copy_hdr_loc, hdr_active ? 1.0f : 0.0f);
         gl.Uniform1f(copy_peak_loc, hdr_peak);
+        gl.Uniform1f(copy_gain_loc, hdr_gain);
     }
     gl.DrawArrays(GL_TRIANGLES, 0, 3);
     gl.UseProgram(prev_prog);
@@ -1441,8 +1493,10 @@ static int hwgl_convert(AVFrame *frame, int slot)
                 hdr_peak = (float)av_q2d(((AVMasteringDisplayMetadata *)sd_m->data)->max_luminance);
             if (sd_c || sd_m) {
                 hwgl.hdr_md_state = 2;
-                av_log(NULL, AV_LOG_INFO, "FSR: HDR content peak %.0f nits\n",
-                       hdr_peak);
+                hdr_update_gain();
+                av_log(NULL, AV_LOG_INFO,
+                       "FSR: HDR content peak %.0f nits, tone map exposure %.2fx\n",
+                       hdr_peak, hdr_gain);
             }
         }
         goto colorspace_done;
@@ -1843,7 +1897,7 @@ static struct {
     GLint phase_loc;
     GLint outsize_loc;
     GLint flowgrid_loc;
-    GLint hdr_loc, peak_loc;
+    GLint hdr_loc, peak_loc, gain_loc;
     const void *in_frame[2];              /* what each OF input buffer holds */
     int64_t in_pts[2];
     const void *pair_a, *pair_b;          /* frames the current flow refers to */
@@ -2243,6 +2297,7 @@ static int fg_init_body(void)
         fg.flowgrid_loc = gl.GetUniformLocation(fg.prog, "flowGrid");
         fg.hdr_loc      = gl.GetUniformLocation(fg.prog, "hdrMode");
         fg.peak_loc     = gl.GetUniformLocation(fg.prog, "hdrPeak");
+        fg.gain_loc     = gl.GetUniformLocation(fg.prog, "hdrGain");
     }
     return 0;
 }
@@ -2472,6 +2527,7 @@ static int fg_warp(SDL_Renderer *renderer, int sp, int sn, float phase,
     gl.Uniform1f(fg.flowgrid_loc, (GLfloat)fg.grid);
     gl.Uniform1f(fg.hdr_loc, tonemap && hdr_active ? 1.0f : 0.0f);
     gl.Uniform1f(fg.peak_loc, hdr_peak);
+    gl.Uniform1f(fg.gain_loc, hdr_gain);
     gl.DrawArrays(GL_TRIANGLES, 0, 3);
     gl.UseProgram(prev_prog);
     for (int i = 4; i >= 0; i--) {
