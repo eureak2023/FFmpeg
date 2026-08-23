@@ -332,6 +332,44 @@ static void hdr_update_gain(void)
 
     hdr_gain = av_clipf(1.0f + hdr_bright * (full - 1.0f), 1.0f, 64.0f);
 }
+/* Client-side pixel-store state around our own host<->GL transfers.
+ *
+ * SDL's GL renderer sets GL_UNPACK_ROW_LENGTH before every texture upload it
+ * makes and never clears it, so whatever it last used is still current when we
+ * upload. After a RIFE frame (an SDL_UpdateTexture of the 1920-wide generated
+ * frame) the row length was 1920 while the next confidence upload is only 480
+ * wide, so the driver read four times the buffer and faulted inside
+ * nvoglv64.dll - intermittently, since it only dies when the over-read leaves
+ * the heap. The same hazard applies to the pack state on readback, where a
+ * stale row length would *write* past the destination. Nothing of ours is
+ * interleaved with SDL's own transfers, so pin the whole state and put back
+ * exactly what was there. */
+typedef struct GLPixelStore {
+    GLint row_length, skip_rows, skip_pixels, alignment;
+} GLPixelStore;
+
+#define GL_PS_(pack, name) ((GLenum)((pack) ? GL_PACK_##name : GL_UNPACK_##name))
+
+static void gl_pixelstore_push(GLPixelStore *s, int pack)
+{
+    gl.GetIntegerv(GL_PS_(pack, ROW_LENGTH),  &s->row_length);
+    gl.GetIntegerv(GL_PS_(pack, SKIP_ROWS),   &s->skip_rows);
+    gl.GetIntegerv(GL_PS_(pack, SKIP_PIXELS), &s->skip_pixels);
+    gl.GetIntegerv(GL_PS_(pack, ALIGNMENT),   &s->alignment);
+    gl.PixelStorei(GL_PS_(pack, ROW_LENGTH),  0);
+    gl.PixelStorei(GL_PS_(pack, SKIP_ROWS),   0);
+    gl.PixelStorei(GL_PS_(pack, SKIP_PIXELS), 0);
+    gl.PixelStorei(GL_PS_(pack, ALIGNMENT),   1);
+}
+
+static void gl_pixelstore_pop(const GLPixelStore *s, int pack)
+{
+    gl.PixelStorei(GL_PS_(pack, ROW_LENGTH),  s->row_length);
+    gl.PixelStorei(GL_PS_(pack, SKIP_ROWS),   s->skip_rows);
+    gl.PixelStorei(GL_PS_(pack, SKIP_PIXELS), s->skip_pixels);
+    gl.PixelStorei(GL_PS_(pack, ALIGNMENT),   s->alignment);
+}
+
 static int          rcas_denoise;
 static SDL_Texture *native_tex, *easu_tex, *out_tex;
 static int          native_w, native_h, out_w, out_h;
@@ -1691,8 +1729,12 @@ int fsr_hw_draw(SDL_Renderer *renderer, AVFrame *frame, const SDL_Rect *rect,
 
         fsr_dump_done |= 1;
         if (src) {
+            GLPixelStore ps;
+
             gl.BindTexture(GL_TEXTURE_2D, hwgl.gl_tex[hwgl.cur_slot]);
+            gl_pixelstore_push(&ps, 1);
             gl.GetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_SHORT, src);
+            gl_pixelstore_pop(&ps, 1);
             gl.BindTexture(GL_TEXTURE_2D, 0);
             snprintf(path, sizeof(path), "%s_src.ppm", fsr_dump_prefix);
             fsr_dump_ppm(path, src, hwgl.w, hwgl.h, 2);
@@ -1719,8 +1761,10 @@ int fsr_hw_draw(SDL_Renderer *renderer, AVFrame *frame, const SDL_Rect *rect,
             SDL_SetRenderTarget(renderer, out_tex) == 0) {
             unsigned char px[4] = { 0 };
             unsigned char *buf = av_malloc((size_t)rect->w * 4);
+            GLPixelStore ps;
 
             SDL_RenderFlush(renderer);
+            gl_pixelstore_push(&ps, 1);
             gl.ReadPixels(rect->w / 2, rect->h / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
             if (buf) { /* average luma over a sparse grid of rows */
                 double sum = 0;
@@ -1739,6 +1783,7 @@ int fsr_hw_draw(SDL_Renderer *renderer, AVFrame *frame, const SDL_Rect *rect,
                        px[0], px[1], px[2], n ? sum / n : 0, n);
                 av_free(buf);
             }
+            gl_pixelstore_pop(&ps, 1);
         }
     }
 
@@ -1749,8 +1794,12 @@ int fsr_hw_draw(SDL_Renderer *renderer, AVFrame *frame, const SDL_Rect *rect,
 
         fsr_dump_done |= 2;
         if (out) {
+            GLPixelStore ps;
+
             SDL_RenderFlush(renderer);
+            gl_pixelstore_push(&ps, 1);
             gl.ReadPixels(0, 0, rect->w, rect->h, GL_RGBA, GL_UNSIGNED_BYTE, out);
+            gl_pixelstore_pop(&ps, 1);
             snprintf(path, sizeof(path), "%s_out.ppm", fsr_dump_prefix);
             fsr_dump_ppm(path, out, rect->w, rect->h, 1);
             av_free(out);
@@ -2226,6 +2275,7 @@ static int fg_init_body(void)
     /* GL flow textures (RG16I) shared with CUDA */
     {
         GLint prev_tex0 = 0, prev_active = 0;
+        GLPixelStore ps;
 
         gl.GetIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
         gl.ActiveTexture(GL_TEXTURE0);
@@ -2244,10 +2294,10 @@ static int fg_init_body(void)
          * warp) so a failed bake never leaves undefined contents. */
         gl.GenTextures(1, &fg.conf_tex);
         gl.BindTexture(GL_TEXTURE_2D, fg.conf_tex);
-        gl.PixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        gl_pixelstore_push(&ps, 0);
         gl.TexImage2D(GL_TEXTURE_2D, 0, GL_R8, fg.cgw, fg.cgh, 0,
                       GL_RED, GL_UNSIGNED_BYTE, fg.conf_host);
-        gl.PixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        gl_pixelstore_pop(&ps, 0);
         gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
@@ -2437,15 +2487,16 @@ static int fg_compute_flow_body(int sp, int sn)
         }
         {
             GLint prev_tex = 0, prev_active = 0;
+            GLPixelStore ps;
 
             gl.GetIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
             gl.ActiveTexture(GL_TEXTURE0);
             gl.GetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
             gl.BindTexture(GL_TEXTURE_2D, fg.conf_tex);
-            gl.PixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            gl_pixelstore_push(&ps, 0);
             gl.TexImage2D(GL_TEXTURE_2D, 0, GL_R8, fg.cgw, fg.cgh, 0,
                           GL_RED, GL_UNSIGNED_BYTE, fg.conf_host);
-            gl.PixelStorei(GL_UNPACK_ALIGNMENT, 4);
+            gl_pixelstore_pop(&ps, 0);
             gl.BindTexture(GL_TEXTURE_2D, prev_tex);
             gl.ActiveTexture(prev_active);
         }
@@ -2708,6 +2759,7 @@ static int rife_fetch_pair(int sp, int sn)
     HANDLE objs[2] = { hwgl.gl_object[sp], hwgl.gl_object[sn] };
     int    slots[2] = { sp, sn };
     GLint  prev_tex = 0;
+    GLPixelStore ps;
 
     hwgl_lock();
     if (!hwgl.DXLockObjects(hwgl.gl_device, 2, objs)) {
@@ -2715,10 +2767,12 @@ static int rife_fetch_pair(int sp, int sn)
         return -1;
     }
     gl.GetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+    gl_pixelstore_push(&ps, 1);
     for (int i = 0; i < 2; i++) {
         gl.BindTexture(GL_TEXTURE_2D, hwgl.gl_tex[slots[i]]);
         gl.GetTexImage(GL_TEXTURE_2D, 0, GL_RGB, GL_UNSIGNED_BYTE, rife_rgb[i]);
     }
+    gl_pixelstore_pop(&ps, 1);
     gl.BindTexture(GL_TEXTURE_2D, prev_tex);
     hwgl.DXUnlockObjects(hwgl.gl_device, 2, objs);
     hwgl_unlock();
