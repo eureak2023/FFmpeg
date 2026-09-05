@@ -70,6 +70,21 @@ fftools/ffplay_rife.o fftools/rife/rife.o fftools/rife/warp.o: \
 EXTRALIBS-ffplay += -L$(NCNN_DIR)/lib -lncnn -lglslang -lSPIRV \
     -lMachineIndependent -lGenericCodeGen -lOSDependent \
     -lglslang-default-resource-limits -fopenmp -lstdc++
+# DLSS 5 neural rendering (NGX "dlssnr"). The model runs on a private D3D12
+# device; d3d12.dll is loaded at runtime, so only the static GUID archive is
+# linked and the executable's import table is unchanged.
+OBJS-ffplay += fftools/ffplay_ngx.o
+EXTRALIBS-ffplay += -ldxguid
+# The NGX snippet refuses callers whose module path does not contain
+# "nvngx.dll", so the calls have to come from a separately named module. It is
+# built here and embedded into ffplay.exe by ffplay_res.rc, which means the
+# resource compile has to wait for it.
+FFPLAY_NGX_SHIM := fftools/nvngx.dll_ffplay.dll
+$(FFPLAY_NGX_SHIM): $(SRC_PATH)/fftools/ffplay_ngxshim.c \
+                    $(SRC_PATH)/fftools/ffplay_ngx.h
+	$(CC) -O2 -fno-optimize-sibling-calls -shared -static -static-libgcc \
+	    -I$(SRC_PATH)/fftools -o $@ $< -lkernel32
+fftools/ffplay_res.o: $(FFPLAY_NGX_SHIM)
 OBJS-ffplay-$(HAVE_GNU_WINDRES) += fftools/ffplay_res.o
 # GUI subsystem: no console window flashes on double-click launches;
 # fsr_detach_console() re-attaches to the parent console when run from one.

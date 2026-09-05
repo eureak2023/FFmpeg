@@ -127,6 +127,31 @@ int  fsr_rife_boot(void);
  * before decoding begins (device probing races with active decode). */
 int  fsr_fg_boot(void);
 
+/* DLSS 5 neural rendering: NVIDIA's detail-synthesis model run over each
+ * decoded frame before it reaches the display path, which is what a
+ * low-bitrate source needs - it puts texture back rather than sharpening what
+ * survived. Needs an RTX 50 series GPU, the D3D11 zero-copy path, and
+ * nvngx_dlssnr.dll beside the executable; without any of those it reports
+ * inactive and nothing else changes. See ffplay_ngx.c.
+ *
+ * fsr_nr_set() takes -1 (auto: on at or below ~1080p), 0 (off) or 1 (on
+ * regardless of size). fsr_nr_active() reports whether it is actually
+ * running. */
+void  fsr_nr_set(int on);
+int   fsr_nr_setting(void);
+int   fsr_nr_active(void);
+/* How far the frame moves toward the model's answer, 0 to 1.5; 0.6 by
+ * default. Above ~1 the synthesised grain starts to show. */
+void  fsr_nr_set_strength(float v);
+float fsr_nr_strength(void);
+/* 0 keeps the source hue and takes only the model's brightness verdict (the
+ * default, and what keeps a film's grade intact); 1 lets the model's own
+ * colour through. */
+void  fsr_nr_set_colour(float v);
+float fsr_nr_colour(void);
+/* Drop the model's temporal history: seek, stream change, discontinuity. */
+void  fsr_nr_reset(void);
+
 /* Small on-screen toast (built-in bitmap font, uppercase letters only).
  * Shown top-left for ~1.8s with a fade-out; draw it right before
  * SDL_RenderPresent(). fsr_toast_draw()/fsr_toast_active() return whether

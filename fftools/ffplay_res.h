@@ -34,4 +34,11 @@
  * (see ffplay_ui.c). */
 #define IDR_FONT_NOTOSANS      110
 
+/* The NGX forwarder DLL (nvngx.dll_ffplay.dll, built from ffplay_ngxshim.c).
+ * It has to be a separate module because the DLSS neural-rendering snippet
+ * only answers callers whose module path contains "nvngx.dll", so it is
+ * embedded here and written to a temp folder at startup rather than shipped
+ * loose (see nr_load_shim() in ffplay_ngx.c). */
+#define IDR_NGX_SHIM_DLL       120
+
 #endif /* FFTOOLS_FFPLAY_RES_H */

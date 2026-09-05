@@ -94,7 +94,7 @@ typedef struct UIAudioTracks {
     char name[UI_MAX_ATRACKS][96];
 } UIAudioTracks;
 
-/* Right-click context menu (blocks until dismissed). The fsr/nr/fg flags
+/* Right-click context menu (blocks until dismissed). The fsr/nr/fg/dlss flags
  * set the checkmarks on the video-effects submenu; fg_mult (2/3/4) checks the
  * matching "FG 프레임 생성 배수" item; sub_on checks the "자막 보이기" item;
  * atracks (may be NULL) fills the audio-track submenu. Returns the chosen
@@ -109,10 +109,12 @@ enum { UI_MENU_OPEN = 1, UI_MENU_CLOSE, UI_MENU_FSR, UI_MENU_NR, UI_MENU_FG,
        UI_MENU_SCALE_FIT, UI_MENU_SCALE_FILL, UI_MENU_SCALE_STRETCH,
        UI_MENU_SUB_SHOW,
        UI_MENU_FGMULT_2X, UI_MENU_FGMULT_3X, UI_MENU_FGMULT_4X,
+       UI_MENU_DLSSNR,
        /* audio track i is UI_MENU_ATRACK_BASE + i */
        UI_MENU_ATRACK_BASE = 100 };
-int  ui_context_menu(int fsr_on, int nr_on, int fg_on, int fg_mult, int stereo_on,
-                     int scale_mode, int sub_on, const UIAudioTracks *atracks,
+int  ui_context_menu(int fsr_on, int nr_on, int fg_on, int fg_mult, int dlss_on,
+                     int stereo_on, int scale_mode, int sub_on,
+                     const UIAudioTracks *atracks,
                      void (*on_idle)(void *), void *idle_ctx);
 
 /* Text subtitles (SRT/SMI/ASS), rendered bottom-center with the system

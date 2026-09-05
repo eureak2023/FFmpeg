@@ -53,6 +53,8 @@
 #include "libavcodec/codec_id.h"
 #endif
 
+#include "ffplay_ngx.h"
+
 #ifdef _WIN32
 #include <windows.h>
 #include <shellapi.h>
@@ -299,6 +301,15 @@ static struct {
     void      (APIENTRY *GetTexImage)(GLenum, GLint, GLenum, GLenum, void *);
     void      (APIENTRY *TexImage2D)(GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *);
     void      (APIENTRY *PixelStorei)(GLenum, GLint);
+    /* Only the neural-rendering composition needs to render into a texture
+     * that is not an SDL render target, so these are resolved but tolerated
+     * missing; everything else runs through SDL_SetRenderTarget. */
+    void      (APIENTRY *GenFramebuffers)(GLsizei, GLuint *);
+    void      (APIENTRY *DeleteFramebuffers)(GLsizei, const GLuint *);
+    void      (APIENTRY *BindFramebuffer)(GLenum, GLuint);
+    void      (APIENTRY *FramebufferTexture2D)(GLenum, GLenum, GLenum, GLuint, GLint);
+    GLenum    (APIENTRY *CheckFramebufferStatus)(GLenum);
+    void      (APIENTRY *GenerateMipmap)(GLenum);
 } gl;
 
 static int          fsr_state;      /* 0 = uninitialized, 1 = ready, -1 = unavailable */
@@ -674,6 +685,16 @@ static int load_gl_functions(void)
     LOAD(TexImage2D);
     LOAD(PixelStorei);
 #undef LOAD
+    /* Optional: their absence only costs neural rendering, so it must not
+     * take the whole GL pipeline down with it. */
+#define LOAD_OPT(name) gl.name = (void *)SDL_GL_GetProcAddress("gl" #name)
+    LOAD_OPT(GenFramebuffers);
+    LOAD_OPT(DeleteFramebuffers);
+    LOAD_OPT(BindFramebuffer);
+    LOAD_OPT(FramebufferTexture2D);
+    LOAD_OPT(CheckFramebufferStatus);
+    LOAD_OPT(GenerateMipmap);
+#undef LOAD_OPT
     return 0;
 }
 
@@ -1030,6 +1051,417 @@ static const GUID iid_ID3D11VideoContext1 =
 static const GUID iid_ID3D11VideoContext2 =
     { 0xc4e7374c, 0x6243, 0x4d1b, { 0xae, 0x87, 0x52, 0xb4, 0xf7, 0x40, 0xe2, 0x61 } };
 
+/* Set on the way out, when releasing GPU objects is both pointless and a
+ * chance to crash inside a driver that is already tearing down. */
+static int hwgl_exiting;
+
+/* ---- DLSS 5 neural rendering: composing the model's answer back ---- */
+
+#define WGL_ACCESS_READ_WRITE_NV 0x0001
+
+/* Auto-enable ceiling, same 2.2 MP line the RIFE path uses. Measured per
+ * frame on an RTX 5080: 3.2 ms at 720p, 4.3 ms at 1080p, 13.5 ms at 4K. The
+ * first two fit any frame rate; 4K fits a 24 fps budget but not a 60 fps one,
+ * and it is not what a low-bitrate source looks like anyway. -dlssnr forces
+ * it on above the cap for anyone who wants to spend the time. */
+#define NR_MAX_PIXELS (2200000)
+
+/* The model hands back a whole picture rather than a correction, and its
+ * absolute luminance is arbitrary - measured 1.05x low on a bright scene and
+ * 1.40x low on a dark one. So its answer is first scaled to sit where the
+ * original's luminance says it should (uniform gain, measured on the GPU),
+ * then read as a per-pixel brightness verdict on the original. With colour at
+ * 0 only that verdict is taken and the source hue survives untouched, which
+ * is what keeps the pass from tinting the film; at 1 the model's own colour
+ * comes through as well. maxRatio caps brightening so the model cannot turn a
+ * highlight into a cluster of coloured cells. */
+static const char *nr_compose_src =
+    "#version 330\n"
+    "uniform sampler2D origTex;\n"
+    "uniform sampler2D modelTex;\n"
+    "uniform sampler2D statTex;\n"   /* mip chain, top level = frame means */
+    "uniform float statLod;\n"
+    "uniform float transfer;\n"
+    "uniform float colour;\n"
+    "uniform float maxRatio;\n"
+    "out vec4 fragColor;\n"
+    "const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);\n"
+    "void main() {\n"
+    "    ivec2 p = ivec2(gl_FragCoord.xy);\n"
+    "    vec2 mean = textureLod(statTex, vec2(0.5), statLod).rg;\n"
+    "    float gain = mean.g > 1e-5 ? clamp(mean.r / mean.g, 0.25, 4.0) : 1.0;\n"
+    "    vec3 o = texelFetch(origTex, p, 0).rgb;\n"
+    "    vec3 m = texelFetch(modelTex, p, 0).rgb * gain;\n"
+    "    float lo = dot(o, LUMA);\n"
+    "    float ratio = lo > 1.0 / 255.0 ? dot(m, LUMA) / lo : 1.0;\n"
+    "    ratio = clamp(ratio, 0.0, maxRatio);\n"
+    "    vec3 blend = mix(o * ratio, m, colour);\n"
+    "    fragColor = vec4(max(mix(o, blend, transfer), vec3(0.0)), 1.0);\n"
+    "}\n";
+
+/* Luminance of both pictures, subsampled into one small RG texture. Its top
+ * mip level is the pair of frame means, which is where the composition reads
+ * the luminance match from - entirely on the GPU. Reading it back to the CPU
+ * instead cost 9 to 30 dropped frames on a ten-second clip, because
+ * glGetTexImage waits for everything already queued. */
+static const char *nr_stat_src =
+    "#version 330\n"
+    "uniform sampler2D origTex;\n"
+    "uniform sampler2D modelTex;\n"
+    "uniform float invStat;\n"
+    "out vec4 fragColor;\n"
+    "const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);\n"
+    "void main() {\n"
+    "    vec2 uv = gl_FragCoord.xy * invStat;\n"
+    "    fragColor = vec4(dot(texture(origTex,  uv).rgb, LUMA),\n"
+    "                     dot(texture(modelTex, uv).rgb, LUMA), 0.0, 1.0);\n"
+    "}\n";
+
+#define NR_STAT_SIZE  256
+#define NR_STAT_LEVEL 8          /* log2(NR_STAT_SIZE): the 1x1 level */
+
+static struct {
+    int want;                /* user setting: -1 auto, 0 off, 1 on          */
+    int ready;               /* textures and feature are up for this size   */
+    int failed;              /* gave up for this session                    */
+    GLuint compose_prog, stat_prog;
+    GLint  statlod_loc, transfer_loc, colour_loc, maxratio_loc, invstat_loc;
+    GLuint fbo;
+    GLuint stat_tex;
+    /* Two sets of textures, because one texture cannot be both. The interop
+     * refuses to register anything created with the NT-handle share flags
+     * (DXRegisterObject fails with 0xC01E01EE), and D3D12 refuses to open
+     * anything without them - so the shared pair below never reaches GL, and
+     * the GL pair below is filled from it by plain 3D-engine copies. At
+     * ~8 MB a frame those cost around 0.02 ms each. */
+    ID3D11Texture2D *share_in;  /* what the model reads (D3D12 side)        */
+    ID3D11Texture2D *share_out; /* what the model writes; owned by ffplay_ngx.c */
+    ID3D11Texture2D *orig_tex;  /* GL's copy of the frame as decoded        */
+    ID3D11Texture2D *model_tex; /* GL's copy of the model's answer          */
+    HANDLE orig_obj, model_obj;
+    GLuint orig_gl, model_gl;
+    int    w, h;
+    float  gain;             /* smoothed luminance match                    */
+    float  transfer;         /* how far to move toward the model            */
+    float  colour;           /* 0 = source hue only                         */
+} nrgl = { .want = -1, .transfer = 0.6f, .colour = 0.0f };
+
+/* FFPLAY_NR_TIMING=1: per-frame cost of the two halves of the pass, averaged
+ * over 100 frames. Kept because the interesting number is not the model's own
+ * runtime but how much of it lands on the display thread. */
+static int     nr_timing;
+static int64_t nr_time_run, nr_time_compose;
+static int     nr_time_n;
+
+/* Slot textures must be registered read-write for the composition to render
+ * into them, which is decided before the first frame; when neural rendering
+ * is off they stay read-only exactly as before. */
+static int nr_slots_rw(int w, int h)
+{
+    if (nrgl.failed || !nrgl.want)
+        return 0;
+    if (!gl.GenFramebuffers || !gl.GenerateMipmap)
+        return 0;
+    return nrgl.want > 0 || (int64_t)w * h <= NR_MAX_PIXELS;
+}
+
+static void nr_gl_destroy(void)
+{
+    if (!hwgl_exiting) {
+        if (nrgl.orig_obj)
+            hwgl.DXUnregisterObject(hwgl.gl_device, nrgl.orig_obj);
+        if (nrgl.model_obj)
+            hwgl.DXUnregisterObject(hwgl.gl_device, nrgl.model_obj);
+        if (nrgl.orig_gl)
+            gl.DeleteTextures(1, &nrgl.orig_gl);
+        if (nrgl.model_gl)
+            gl.DeleteTextures(1, &nrgl.model_gl);
+        if (nrgl.stat_tex)
+            gl.DeleteTextures(1, &nrgl.stat_tex);
+        if (nrgl.fbo && gl.DeleteFramebuffers)
+            gl.DeleteFramebuffers(1, &nrgl.fbo);
+        if (nrgl.orig_tex)
+            ID3D11Texture2D_Release(nrgl.orig_tex);
+        if (nrgl.model_tex)
+            ID3D11Texture2D_Release(nrgl.model_tex);
+        if (nrgl.share_in)
+            ID3D11Texture2D_Release(nrgl.share_in);
+    }
+    ngx_nr_free_size();
+    nrgl.orig_obj = nrgl.model_obj = NULL;
+    nrgl.orig_gl = nrgl.model_gl = nrgl.stat_tex = nrgl.fbo = 0;
+    nrgl.orig_tex = nrgl.model_tex = nrgl.share_in = nrgl.share_out = NULL;
+    nrgl.ready = 0;
+    nrgl.w = nrgl.h = 0;
+}
+
+/* Register a D3D11 texture as a GL texture we only ever sample from. */
+static int nr_register(const char *what, ID3D11Texture2D *tex, HANDLE *obj,
+                       GLuint *name)
+{
+    GLint prev_tex = 0, prev_active = 0;
+
+    gl.GenTextures(1, name);
+    *obj = hwgl.DXRegisterObject(hwgl.gl_device, tex, *name, GL_TEXTURE_2D,
+                                 WGL_ACCESS_READ_ONLY_NV);
+    if (!*obj) {
+        av_log(NULL, AV_LOG_WARNING,
+               "DLSS-NR: cannot register the %s texture with GL (error %lu)\n",
+               what, (unsigned long)GetLastError());
+        return -1;
+    }
+    if (!hwgl.DXLockObjects(hwgl.gl_device, 1, obj))
+        return -1;
+    gl.GetIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
+    gl.ActiveTexture(GL_TEXTURE0);
+    gl.GetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+    gl.BindTexture(GL_TEXTURE_2D, *name);
+    gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    gl.BindTexture(GL_TEXTURE_2D, prev_tex);
+    gl.ActiveTexture(prev_active);
+    hwgl.DXUnlockObjects(hwgl.gl_device, 1, obj);
+    return 0;
+}
+
+/* Bring the pass up for one frame size. Called with the device lock held,
+ * from hwgl_ensure_size(). Any failure is permanent for the session and only
+ * costs the enhancement. */
+static int nr_gl_setup(int w, int h)
+{
+    D3D11_TEXTURE2D_DESC td = { 0 };
+    GLint prev_tex = 0, prev_active = 0;
+    GLPixelStore ps;
+
+    if (nrgl.failed || !nr_slots_rw(w, h))
+        return -1;
+    if (nrgl.ready && nrgl.w == w && nrgl.h == h)
+        return 0;
+    nr_gl_destroy();
+
+    if (ngx_nr_init(hwgl.device, hwgl.dcontext) < 0)
+        goto fail;
+
+    if (!nrgl.compose_prog) {
+        nrgl.compose_prog = build_program(vertex_src, nr_compose_src);
+        nrgl.stat_prog    = build_program(vertex_src, nr_stat_src);
+        if (!nrgl.compose_prog || !nrgl.stat_prog)
+            goto fail;
+        nrgl.statlod_loc  = gl.GetUniformLocation(nrgl.compose_prog, "statLod");
+        nrgl.transfer_loc = gl.GetUniformLocation(nrgl.compose_prog, "transfer");
+        nrgl.colour_loc   = gl.GetUniformLocation(nrgl.compose_prog, "colour");
+        nrgl.maxratio_loc = gl.GetUniformLocation(nrgl.compose_prog, "maxRatio");
+        nrgl.invstat_loc  = gl.GetUniformLocation(nrgl.stat_prog, "invStat");
+        {
+            GLint prev_prog = 0, loc;
+
+            gl.GetIntegerv(GL_CURRENT_PROGRAM, &prev_prog);
+            for (int i = 0; i < 2; i++) {
+                GLuint p = i ? nrgl.stat_prog : nrgl.compose_prog;
+
+                gl.UseProgram(p);
+                loc = gl.GetUniformLocation(p, "origTex");
+                if (loc >= 0)
+                    gl.Uniform1i(loc, 0);
+                loc = gl.GetUniformLocation(p, "modelTex");
+                if (loc >= 0)
+                    gl.Uniform1i(loc, 1);
+                loc = gl.GetUniformLocation(p, "statTex");
+                if (loc >= 0)
+                    gl.Uniform1i(loc, 2);
+            }
+            gl.UseProgram(prev_prog);
+        }
+    }
+
+    /* The model's input. The VideoProcessor writes with the video engine,
+     * whose output the interop does not synchronise into GL (the same reason
+     * hwgl.rgb_tex exists), so this is a 3D-engine copy of vp_tex rather than
+     * vp_tex itself. */
+    td.Width            = w;
+    td.Height           = h;
+    td.MipLevels        = 1;
+    td.ArraySize        = 1;
+    td.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage            = D3D11_USAGE_DEFAULT;
+    td.BindFlags        = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    td.MiscFlags        = D3D11_RESOURCE_MISC_SHARED_NTHANDLE |
+                          D3D11_RESOURCE_MISC_SHARED;
+    if (FAILED(ID3D11Device_CreateTexture2D(hwgl.device, &td, NULL, &nrgl.share_in)))
+        goto fail;
+
+    if (ngx_nr_ensure(nrgl.share_in, w, h, &nrgl.share_out) < 0)
+        goto fail;
+
+    /* GL's own pair. Neither may carry the share flags, so both are ordinary
+     * textures that a copy keeps in step with the shared ones. model_tex has
+     * to match share_out's format for CopyResource to accept it. */
+    td.MiscFlags = 0;
+    if (FAILED(ID3D11Device_CreateTexture2D(hwgl.device, &td, NULL, &nrgl.orig_tex)))
+        goto fail;
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (FAILED(ID3D11Device_CreateTexture2D(hwgl.device, &td, NULL, &nrgl.model_tex)))
+        goto fail;
+
+    if (nr_register("original", nrgl.orig_tex,  &nrgl.orig_obj,  &nrgl.orig_gl)  < 0 ||
+        nr_register("model",    nrgl.model_tex, &nrgl.model_obj, &nrgl.model_gl) < 0)
+        goto fail;
+
+    gl.GenFramebuffers(1, &nrgl.fbo);
+    gl.GenTextures(1, &nrgl.stat_tex);
+    gl.GetIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
+    gl.ActiveTexture(GL_TEXTURE0);
+    gl.GetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex);
+    gl.BindTexture(GL_TEXTURE_2D, nrgl.stat_tex);
+    gl_pixelstore_push(&ps, 0);
+    gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RG16F, NR_STAT_SIZE, NR_STAT_SIZE, 0,
+                  GL_RG, GL_FLOAT, NULL);
+    gl_pixelstore_pop(&ps, 0);
+    gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+    gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    gl.GenerateMipmap(GL_TEXTURE_2D);      /* allocate the whole chain once */
+    gl.BindTexture(GL_TEXTURE_2D, prev_tex);
+    gl.ActiveTexture(prev_active);
+
+    nrgl.w = w;
+    nrgl.h = h;
+    nrgl.ready = 1;
+    return 0;
+
+fail:
+    nr_gl_destroy();
+    nrgl.failed = 1;
+    return -1;
+}
+
+/* Compose the model's answer over the original into the GL slot texture.
+ * Called with the device lock held and the GL context current. */
+static int nr_gl_compose(int slot)
+{
+    HANDLE objs[3];
+    GLint prev_prog = 0, prev_active = 0, prev_fbo = 0;
+    GLint prev_tex0 = 0, prev_tex1 = 0, prev_tex2 = 0, prev_vp[4];
+    GLboolean blend, scissor;
+    int ok = 0;
+
+    if (!nrgl.ready || !hwgl.gl_object[slot])
+        return -1;
+
+    objs[0] = nrgl.orig_obj;
+    objs[1] = nrgl.model_obj;
+    objs[2] = hwgl.gl_object[slot];
+    if (!hwgl.DXLockObjects(hwgl.gl_device, 3, objs))
+        return -1;
+
+    gl.GetIntegerv(GL_CURRENT_PROGRAM, &prev_prog);
+    gl.GetIntegerv(GL_ACTIVE_TEXTURE, &prev_active);
+    gl.GetIntegerv(GL_FRAMEBUFFER_BINDING, &prev_fbo);
+    gl.GetIntegerv(GL_VIEWPORT, prev_vp);
+    blend   = gl.IsEnabled(GL_BLEND);
+    scissor = gl.IsEnabled(GL_SCISSOR_TEST);
+    gl.ActiveTexture(GL_TEXTURE2);
+    gl.GetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex2);
+    gl.BindTexture(GL_TEXTURE_2D, nrgl.stat_tex);
+    gl.ActiveTexture(GL_TEXTURE1);
+    gl.GetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex1);
+    gl.BindTexture(GL_TEXTURE_2D, nrgl.model_gl);
+    gl.ActiveTexture(GL_TEXTURE0);
+    gl.GetIntegerv(GL_TEXTURE_BINDING_2D, &prev_tex0);
+    gl.BindTexture(GL_TEXTURE_2D, nrgl.orig_gl);
+    gl.Disable(GL_BLEND);
+    gl.Disable(GL_SCISSOR_TEST);
+
+    /* Measure this frame's two luminance means first: the composition reads
+     * them straight out of the mip chain, so nothing ever has to come back to
+     * the CPU. */
+    gl.BindFramebuffer(GL_FRAMEBUFFER, nrgl.fbo);
+    gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                            nrgl.stat_tex, 0);
+    if (gl.CheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+        gl.Viewport(0, 0, NR_STAT_SIZE, NR_STAT_SIZE);
+        gl.UseProgram(nrgl.stat_prog);
+        gl.Uniform1f(nrgl.invstat_loc, 1.0f / NR_STAT_SIZE);
+        gl.DrawArrays(GL_TRIANGLES, 0, 3);
+        gl.ActiveTexture(GL_TEXTURE2);
+        gl.BindTexture(GL_TEXTURE_2D, nrgl.stat_tex);
+        gl.GenerateMipmap(GL_TEXTURE_2D);
+        gl.ActiveTexture(GL_TEXTURE0);
+
+        gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                GL_TEXTURE_2D, hwgl.gl_tex[slot], 0);
+        if (gl.CheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+            gl.Viewport(0, 0, nrgl.w, nrgl.h);
+            gl.UseProgram(nrgl.compose_prog);
+            gl.Uniform1f(nrgl.statlod_loc, (float)NR_STAT_LEVEL);
+            gl.Uniform1f(nrgl.transfer_loc, nrgl.transfer);
+            gl.Uniform1f(nrgl.colour_loc, nrgl.colour);
+            gl.Uniform1f(nrgl.maxratio_loc, 2.0f);
+            gl.DrawArrays(GL_TRIANGLES, 0, 3);
+            ok = 1;
+        }
+    }
+
+    gl.FramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, 0, 0);
+    gl.BindFramebuffer(GL_FRAMEBUFFER, prev_fbo);
+    gl.UseProgram(prev_prog);
+    gl.BindTexture(GL_TEXTURE_2D, prev_tex0);
+    gl.ActiveTexture(GL_TEXTURE1);
+    gl.BindTexture(GL_TEXTURE_2D, prev_tex1);
+    gl.ActiveTexture(GL_TEXTURE2);
+    gl.BindTexture(GL_TEXTURE_2D, prev_tex2);
+    gl.ActiveTexture(prev_active);
+    gl.Viewport(prev_vp[0], prev_vp[1], prev_vp[2], prev_vp[3]);
+    if (blend)
+        gl.Enable(GL_BLEND);
+    if (scissor)
+        gl.Enable(GL_SCISSOR_TEST);
+    hwgl.DXUnlockObjects(hwgl.gl_device, 3, objs);
+    return ok ? 0 : -1;
+}
+
+/* Toggling changes how the slot textures have to be registered, so the whole
+ * interop size state is dropped and rebuilt on the next frame - which is also
+ * when the GL context is current and the device lock is held. */
+void fsr_nr_set(int on)
+{
+    if (nrgl.want == on)
+        return;
+    nrgl.want = on;
+    if (on)
+        nrgl.failed = 0;        /* an explicit request earns a fresh try */
+    hwgl.w = hwgl.h = 0;
+    hwgl.last_frame = NULL;
+}
+
+int fsr_nr_setting(void)  { return nrgl.want; }
+int fsr_nr_active(void)   { return nrgl.ready; }
+
+void fsr_nr_set_strength(float v)
+{
+    nrgl.transfer = av_clipf(v, 0.0f, 1.5f);
+}
+
+float fsr_nr_strength(void)  { return nrgl.transfer; }
+
+void fsr_nr_set_colour(float v)
+{
+    nrgl.colour = av_clipf(v, 0.0f, 1.0f);
+}
+
+float fsr_nr_colour(void)  { return nrgl.colour; }
+
+/* The model keeps temporal state; a seek or a stream change would otherwise
+ * be blended against frames from somewhere else entirely. */
+void fsr_nr_reset(void)
+{
+    ngx_nr_reset_history();
+}
+
 /* ASCII-fold a DXGI adapter description for matching against GL_RENDERER. */
 static void adapter_desc_to_ascii(const WCHAR *src, char *dst, size_t dst_size)
 {
@@ -1152,12 +1584,11 @@ static void hwgl_unlock(void)
 /* At process exit the NVIDIA driver can crash on interop unregistration
  * (observed with locked/remote sessions); the OS reclaims everything at
  * process death anyway, so teardown is skipped entirely then. */
-static int hwgl_exiting;
-
 static void fg_on_convert(AVFrame *frame, int slot); /* frame generation hook */
 
 static void hwgl_destroy_size(void)
 {
+    nr_gl_destroy();
     if (hwgl_exiting) {
         for (int i = 0; i < 2; i++) {
             hwgl.gl_object[i] = NULL;
@@ -1269,6 +1700,7 @@ static int hwgl_init(AVFrame *frame)
 #undef LOADWGL
 
     fsr_dump_prefix = getenv("FSR_DEBUG_DUMP");
+    nr_timing = getenv("FFPLAY_NR_TIMING") != NULL;
 
     if (!d3d->video_device || !d3d->video_context)
         return -1;
@@ -1401,12 +1833,19 @@ static int hwgl_ensure_size(int w, int h)
 
     /* Set sampling state once per slot; the texture must be interop-locked
      * for GL use. All interop lock/unlock calls are serialized against the
-     * decoder's D3D11 submissions via the hwdevice lock. */
+     * decoder's D3D11 submissions via the hwdevice lock.
+     *
+     * Read-write access is asked for only when neural rendering is going to
+     * run: the composition pass then renders into these textures instead of a
+     * CopyResource filling them. Without it they stay read-only exactly as
+     * they always were. */
     for (int i = 0; i < 2; i++) {
         gl.GenTextures(1, &hwgl.gl_tex[i]);
         hwgl.gl_object[i] = hwgl.DXRegisterObject(hwgl.gl_device, hwgl.rgb_tex[i],
                                                   hwgl.gl_tex[i], GL_TEXTURE_2D,
-                                                  WGL_ACCESS_READ_ONLY_NV);
+                                                  nr_slots_rw(w, h)
+                                                      ? WGL_ACCESS_READ_WRITE_NV
+                                                      : WGL_ACCESS_READ_ONLY_NV);
         if (!hwgl.gl_object[i])
             goto fail;
 
@@ -1431,6 +1870,9 @@ static int hwgl_ensure_size(int w, int h)
 
     hwgl.w = w;
     hwgl.h = h;
+    /* Optional and self-disabling: a failure here leaves the display path
+     * exactly as it was, minus the enhancement. */
+    nr_gl_setup(w, h);
     return 0;
 
 fail:
@@ -1572,10 +2014,61 @@ colorspace_done:
     }
     hr = ID3D11VideoContext_VideoProcessorBlt(hwgl.vcontext, hwgl.vp, hwgl.out_view, 0, 1, &stream);
     if (SUCCEEDED(hr)) {
-        ID3D11DeviceContext_CopyResource(hwgl.dcontext,
-                                         (ID3D11Resource *)hwgl.rgb_tex[slot],
-                                         (ID3D11Resource *)hwgl.vp_tex);
-        ID3D11DeviceContext_Flush(hwgl.dcontext);
+        int composed = 0;
+
+        /* Neural rendering takes the place of the copy into the slot: the
+         * model reads a 3D-engine copy of the frame and the composition pass
+         * writes the result into the slot texture. Doing it here rather than
+         * at display time is deliberate - frame generation and RIFE both read
+         * the slots, so generated frames come from enhanced sources and
+         * cannot flicker against the real ones. */
+        if (nrgl.ready) {
+            int64_t t0 = nr_timing ? av_gettime_relative() : 0, t1 = t0, t2 = t0;
+
+            /* One copy for the model (shared with D3D12), one for GL to
+             * sample as the original; neither texture can serve both roles. */
+            ID3D11DeviceContext_CopyResource(hwgl.dcontext,
+                                             (ID3D11Resource *)nrgl.share_in,
+                                             (ID3D11Resource *)hwgl.vp_tex);
+            ID3D11DeviceContext_CopyResource(hwgl.dcontext,
+                                             (ID3D11Resource *)nrgl.orig_tex,
+                                             (ID3D11Resource *)hwgl.vp_tex);
+            if (ngx_nr_run() == 0) {
+                if (nr_timing)
+                    t1 = av_gettime_relative();
+                /* ngx_nr_run left a GPU-side wait on the D3D11 timeline, so
+                 * this copy cannot start before the model has finished. */
+                ID3D11DeviceContext_CopyResource(hwgl.dcontext,
+                                                 (ID3D11Resource *)nrgl.model_tex,
+                                                 (ID3D11Resource *)nrgl.share_out);
+                ID3D11DeviceContext_Flush(hwgl.dcontext);
+                composed = nr_gl_compose(slot) == 0;
+                if (nr_timing) {
+                    t2 = av_gettime_relative();
+                    nr_time_run     += t1 - t0;
+                    nr_time_compose += t2 - t1;
+                    if (++nr_time_n == 100) {
+                        av_log(NULL, AV_LOG_INFO,
+                               "DLSS-NR: %.2f ms submit + %.2f ms compose per frame\n",
+                               nr_time_run / 100000.0, nr_time_compose / 100000.0);
+                        nr_time_n = 0;
+                        nr_time_run = nr_time_compose = 0;
+                    }
+                }
+            }
+            if (!composed && !ngx_nr_available()) {
+                av_log(NULL, AV_LOG_WARNING,
+                       "DLSS-NR: pass dropped out, back to the plain copy\n");
+                nr_gl_destroy();
+                nrgl.failed = 1;
+            }
+        }
+        if (!composed) {
+            ID3D11DeviceContext_CopyResource(hwgl.dcontext,
+                                             (ID3D11Resource *)hwgl.rgb_tex[slot],
+                                             (ID3D11Resource *)hwgl.vp_tex);
+            ID3D11DeviceContext_Flush(hwgl.dcontext);
+        }
     }
     hwgl_unlock();
     ID3D11VideoProcessorInputView_Release(in_view);
@@ -2962,6 +3455,15 @@ int fsr_fg_draw(SDL_Renderer *renderer, struct AVFrame *prev, struct AVFrame *ne
 void        fsr_rife_set(int on)        { (void)on; }
 int         fsr_rife_active(int w, int h) { (void)w; (void)h; return 0; }
 int         fsr_rife_boot(void)         { return -1; }
+
+void  fsr_nr_set(int on)               { (void)on; }
+int   fsr_nr_setting(void)             { return 0; }
+int   fsr_nr_active(void)              { return 0; }
+void  fsr_nr_set_strength(float v)     { (void)v; }
+float fsr_nr_strength(void)            { return 0.0f; }
+void  fsr_nr_set_colour(float v)       { (void)v; }
+float fsr_nr_colour(void)              { return 0.0f; }
+void  fsr_nr_reset(void)               { }
 
 #endif /* CONFIG_D3D11VA */
 
@@ -4519,6 +5021,7 @@ void fsr_uninit(void)
     hwgl_exiting = 1;
     fg_destroy();
     hwgl_destroy();
+    ngx_nr_uninit();        /* the D3D12 device and the NGX runtime */
     rife_free_buffers();
     rife_uninit();          /* drop the Vulkan session before the GPU goes */
 #endif
