@@ -659,7 +659,8 @@ static LRESULT CALLBACK menu_wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 }
 #endif
 
-int ui_context_menu(int fsr_on, int nr_on, int fg_on, int lada_on, int jasna_on, int fg_mult,
+int ui_context_menu(int fsr_on, int nr_on, int fg_on, int lada_on, int jasna_on,
+                    int fg_mult, int dlss_on,
                     int stereo_on, int scale_mode, int sub_on,
                     const UIAudioTracks *atracks,
                     void (*on_idle)(void *), void *idle_ctx)
@@ -700,6 +701,8 @@ int ui_context_menu(int fsr_on, int nr_on, int fg_on, int lada_on, int jasna_on,
         /* Greyed out unless FG is on -- the multiplier only matters then. */
         AppendMenuW(fx, MF_POPUP | (fg_on ? 0 : MF_GRAYED), (UINT_PTR)fm,
                     L"FG 프레임 생성 배수");
+        AppendMenuW(fx, MF_STRING | (dlss_on ? MF_CHECKED : 0),
+                    UI_MENU_DLSSNR, L"DLSS 화질 개선");
         AppendMenuW(sc, MF_STRING | (scale_mode == 0 ? MF_CHECKED : 0),
                     UI_MENU_SCALE_FIT, L"비율 유지");
         AppendMenuW(sc, MF_STRING | (scale_mode == 1 ? MF_CHECKED : 0),

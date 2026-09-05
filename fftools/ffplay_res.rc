@@ -12,3 +12,8 @@ IDR_RIFE_FLOWNET_BIN   RCDATA "../bin/rife-v4.6/flownet.bin"
 /* Bundled UI font (Noto Sans KR), used for all on-screen text including
  * subtitles. Vendored in the FFmpeg source root. */
 IDR_FONT_NOTOSANS      RCDATA "NotoSansKR-Regular.ttf"
+
+/* NGX forwarder for DLSS neural rendering, built by the fftools Makefile from
+ * ffplay_ngxshim.c into the build tree right before this resource script is
+ * compiled. Tiny (a few KB); see ffplay_ngx.c for why it is a separate DLL. */
+IDR_NGX_SHIM_DLL       RCDATA "fftools/nvngx.dll_ffplay.dll"

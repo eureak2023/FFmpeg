@@ -407,6 +407,13 @@ static int fsr_rife = 0;           /* FG engine: 0 = optical-flow warp (default)
                                     * can't run later), so starting from FLOW, 'r'
                                     * applies on the next launch. */
 static int rife_booted = 0;        /* RIFE's Vulkan/model came up this session */
+static int dlss_nr = -1;           /* DLSS 5 neural rendering: -1 = auto (on up
+                                    * to ~1080p, where its 4.3 ms/frame always
+                                    * fits), 0 = off, 1 = on at any size.
+                                    * Remembered in ffplay.ini. */
+static int dlss_nr_str = 60;       /* how far toward the model's answer, percent;
+                                    * 'n' cycles it and 0 turns the pass off  */
+static int dlss_nr_prev = 60;      /* strength the on/off toggle comes back to */
 static int fg_debug = 0;           /* 'i': top-left red marker that blinks only on
                                     * a genuinely interpolated frame (see below) */
 static int fg_rife_pref = 0;       /* persisted RIFE/FLOW choice; only the 'r'
@@ -1561,6 +1568,12 @@ static void load_settings(void)
             fg_rife_pref = fsr_rife = !!v;
         else if (sscanf(line, "video_vis=%d", &v) == 1)
             video_vis = !!v;
+        else if (sscanf(line, "dlss_nr=%d", &v) == 1 && v >= -1 && v <= 1)
+            dlss_nr = v;
+        else if (sscanf(line, "dlss_nr_str=%d", &v) == 1 && v >= 0 && v <= 150)
+            dlss_nr_str = v;
+        else if (sscanf(line, "dlss_nr_prev=%d", &v) == 1 && v > 0 && v <= 150)
+            dlss_nr_prev = v;   /* so shift+D comes back to the last real one */
     }
     fclose(f);
 }
@@ -1591,6 +1604,9 @@ static void save_settings(VideoState *is)
     fprintf(f, "fsr_fg=%d\n", !!fsr_fg);
     fprintf(f, "fg_rife=%d\n", fg_rife_pref);
     fprintf(f, "video_vis=%d\n", video_vis);
+    fprintf(f, "dlss_nr=%d\n", dlss_nr);
+    fprintf(f, "dlss_nr_str=%d\n", dlss_nr_str);
+    fprintf(f, "dlss_nr_prev=%d\n", dlss_nr_prev);
     fclose(f);
 }
 
@@ -1733,6 +1749,18 @@ static void status_hud_update(int fps)
                       (int)lrint((2.0f - fsr_sharpness) / 2.0f * 100.0f),
                       fsr_denoise ? "ON" : "OFF", fg_state,
                       *model ? "\nMODEL " : "", model);
+        /* "NR" above is the RCAS denoise term; this line is the DLSS model.
+         * N/A means it was asked for but could not run here - no RTX 50, no
+         * snippet DLL, or a software-decoded source. */
+        if (dlss_nr_str && n < (int)sizeof(buf)) {
+            char nr_state[8];
+
+            if (fsr_nr_active())
+                snprintf(nr_state, sizeof(nr_state), "%d", dlss_nr_str);
+            else
+                snprintf(nr_state, sizeof(nr_state), "N/A");
+            n += snprintf(buf + n, sizeof(buf) - n, "\nDLSS %s", nr_state);
+        }
         /* only worth a line while there is a tone map to tune */
         if (fsr_hdr_active() && n < (int)sizeof(buf))
             snprintf(buf + n, sizeof(buf) - n, "\nHDR %d", hdr_bright);
@@ -1768,6 +1796,45 @@ static void fps_tick(void)
         win_start = now;
         count = 0;
     }
+}
+
+/* The single place the DLSS neural-rendering strength changes, so the 'n'
+ * cycle, the shift+D toggle and the context-menu item cannot drift apart.
+ * percent 0 turns the pass off; anything else also pins dlss_nr on, because
+ * asking for it explicitly should override the resolution cap that the -1
+ * auto setting applies. */
+static void apply_dlss_nr(int percent)
+{
+    char toast[24];
+
+    dlss_nr_str = av_clip(percent, 0, 150);
+    if (dlss_nr_str)
+        dlss_nr_prev = dlss_nr_str;      /* what the on/off toggle restores */
+    fsr_nr_set_strength(dlss_nr_str / 100.0f);
+    fsr_nr_set(dlss_nr_str ? 1 : 0);
+    dlss_nr = dlss_nr_str ? 1 : 0;
+    av_log(NULL, AV_LOG_INFO, "DLSS neural rendering: %d%%\n", dlss_nr_str);
+    if (renderer) {
+        if (dlss_nr_str)
+            snprintf(toast, sizeof(toast), "DLSS %d", dlss_nr_str);
+        else
+            snprintf(toast, sizeof(toast), "DLSS OFF");
+        fsr_toast_show(renderer, toast);
+    }
+    if (show_fps)
+        status_hud_update(-1);
+}
+
+/* Next strength on the cycle; back walks the same list in reverse. */
+static int dlss_nr_step(int cur, int back)
+{
+    static const int steps[] = { 0, 35, 60, 100 };
+    int n = FF_ARRAY_ELEMS(steps), at = 0;
+
+    for (int i = 0; i < n; i++)
+        if (steps[i] == cur)
+            at = i;
+    return steps[(at + (back ? n - 1 : 1)) % n];
 }
 
 static double get_master_clock(VideoState *is);
@@ -2188,6 +2255,9 @@ static void stream_seek(VideoState *is, int64_t pos, int64_t rel, int by_bytes)
         /* Release any lada buffer-pause now, off the display thread, so the seek can't
          * deadlock playback in a permanent "LADA BUFFER" state (see lada_notify_seek). */
         lada_notify_seek();
+        /* The neural-rendering model carries temporal history; landing
+         * somewhere else in the film must not be blended against it. */
+        fsr_nr_reset();
         SDL_CondSignal(is->continue_read_thread);
     }
 }
@@ -5115,8 +5185,9 @@ static char *wait_for_input_file(void)
                 /* No file open yet: no audio tracks to offer. */
                 switch (ui_context_menu(fsr, fsr_denoise, fsr_fg,
                                         lada && !lada_is_jasna(), lada && lada_is_jasna(),
-                                        fg_mult, audio_stereo, video_scaling,
-                                        subtitle_shown, NULL, NULL, NULL)) {
+                                        fg_mult, dlss_nr_str > 0, audio_stereo,
+                                        video_scaling, subtitle_shown,
+                                        NULL, NULL, NULL)) {
                 case UI_MENU_OPEN: {
                     char *f = ui_open_file_dialog();
 
@@ -5131,6 +5202,14 @@ static char *wait_for_input_file(void)
                 case UI_MENU_NR:  fsr_denoise = !fsr_denoise; break;
                 case UI_MENU_FG:  fsr_fg = !fsr_fg; break;
                 case UI_MENU_JASNA: lada = !lada; break; /* no video: flip restoration intent */
+                case UI_MENU_DLSSNR:
+                    /* No video yet, so just record the choice; it takes
+                     * effect when a file opens. */
+                    if (dlss_nr_str)
+                        dlss_nr_prev = dlss_nr_str;
+                    dlss_nr_str = dlss_nr_str ? 0 : dlss_nr_prev;
+                    dlss_nr = dlss_nr_str ? 1 : 0;
+                    break;
                 case UI_MENU_AOUT_ORIG:   audio_stereo = 0; break;
                 case UI_MENU_AOUT_STEREO: audio_stereo = 1; break;
                 case UI_MENU_SCALE_FIT:     video_scaling = 0; break;
@@ -5252,6 +5331,7 @@ static int handle_ui_event(VideoState *cur_stream, const SDL_Event *event)
         cmd = ui_context_menu(fsr, fsr_denoise, fsr_fg,
                               lada_active() && !lada_is_jasna(),
                               lada_active() && lada_is_jasna(), fg_mult,
+                              dlss_nr_str > 0,
                               audio_stereo, video_scaling, subtitle_shown,
                               &atracks, menu_idle_present, cur_stream);
         switch (cmd) {
@@ -5263,6 +5343,10 @@ static int handle_ui_event(VideoState *cur_stream, const SDL_Event *event)
         case UI_MENU_NR:  sym = SDLK_d; break;
         case UI_MENU_FG:  sym = SDLK_g; break;
         case UI_MENU_JASNA: apply_engine(cur_stream, 1); break;
+        case UI_MENU_DLSSNR:
+            apply_dlss_nr(dlss_nr_str ? 0 : dlss_nr_prev);
+            cur_stream->force_refresh = 1;
+            break;
         case UI_MENU_SCALE_FIT:     set_video_scaling(cur_stream, 0); break;
         case UI_MENU_SCALE_FILL:    set_video_scaling(cur_stream, 1); break;
         case UI_MENU_SCALE_STRETCH: set_video_scaling(cur_stream, 2); break;
@@ -5521,6 +5605,13 @@ static void event_loop(VideoState *cur_stream)
                     status_hud_update(-1);   /* reflect the switch right away */
                 cur_stream->force_refresh = 1;
                 break;
+            case SDLK_n:
+                /* Cycle the strength: judging this needs an A/B against a
+                 * middle setting, not just on/off. Shift walks back down. */
+                apply_dlss_nr(dlss_nr_step(dlss_nr_str,
+                                           (event.key.keysym.mod & KMOD_SHIFT) != 0));
+                cur_stream->force_refresh = 1;
+                break;
             case SDLK_h: {
                 /* HDR->SDR exposure, in 25% steps. 'h' brighter, shift+'h'
                  * darker; clamped rather than wrapped so holding one key
@@ -5539,6 +5630,13 @@ static void event_loop(VideoState *cur_stream)
                 break;
             }
             case SDLK_d:
+                /* Shift+D is the DLSS on/off next to it; plain 'd' stays the
+                 * RCAS denoise term it has always been. */
+                if (event.key.keysym.mod & KMOD_SHIFT) {
+                    apply_dlss_nr(dlss_nr_str ? 0 : dlss_nr_prev);
+                    cur_stream->force_refresh = 1;
+                    break;
+                }
                 fsr_denoise = !fsr_denoise;
                 fsr_set_denoise(renderer, fsr_denoise);
                 av_log(NULL, AV_LOG_INFO, "FSR RCAS denoise %s\n",
@@ -5994,6 +6092,8 @@ static const OptionDef options[] = {
     { "lada",               OPT_TYPE_BOOL,           0, { &lada }, "real-time mosaic (JAV) restoration via the lada sidecar; off by default, toggle at runtime with 'L'" },
     { "lada_home",          OPT_TYPE_STRING, OPT_EXPERT, { &lada_home }, "path to the lada project root (contains .venv and lada_sidecar.py)", "dir" },
     { "jasna_home",         OPT_TYPE_STRING, OPT_EXPERT, { &jasna_home }, "path to the jasna source checkout (contains .venv and model_weights)", "dir" },
+    { "dlss_nr",            OPT_TYPE_BOOL,  OPT_EXPERT, { &dlss_nr }, "DLSS 5 neural rendering: resynthesise detail a low-bitrate encode threw away; default is on up to ~1080p and off above (-dlss_nr forces it on at any size, -nodlss_nr off). Needs an RTX 50 series GPU, hardware decoding, and nvngx_dlssnr.dll beside ffplay.exe; cycle strength at runtime with 'n' (remembered across runs)" },
+    { "dlss_nr_strength",   OPT_TYPE_INT,   OPT_EXPERT, { &dlss_nr_str }, "how far the picture moves toward the model's answer, percent (0 = off, 60 = default, above ~100 the synthesised grain shows)", "percent" },
     { "install",            OPT_TYPE_BOOL,  OPT_EXPERT, { &install_assoc }, "register .mp4/.mkv file associations for the current user and exit" },
     { "uninstall",          OPT_TYPE_BOOL,  OPT_EXPERT, { &uninstall_assoc }, "remove the .mp4/.mkv file associations and exit" },
     { NULL, },
@@ -6033,8 +6133,11 @@ void show_help_default(const char *opt, const char *arg)
            "+, -                increase and decrease FSR sharpness respectively\n"
            "d                   toggle FSR noise/grain-aware sharpening (denoise)\n"
            "g                   toggle 2x frame generation (NVIDIA optical flow)\n"
+           "r                   switch frame-generation engine (RIFE / optical flow)\n"
+           "shift+d             toggle DLSS neural rendering (also in the right-click 영상 효과 menu)\n"
+           "n, shift+n          cycle DLSS neural rendering strength (off, 35, 60, 100%%)\n"
            "h, shift+h          increase and decrease the brightness of HDR tone-mapped to SDR\n"
-           "tab                 toggle the status overlay (FPS, FSR, sharpness, denoise, FG)\n"
+           "tab                 toggle the status overlay (FPS, FSR, sharpness, denoise, FG, DLSS)\n"
            "1, 2, 3, 4          scale window to 0.5x, 1x, 1.5x, 2x of the video size\n"
            "left/right          seek backward/forward by 10 seconds or a custom interval if -seek_interval is set\n"
            "down/up             decrease and increase volume respectively\n"
@@ -6259,6 +6362,11 @@ int main(int argc, char **argv)
             /* RIFE loads lazily on the first generated frame; if its model or
              * Vulkan is missing the optical-flow warp just keeps being used. */
             fsr_rife_set(fsr_rife);
+            /* Neural rendering comes up with the first hardware frame, so
+             * this only records the preference. */
+            dlss_nr_str = av_clip(dlss_nr_str, 0, 150);
+            fsr_nr_set_strength(dlss_nr_str / 100.0f);
+            fsr_nr_set(dlss_nr_str ? dlss_nr : 0);
             update_fg_refresh();
             if (lada && input_filename) {
                 if (lada_start(input_filename, lada_home, "cuda") < 0)
