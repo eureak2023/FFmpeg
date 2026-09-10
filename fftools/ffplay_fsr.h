@@ -152,6 +152,25 @@ float fsr_nr_colour(void);
 /* Drop the model's temporal history: seek, stream change, discontinuity. */
 void  fsr_nr_reset(void);
 
+/* NVIDIA RTX Video Super Resolution, run by the D3D11 VideoProcessor that
+ * already does our colour conversion - so it costs one driver call on the
+ * existing zero-copy path rather than a pass of its own. When on, the
+ * processor renders the frame at 2x and the FSR passes take it from there;
+ * EASU then only has whatever is left between 2x and the window.
+ *
+ * On by default. Only sources up to 1080p are eligible: above that the pass
+ * is refused outright, since the source already carries the detail and the
+ * slot textures would have to grow to 8K.
+ *
+ * fsr_vsr_set() takes 0 (off) or 1 (on). fsr_vsr_active() reports whether the
+ * driver actually accepted it - it needs an RTX card and a recent driver, and
+ * says so once if not. fsr_vsr_scale() is the factor in use, 1 when the pass
+ * is not running. */
+void  fsr_vsr_set(int on);
+int   fsr_vsr_setting(void);
+int   fsr_vsr_active(void);
+int   fsr_vsr_scale(void);
+
 /* Small on-screen toast (built-in bitmap font, uppercase letters only).
  * Shown top-left for ~1.8s with a fade-out; draw it right before
  * SDL_RenderPresent(). fsr_toast_draw()/fsr_toast_active() return whether

@@ -414,6 +414,10 @@ static int dlss_nr = -1;           /* DLSS 5 neural rendering: -1 = auto (on up
 static int dlss_nr_str = 60;       /* how far toward the model's answer, percent;
                                     * 'n' cycles it and 0 turns the pass off  */
 static int dlss_nr_prev = 60;      /* strength the on/off toggle comes back to */
+static int vsr = 1;                /* NVIDIA RTX Video Super Resolution. On for
+                                    * sources up to 1080p, which is the only
+                                    * size it runs at anyway; -novsr turns it
+                                    * off. Remembered in ffplay.ini. */
 static int fg_debug = 0;           /* 'i': top-left red marker that blinks only on
                                     * a genuinely interpolated frame (see below) */
 static int fg_rife_pref = 0;       /* persisted RIFE/FLOW choice; only the 'r'
@@ -1570,6 +1574,8 @@ static void load_settings(void)
             video_vis = !!v;
         else if (sscanf(line, "dlss_nr=%d", &v) == 1 && v >= -1 && v <= 1)
             dlss_nr = v;
+        else if (sscanf(line, "vsr=%d", &v) == 1 && v >= 0 && v <= 1)
+            vsr = v;
         else if (sscanf(line, "dlss_nr_str=%d", &v) == 1 && v >= 0 && v <= 150)
             dlss_nr_str = v;
         else if (sscanf(line, "dlss_nr_prev=%d", &v) == 1 && v > 0 && v <= 150)
@@ -1604,6 +1610,7 @@ static void save_settings(VideoState *is)
     fprintf(f, "fsr_fg=%d\n", !!fsr_fg);
     fprintf(f, "fg_rife=%d\n", fg_rife_pref);
     fprintf(f, "video_vis=%d\n", video_vis);
+    fprintf(f, "vsr=%d\n", vsr);
     fprintf(f, "dlss_nr=%d\n", dlss_nr);
     fprintf(f, "dlss_nr_str=%d\n", dlss_nr_str);
     fprintf(f, "dlss_nr_prev=%d\n", dlss_nr_prev);
@@ -1760,6 +1767,16 @@ static void status_hud_update(int fps)
             else
                 snprintf(nr_state, sizeof(nr_state), "N/A");
             n += snprintf(buf + n, sizeof(buf) - n, "\nDLSS %s", nr_state);
+        }
+        /* Super resolution. N/A means it was asked for but the driver would
+         * not run it - not an RTX card, too old a driver, or a
+         * software-decoded source that never reaches the processor. */
+        if ((vsr > 0 || fsr_vsr_active()) && n < (int)sizeof(buf)) {
+            if (fsr_vsr_active())
+                n += snprintf(buf + n, sizeof(buf) - n, "\nVSR %dX",
+                              fsr_vsr_scale());
+            else
+                n += snprintf(buf + n, sizeof(buf) - n, "\nVSR N/A");
         }
         /* only worth a line while there is a tone map to tune */
         if (fsr_hdr_active() && n < (int)sizeof(buf))
@@ -5605,6 +5622,20 @@ static void event_loop(VideoState *cur_stream)
                     status_hud_update(-1);   /* reflect the switch right away */
                 cur_stream->force_refresh = 1;
                 break;
+            case SDLK_u:
+                /* VSR lives on the D3D11 processor, so this rebuilds it and
+                 * the next frame arrives through the new one. Forcing 1
+                 * rather than cycling back through auto means the key always
+                 * does something, whatever the source size; whether the
+                 * driver took it shows up on the TAB overlay. */
+                vsr = fsr_vsr_setting() ? 0 : 1;
+                fsr_vsr_set(vsr);
+                if (renderer)
+                    fsr_toast_show(renderer, vsr ? "VSR ON" : "VSR OFF");
+                if (show_fps)
+                    status_hud_update(-1);
+                cur_stream->force_refresh = 1;
+                break;
             case SDLK_n:
                 /* Cycle the strength: judging this needs an A/B against a
                  * middle setting, not just on/off. Shift walks back down. */
@@ -6094,6 +6125,7 @@ static const OptionDef options[] = {
     { "jasna_home",         OPT_TYPE_STRING, OPT_EXPERT, { &jasna_home }, "path to the jasna source checkout (contains .venv and model_weights)", "dir" },
     { "dlss_nr",            OPT_TYPE_BOOL,  OPT_EXPERT, { &dlss_nr }, "DLSS 5 neural rendering: resynthesise detail a low-bitrate encode threw away; default is on up to ~1080p and off above (-dlss_nr forces it on at any size, -nodlss_nr off). Needs an RTX 50 series GPU, hardware decoding, and nvngx_dlssnr.dll beside ffplay.exe; cycle strength at runtime with 'n' (remembered across runs)" },
     { "dlss_nr_strength",   OPT_TYPE_INT,   OPT_EXPERT, { &dlss_nr_str }, "how far the picture moves toward the model's answer, percent (0 = off, 60 = default, above ~100 the synthesised grain shows)", "percent" },
+    { "vsr",                OPT_TYPE_BOOL,  OPT_EXPERT, { &vsr }, "NVIDIA RTX Video Super Resolution: the D3D11 VideoProcessor that already does the colour conversion renders the frame at 2x through NVIDIA's model, and the FSR passes take it from there. On by default for sources up to 1080p; above that the source already has the detail and 2x would mean 8K slot textures, so it is refused and -vsr does not override that. -novsr turns it off. Needs an RTX card, a recent driver and hardware decoding; toggle at runtime with 'u' (remembered across runs)" },
     { "install",            OPT_TYPE_BOOL,  OPT_EXPERT, { &install_assoc }, "register .mp4/.mkv file associations for the current user and exit" },
     { "uninstall",          OPT_TYPE_BOOL,  OPT_EXPERT, { &uninstall_assoc }, "remove the .mp4/.mkv file associations and exit" },
     { NULL, },
@@ -6367,6 +6399,7 @@ int main(int argc, char **argv)
             dlss_nr_str = av_clip(dlss_nr_str, 0, 150);
             fsr_nr_set_strength(dlss_nr_str / 100.0f);
             fsr_nr_set(dlss_nr_str ? dlss_nr : 0);
+            fsr_vsr_set(vsr);
             update_fg_refresh();
             if (lada && input_filename) {
                 if (lada_start(input_filename, lada_home, "cuda") < 0)
