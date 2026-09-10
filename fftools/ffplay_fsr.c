@@ -1031,7 +1031,8 @@ static struct {
     const void *slot_frame[2];    /* which decoded frame each slot holds */
     int64_t slot_pts[2];
     int cur_slot;
-    int w, h;
+    int w, h;                     /* slot/output size: input size * vsr.scale */
+    int in_w, in_h;               /* what the VideoProcessor takes in         */
     int cs_matrix, cs_range;      /* color space currently set on the stream */
     /* Cache key of the last fully rendered frame: repeated refreshes of the
      * same frame (pause, toast) redraw the cached out_tex without touching
@@ -1050,6 +1051,42 @@ static const GUID iid_ID3D11VideoContext1 =
     { 0xa7f026da, 0xa5f8, 0x4487, { 0xa5, 0x64, 0x15, 0xe3, 0x43, 0x57, 0x65, 0x1e } };
 static const GUID iid_ID3D11VideoContext2 =
     { 0xc4e7374c, 0x6243, 0x4d1b, { 0xae, 0x87, 0x52, 0xb4, 0xf7, 0x40, 0xe2, 0x61 } };
+
+/* ---- NVIDIA RTX Video Super Resolution ----
+ *
+ * The driver exposes VSR as a private stream extension on the D3D11
+ * VideoProcessor rather than as an API of its own: set this GUID on the stream
+ * and the same VideoProcessorBlt that already does our YCbCr->RGB de-matrix
+ * runs the model on the way through. Nothing else in the display path moves,
+ * which is the whole appeal - it costs one call, not a pipeline.
+ *
+ * None of it is documented by NVIDIA. The GUID and the payload are the ones
+ * Chromium sets for the same feature, and a driver that does not recognise
+ * them answers with a failed HRESULT rather than misbehaving, so a wrong guess
+ * costs the feature and nothing else.
+ *
+ * The model needs an output bigger than its input to have anything to do, so
+ * the processor is built with a scale factor when VSR is on (see vsr.scale)
+ * rather than the 1:1 the colour conversion alone would want. */
+static const GUID GUID_NVIDIA_PPE =
+    { 0xd43ce1b3, 0x1f4b, 0x48ac, { 0xba, 0xee, 0xc3, 0xc2, 0x53, 0x75, 0xe6, 0xf7 } };
+
+#define NV_PPE_VERSION_V1  0x1u
+#define NV_PPE_METHOD_VSR  0x2u   /* super resolution */
+
+typedef struct NvPpeStreamExt {
+    UINT version;
+    UINT method;
+    UINT enable;
+} NvPpeStreamExt;
+
+static struct {
+    int want;        /* user setting: 1 on (the default), 0 off      */
+    int active;      /* the driver accepted it for this processor    */
+    int failed;      /* it refused; stop asking for this session     */
+    int scale;       /* processor output scale in use, 1 = no upscale */
+    int big_logged;  /* said once that the source is too large       */
+} vsr = { .want = 1, .scale = 1 };
 
 /* Set on the way out, when releasing GPU objects is both pointless and a
  * chance to crash inside a driver that is already tearing down. */
@@ -1462,6 +1499,25 @@ void fsr_nr_reset(void)
     ngx_nr_reset_history();
 }
 
+/* Changing the setting changes the processor's output size, so the whole
+ * interop size state is dropped and rebuilt on the next frame - which is also
+ * when the GL context is current and the device lock is held. */
+void fsr_vsr_set(int on)
+{
+    if (vsr.want == on)
+        return;
+    vsr.want = on;
+    if (on)
+        vsr.failed = 0;         /* an explicit request earns a fresh try */
+    hwgl.w = hwgl.h = 0;
+    hwgl.in_w = hwgl.in_h = 0;
+    hwgl.last_frame = NULL;
+}
+
+int fsr_vsr_setting(void) { return vsr.want; }
+int fsr_vsr_active(void)  { return vsr.active; }
+int fsr_vsr_scale(void)   { return vsr.active ? vsr.scale : 1; }
+
 /* ASCII-fold a DXGI adapter description for matching against GL_RENDERER. */
 static void adapter_desc_to_ascii(const WCHAR *src, char *dst, size_t dst_size)
 {
@@ -1647,6 +1703,7 @@ static void hwgl_destroy_size(void)
         hwgl.vp_enum = NULL;
     }
     hwgl.w = hwgl.h = 0;
+    hwgl.in_w = hwgl.in_h = 0;
     hwgl.cs_matrix = hwgl.cs_range = -1;
     hwgl.last_frame = NULL;
 }
@@ -1764,20 +1821,70 @@ static int hwgl_init(AVFrame *frame)
     return 0;
 }
 
+/* Ask the driver to run VSR on this processor's stream. Returns 0 if it
+ * accepted. Called once per processor: the setting lives on the processor, and
+ * the processor is rebuilt whenever the size or the scale changes. */
+static int hwgl_vsr_apply(int on)
+{
+    NvPpeStreamExt ext = { NV_PPE_VERSION_V1, NV_PPE_METHOD_VSR, on ? 1u : 0u };
+    HRESULT hr;
+
+    if (!hwgl.vcontext || !hwgl.vp)
+        return -1;
+    hr = ID3D11VideoContext_VideoProcessorSetStreamExtension(hwgl.vcontext, hwgl.vp, 0,
+             &GUID_NVIDIA_PPE, (UINT)sizeof(ext), &ext);
+    if (FAILED(hr)) {
+        if (on && !vsr.failed) {
+            vsr.failed = 1;
+            av_log(NULL, AV_LOG_WARNING,
+                   "VSR: the driver refused super resolution (0x%08lX); "
+                   "needs an RTX card and a recent driver\n", (unsigned long)hr);
+        }
+        return -1;
+    }
+    return 0;
+}
+
+/* Output scale for a source of this size, or 0 for "do not run the pass".
+ *
+ * Above 1080p the pass is refused outright, and -vsr does not override that:
+ * a source that size already carries the detail the model would be inventing,
+ * and the cost is not only time - every slot texture and every downstream GL
+ * pass grows with the scale, so 2x on a 4K source means 8K slots. 2x is the
+ * cap below that line even though the model goes further, for the same
+ * reason. */
+static int vsr_scale_for(int w, int h)
+{
+    if (vsr.failed || !vsr.want)
+        return 0;
+    if ((int64_t)w * h > 2073600)   /* 1920x1080 */
+        return 0;
+    return 2;
+}
+
 static int hwgl_ensure_size(int w, int h)
 {
+    const int want_scale = vsr_scale_for(w, h);
+    const int scale = want_scale ? want_scale : 1;
+    const int ow = w * scale, oh = h * scale;
     D3D11_TEXTURE2D_DESC tdesc = { 0 };
     D3D11_VIDEO_PROCESSOR_CONTENT_DESC cdesc = { 0 };
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC odesc = { 0 };
     GLint prev_tex0 = 0, prev_active = 0;
     HRESULT hr;
 
-    if (hwgl.rgb_tex[0] && hwgl.w == w && hwgl.h == h)
+    /* hwgl.w/h stay in the key even though in_w/in_h now decide the size:
+     * zeroing them is how every other toggle here asks for a rebuild
+     * (fsr_nr_set does exactly that), and dropping them from the test left
+     * those callers silently skipping the rebuild - the draw path then ran
+     * with hwgl.w == 0 and tiled the picture. */
+    if (hwgl.rgb_tex[0] && hwgl.w == ow && hwgl.h == oh &&
+        hwgl.in_w == w && hwgl.in_h == h && vsr.scale == scale)
         return 0;
     hwgl_destroy_size();
 
-    tdesc.Width            = w;
-    tdesc.Height           = h;
+    tdesc.Width            = ow;
+    tdesc.Height           = oh;
     tdesc.MipLevels        = 1;
     tdesc.ArraySize        = 1;
     tdesc.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -1787,14 +1894,14 @@ static int hwgl_ensure_size(int w, int h)
     {
         /* Tell-tale initial fill: a broken conversion chain shows orange
          * instead of black, which is much easier to diagnose. */
-        uint32_t *init_px = av_malloc((size_t)w * h * 4);
+        uint32_t *init_px = av_malloc((size_t)ow * oh * 4);
         D3D11_SUBRESOURCE_DATA init = { 0 };
 
         if (init_px) {
-            for (int i = 0; i < w * h; i++)
+            for (int i = 0; i < ow * oh; i++)
                 init_px[i] = 0xFFFF8000; /* BGRA orange */
             init.pSysMem     = init_px;
-            init.SysMemPitch = w * 4;
+            init.SysMemPitch = ow * 4;
         }
         hr = S_OK;
         for (int i = 0; i < 2 && SUCCEEDED(hr); i++)
@@ -1808,8 +1915,8 @@ static int hwgl_ensure_size(int w, int h)
     cdesc.InputFrameFormat = D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE;
     cdesc.InputWidth       = w;
     cdesc.InputHeight      = h;
-    cdesc.OutputWidth      = w;
-    cdesc.OutputHeight     = h;
+    cdesc.OutputWidth      = ow;
+    cdesc.OutputHeight     = oh;
     cdesc.Usage            = D3D11_VIDEO_USAGE_PLAYBACK_NORMAL;
     hr = ID3D11VideoDevice_CreateVideoProcessorEnumerator(hwgl.vdevice, &cdesc, &hwgl.vp_enum);
     if (FAILED(hr))
@@ -1817,6 +1924,29 @@ static int hwgl_ensure_size(int w, int h)
     hr = ID3D11VideoDevice_CreateVideoProcessor(hwgl.vdevice, hwgl.vp_enum, 0, &hwgl.vp);
     if (FAILED(hr))
         goto fail;
+
+    /* VSR is a property of the processor, so it is set here rather than per
+     * frame - and only when there is an upscale for it to do.
+     *
+     * It also depends on the stream's automatic processing staying on, which
+     * here means simply not touching it: VSR *is* driver-side video
+     * processing, and VideoProcessorSetStreamAutoProcessingMode(FALSE) turns
+     * it off along with everything else. Nothing reports that - the extension
+     * call still returns S_OK and the processor quietly scales with plain
+     * bilinear instead. Measured: with auto processing off the 2x output
+     * matched an OpenCV bilinear upscale of the same frame to 0.006 levels,
+     * the same picture rather than a similar one; with it on, high-frequency
+     * energy at the slot went 3.58 -> 14.97 (bilinear 3.58, lanczos4 6.45). */
+    vsr.scale  = scale;
+    vsr.active = want_scale && hwgl_vsr_apply(1) == 0;
+    if (!want_scale && vsr.want > 0 && !vsr.big_logged) {
+        vsr.big_logged = 1;
+        av_log(NULL, AV_LOG_INFO,
+               "VSR: not used above 1080p (source is %dx%d)\n", w, h);
+    }
+    if (vsr.active)
+        av_log(NULL, AV_LOG_INFO, "VSR: NVIDIA super resolution on, %dx%d -> %dx%d\n",
+               w, h, ow, oh);
 
     /* The VideoProcessor writes with the GPU's video engine, whose writes
      * the NV_DX_interop path does not synchronize into GL (verified: 3D
@@ -1843,7 +1973,7 @@ static int hwgl_ensure_size(int w, int h)
         gl.GenTextures(1, &hwgl.gl_tex[i]);
         hwgl.gl_object[i] = hwgl.DXRegisterObject(hwgl.gl_device, hwgl.rgb_tex[i],
                                                   hwgl.gl_tex[i], GL_TEXTURE_2D,
-                                                  nr_slots_rw(w, h)
+                                                  nr_slots_rw(ow, oh)
                                                       ? WGL_ACCESS_READ_WRITE_NV
                                                       : WGL_ACCESS_READ_ONLY_NV);
         if (!hwgl.gl_object[i])
@@ -1868,11 +1998,13 @@ static int hwgl_ensure_size(int w, int h)
         hwgl_unlock();
     }
 
-    hwgl.w = w;
-    hwgl.h = h;
+    hwgl.in_w = w;
+    hwgl.in_h = h;
+    hwgl.w = ow;
+    hwgl.h = oh;
     /* Optional and self-disabling: a failure here leaves the display path
      * exactly as it was, minus the enhancement. */
-    nr_gl_setup(w, h);
+    nr_gl_setup(ow, oh);
     return 0;
 
 fail:
@@ -2162,12 +2294,15 @@ int fsr_hw_draw(SDL_Renderer *renderer, AVFrame *frame, const SDL_Rect *rect,
 
     if (hwgl_ensure_size(frame->width, frame->height) < 0)
         goto fail_permanent;
-    if (ensure_textures(renderer, frame->width, frame->height, rect->w, rect->h) < 0)
+    /* Sizes from here on are the slot's, not the decoded frame's: with VSR the
+     * processor has already upscaled, and EASU's job is whatever is left
+     * between that and the window. */
+    if (ensure_textures(renderer, hwgl.w, hwgl.h, rect->w, rect->h) < 0)
         return 0;
 
-    engaged = fsr_on && (rect->w > frame->width || rect->h > frame->height);
+    engaged = fsr_on && (rect->w > hwgl.w || rect->h > hwgl.h);
     if (fsr_on)
-        log_engage_transition(engaged, frame->width, frame->height, rect);
+        log_engage_transition(engaged, hwgl.w, hwgl.h, rect);
 
     /* Repeated refreshes of the same frame (pause, toast overlay) reuse the
      * already-rendered out_tex; only new content touches D3D11 and GL. */
@@ -2196,8 +2331,8 @@ int fsr_hw_draw(SDL_Renderer *renderer, AVFrame *frame, const SDL_Rect *rect,
     if (engaged) {
         GLfloat con0[4];
 
-        con0[0] = (GLfloat)frame->width  / rect->w;
-        con0[1] = (GLfloat)frame->height / rect->h;
+        con0[0] = (GLfloat)hwgl.w / rect->w;
+        con0[1] = (GLfloat)hwgl.h / rect->h;
         con0[2] = 0.5f * con0[0] - 0.5f;
         con0[3] = 0.5f * con0[1] - 0.5f;
         if (run_pass2(renderer, easu_prog, NULL, hwgl.gl_tex[hwgl.cur_slot], easu_tex,
@@ -2209,8 +2344,24 @@ int fsr_hw_draw(SDL_Renderer *renderer, AVFrame *frame, const SDL_Rect *rect,
             goto fail_soft;
         }
     } else {
-        if (run_pass2(renderer, copy_prog, NULL, hwgl.gl_tex[hwgl.cur_slot], out_tex,
-                      rect->w, rect->h, NULL, 0.0f) < 0) {
+        /* VSR has already brought the slot up to the window, so EASU has
+         * nothing left to do - but RCAS does, and falling through to the
+         * plain copy dropped the sharpen along with the upscale it is
+         * normally attached to.
+         *
+         * Only when the slot is already exactly the output size, though.
+         * RCAS is a 1:1 filter (texelFetch at gl_FragCoord, no resample), so
+         * pointing it at a slot larger than the window shows the top-left
+         * corner at 1:1 instead of the fitted picture. Chaining copy into
+         * RCAS would scale and sharpen, but both programs tone map, so an
+         * HDR source would go through it twice. */
+        const int sharpen = fsr_on && vsr.active &&
+                            hwgl.w == rect->w && hwgl.h == rect->h;
+
+        if (run_pass2(renderer, sharpen ? rcas_prog : copy_prog, NULL,
+                      hwgl.gl_tex[hwgl.cur_slot], out_tex,
+                      rect->w, rect->h, NULL,
+                      sharpen ? exp2f(-sharpness) : 0.0f) < 0) {
             hwgl.DXUnlockObjects(hwgl.gl_device, 1, &hwgl.gl_object[hwgl.cur_slot]);
             hwgl_unlock();
             goto fail_soft;
@@ -3464,6 +3615,11 @@ float fsr_nr_strength(void)            { return 0.0f; }
 void  fsr_nr_set_colour(float v)       { (void)v; }
 float fsr_nr_colour(void)              { return 0.0f; }
 void  fsr_nr_reset(void)               { }
+
+void  fsr_vsr_set(int on)              { (void)on; }
+int   fsr_vsr_setting(void)            { return 0; }
+int   fsr_vsr_active(void)             { return 0; }
+int   fsr_vsr_scale(void)              { return 1; }
 
 #endif /* CONFIG_D3D11VA */
 
