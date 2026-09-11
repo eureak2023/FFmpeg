@@ -165,8 +165,13 @@ void  fsr_nr_reset(void);
  * fsr_vsr_set() takes 0 (off) or 1 (on). fsr_vsr_active() reports whether the
  * driver actually accepted it - it needs an RTX card and a recent driver, and
  * says so once if not. fsr_vsr_scale() is the factor in use, 1 when the pass
- * is not running. */
+ * is not running.
+ *
+ * fsr_vsr_set_scale() asks for 2x, 3x or 4x. What a source actually gets is
+ * capped so the processor never outputs more than 4K, which leaves a small
+ * source free to take the whole factor and settles 1080p at 2x by itself. */
 void  fsr_vsr_set(int on);
+void  fsr_vsr_set_scale(int scale);
 int   fsr_vsr_setting(void);
 int   fsr_vsr_active(void);
 int   fsr_vsr_scale(void);

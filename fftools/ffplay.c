@@ -417,6 +417,9 @@ static int vsr = 1;                /* NVIDIA RTX Video Super Resolution. On for
                                     * sources up to 1080p, which is the only
                                     * size it runs at anyway; -novsr turns it
                                     * off. Remembered in ffplay.ini. */
+static int vsr_scale = 2;          /* how far the model upscales, 2 to 4; what
+                                    * a source actually gets is capped so the
+                                    * processor stays within 4K */
 static int fg_debug = 0;           /* 'i': top-left red marker that blinks only on
                                     * a genuinely interpolated frame (see below) */
 static int fg_rife_pref = 0;       /* persisted RIFE/FLOW choice; only the 'r'
@@ -1553,6 +1556,8 @@ static void load_settings(void)
             dlss_nr = v;
         else if (sscanf(line, "vsr=%d", &v) == 1 && v >= 0 && v <= 1)
             vsr = v;
+        else if (sscanf(line, "vsr_scale=%d", &v) == 1 && v >= 2 && v <= 4)
+            vsr_scale = v;
         else if (sscanf(line, "dlss_nr_str=%d", &v) == 1 && v >= 0 && v <= 150)
             dlss_nr_str = v;
         else if (sscanf(line, "dlss_nr_prev=%d", &v) == 1 && v > 0 && v <= 150)
@@ -1588,6 +1593,7 @@ static void save_settings(VideoState *is)
     fprintf(f, "fg_rife=%d\n", fg_rife_pref);
     fprintf(f, "video_vis=%d\n", video_vis);
     fprintf(f, "vsr=%d\n", vsr);
+    fprintf(f, "vsr_scale=%d\n", vsr_scale);
     fprintf(f, "dlss_nr=%d\n", dlss_nr);
     fprintf(f, "dlss_nr_str=%d\n", dlss_nr_str);
     fprintf(f, "dlss_nr_prev=%d\n", dlss_nr_prev);
@@ -5917,6 +5923,7 @@ static const OptionDef options[] = {
     { "dlss_nr",            OPT_TYPE_BOOL,  OPT_EXPERT, { &dlss_nr }, "DLSS 5 neural rendering: resynthesise detail a low-bitrate encode threw away; default is on up to ~1080p and off above (-dlss_nr forces it on at any size, -nodlss_nr off). Needs an RTX 50 series GPU, hardware decoding, and nvngx_dlssnr.dll beside ffplay.exe; cycle strength at runtime with 'n' (remembered across runs)" },
     { "dlss_nr_strength",   OPT_TYPE_INT,   OPT_EXPERT, { &dlss_nr_str }, "how far the picture moves toward the model's answer, percent (0 = off, 60 = default, above ~100 the synthesised grain shows)", "percent" },
     { "vsr",                OPT_TYPE_BOOL,  OPT_EXPERT, { &vsr }, "NVIDIA RTX Video Super Resolution: the D3D11 VideoProcessor that already does the colour conversion renders the frame at 2x through NVIDIA's model, and the FSR passes take it from there. On by default for sources up to 1080p; above that the source already has the detail and 2x would mean 8K slot textures, so it is refused and -vsr does not override that. -novsr turns it off. Needs an RTX card, a recent driver and hardware decoding; toggle at runtime with 'u' (remembered across runs)" },
+    { "vsr_scale",          OPT_TYPE_INT,   OPT_EXPERT, { &vsr_scale }, "how far RTX Video Super Resolution upscales, 2 to 4 (default 2). Capped per source so the VideoProcessor never outputs more than 4K, which leaves a small source free to take the whole factor while 1080p settles at 2x by itself; every slot texture grows with it", "factor" },
     { "install",            OPT_TYPE_BOOL,  OPT_EXPERT, { &install_assoc }, "register .mp4/.mkv file associations for the current user and exit" },
     { "uninstall",          OPT_TYPE_BOOL,  OPT_EXPERT, { &uninstall_assoc }, "remove the .mp4/.mkv file associations and exit" },
     { NULL, },
@@ -6187,6 +6194,8 @@ int main(int argc, char **argv)
             dlss_nr_str = av_clip(dlss_nr_str, 0, 150);
             fsr_nr_set_strength(dlss_nr_str / 100.0f);
             fsr_nr_set(dlss_nr_str ? dlss_nr : 0);
+            vsr_scale = av_clip(vsr_scale, 2, 4);
+            fsr_vsr_set_scale(vsr_scale);
             fsr_vsr_set(vsr);
             update_fg_refresh();
         }
