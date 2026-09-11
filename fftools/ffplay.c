@@ -5629,15 +5629,32 @@ static void event_loop(VideoState *cur_stream)
                 cur_stream->force_refresh = 1;
                 break;
             case SDLK_u:
-                /* VSR lives on the D3D11 processor, so this rebuilds it and
-                 * the next frame arrives through the new one. Forcing 1
-                 * rather than cycling back through auto means the key always
-                 * does something, whatever the source size; whether the
-                 * driver took it shows up on the TAB overlay. */
-                vsr = fsr_vsr_setting() ? 0 : 1;
-                fsr_vsr_set(vsr);
-                if (renderer)
-                    fsr_toast_show(renderer, vsr ? "VSR ON" : "VSR OFF");
+                /* VSR lives on the D3D11 processor, so either of these
+                 * rebuilds it and the next frame arrives through the new one.
+                 * Shift+U steps the factor instead of toggling, because
+                 * judging 3x against 2x needs them back to back on the same
+                 * shot. Stepping it implies wanting the pass on, so the key
+                 * always does something whatever state it was in. */
+                if (event.key.keysym.mod & KMOD_SHIFT) {
+                    char toast[16];
+
+                    vsr_scale = vsr_scale >= 4 ? 2 : vsr_scale + 1;
+                    fsr_vsr_set_scale(vsr_scale);
+                    if (!vsr) {
+                        vsr = 1;
+                        fsr_vsr_set(vsr);
+                    }
+                    /* The factor asked for; a source too large for it is
+                     * capped down, which the TAB overlay reports. */
+                    snprintf(toast, sizeof(toast), "VSR %dX", vsr_scale);
+                    if (renderer)
+                        fsr_toast_show(renderer, toast);
+                } else {
+                    vsr = fsr_vsr_setting() ? 0 : 1;
+                    fsr_vsr_set(vsr);
+                    if (renderer)
+                        fsr_toast_show(renderer, vsr ? "VSR ON" : "VSR OFF");
+                }
                 if (show_fps)
                     status_hud_update(-1);
                 cur_stream->force_refresh = 1;
@@ -6132,7 +6149,7 @@ static const OptionDef options[] = {
     { "dlss_nr",            OPT_TYPE_BOOL,  OPT_EXPERT, { &dlss_nr }, "DLSS 5 neural rendering: resynthesise detail a low-bitrate encode threw away; default is on up to ~1080p and off above (-dlss_nr forces it on at any size, -nodlss_nr off). Needs an RTX 50 series GPU, hardware decoding, and nvngx_dlssnr.dll beside ffplay.exe; cycle strength at runtime with 'n' (remembered across runs)" },
     { "dlss_nr_strength",   OPT_TYPE_INT,   OPT_EXPERT, { &dlss_nr_str }, "how far the picture moves toward the model's answer, percent (0 = off, 60 = default, above ~100 the synthesised grain shows)", "percent" },
     { "vsr",                OPT_TYPE_BOOL,  OPT_EXPERT, { &vsr }, "NVIDIA RTX Video Super Resolution: the D3D11 VideoProcessor that already does the colour conversion renders the frame at 2x through NVIDIA's model, and the FSR passes take it from there. On by default for sources up to 1080p; above that the source already has the detail and 2x would mean 8K slot textures, so it is refused and -vsr does not override that. -novsr turns it off. Needs an RTX card, a recent driver and hardware decoding; toggle at runtime with 'u' (remembered across runs)" },
-    { "vsr_scale",          OPT_TYPE_INT,   OPT_EXPERT, { &vsr_scale }, "how far RTX Video Super Resolution upscales, 2 to 4 (default 2). Capped per source so the VideoProcessor never outputs more than 4K, which leaves a small source free to take the whole factor while 1080p settles at 2x by itself; every slot texture grows with it", "factor" },
+    { "vsr_scale",          OPT_TYPE_INT,   OPT_EXPERT, { &vsr_scale }, "how far RTX Video Super Resolution upscales, 2 to 4 (default 2). Capped per source so the VideoProcessor never outputs more than 4K, which leaves a small source free to take the whole factor while 1080p settles at 2x by itself; every slot texture grows with it. Shift+'u' steps it at runtime (remembered across runs)", "factor" },
     { "install",            OPT_TYPE_BOOL,  OPT_EXPERT, { &install_assoc }, "register .mp4/.mkv file associations for the current user and exit" },
     { "uninstall",          OPT_TYPE_BOOL,  OPT_EXPERT, { &uninstall_assoc }, "remove the .mp4/.mkv file associations and exit" },
     { NULL, },
