@@ -1085,8 +1085,10 @@ static struct {
     int active;      /* the driver accepted it for this processor    */
     int failed;      /* it refused; stop asking for this session     */
     int scale;       /* processor output scale in use, 1 = no upscale */
+    int scale_want;  /* requested factor, 2 to 4 (-vsr_scale)        */
     int big_logged;  /* said once that the source is too large       */
-} vsr = { .want = 1, .scale = 1 };
+    int clamp_logged;/* said once that the factor had to come down   */
+} vsr = { .want = 1, .scale = 1, .scale_want = 2 };
 
 /* Set on the way out, when releasing GPU objects is both pointless and a
  * chance to crash inside a driver that is already tearing down. */
@@ -1514,6 +1516,21 @@ void fsr_vsr_set(int on)
     hwgl.last_frame = NULL;
 }
 
+/* 2 to 4; what a given source actually gets is capped by the output budget
+ * in vsr_scale_for(). Like the on/off switch, this changes the processor's
+ * output size, so the interop state is dropped and rebuilt. */
+void fsr_vsr_set_scale(int s)
+{
+    s = av_clip(s, 2, 4);
+    if (vsr.scale_want == s)
+        return;
+    vsr.scale_want  = s;
+    vsr.clamp_logged = 0;
+    hwgl.w = hwgl.h = 0;
+    hwgl.in_w = hwgl.in_h = 0;
+    hwgl.last_frame = NULL;
+}
+
 int fsr_vsr_setting(void) { return vsr.want; }
 int fsr_vsr_active(void)  { return vsr.active; }
 int fsr_vsr_scale(void)   { return vsr.active ? vsr.scale : 1; }
@@ -1848,18 +1865,36 @@ static int hwgl_vsr_apply(int on)
 /* Output scale for a source of this size, or 0 for "do not run the pass".
  *
  * Above 1080p the pass is refused outright, and -vsr does not override that:
- * a source that size already carries the detail the model would be inventing,
- * and the cost is not only time - every slot texture and every downstream GL
- * pass grows with the scale, so 2x on a 4K source means 8K slots. 2x is the
- * cap below that line even though the model goes further, for the same
- * reason. */
+ * a source that size already carries the detail the model would be inventing.
+ *
+ * Below it the requested factor is capped by what the processor is allowed to
+ * output, because every slot texture and every downstream GL pass grows with
+ * it - 1080p at 4x would mean 8K slots, two of them, plus the neural
+ * rendering pair. Holding the output to 4K lets a small source take the
+ * factor it asked for (640x480 at 4x is 2560x1920) while 1080p settles at 2x
+ * on its own. The model itself is happy either way: measured on 640x480,
+ * high-frequency energy against a lanczos4 upscale of the same frame to the
+ * same size was 2.32x at 2x and 3.46x at 3x. */
+#define VSR_MAX_OUT_PIXELS (3840 * 2160)
+
 static int vsr_scale_for(int w, int h)
 {
+    int s;
+
     if (vsr.failed || !vsr.want)
         return 0;
     if ((int64_t)w * h > 2073600)   /* 1920x1080 */
         return 0;
-    return 2;
+    for (s = vsr.scale_want; s > 2; s--)
+        if ((int64_t)w * s * h * s <= VSR_MAX_OUT_PIXELS)
+            break;
+    if (s != vsr.scale_want && !vsr.clamp_logged) {
+        vsr.clamp_logged = 1;
+        av_log(NULL, AV_LOG_INFO,
+               "VSR: %dx would put the processor past %dx%d, using %dx\n",
+               vsr.scale_want, 3840, 2160, s);
+    }
+    return s;
 }
 
 static int hwgl_ensure_size(int w, int h)
@@ -3639,6 +3674,7 @@ float fsr_nr_colour(void)              { return 0.0f; }
 void  fsr_nr_reset(void)               { }
 
 void  fsr_vsr_set(int on)              { (void)on; }
+void  fsr_vsr_set_scale(int s)         { (void)s; }
 int   fsr_vsr_setting(void)            { return 0; }
 int   fsr_vsr_active(void)             { return 0; }
 int   fsr_vsr_scale(void)              { return 1; }
