@@ -410,9 +410,12 @@ static int dlss_nr = -1;           /* DLSS 5 neural rendering: -1 = auto (on up
                                     * to ~1080p, where its 4.3 ms/frame always
                                     * fits), 0 = off, 1 = on at any size.
                                     * Remembered in ffplay.ini. */
-static int dlss_nr_str = 60;       /* how far toward the model's answer, percent;
-                                    * 'n' cycles it and 0 turns the pass off  */
-static int dlss_nr_prev = 60;      /* strength the on/off toggle comes back to */
+/* How far the picture moves toward the model's answer. Fixed: the knob was
+ * only ever useful for judging the pass, and once judged it wants one value,
+ * not a cycle that can be left parked on 0 (which reads as "DLSS is broken"
+ * rather than "you turned it down"). 35 keeps the synthesised grain out of
+ * sight; it showed from about 100 up. */
+#define DLSS_NR_STRENGTH 35
 static int vsr = 1;                /* NVIDIA RTX Video Super Resolution. On for
                                     * sources up to 1080p, which is the only
                                     * size it runs at anyway; -novsr turns it
@@ -1558,10 +1561,11 @@ static void load_settings(void)
             vsr = v;
         else if (sscanf(line, "vsr_scale=%d", &v) == 1 && v >= 2 && v <= 4)
             vsr_scale = v;
-        else if (sscanf(line, "dlss_nr_str=%d", &v) == 1 && v >= 0 && v <= 150)
-            dlss_nr_str = v;
-        else if (sscanf(line, "dlss_nr_prev=%d", &v) == 1 && v > 0 && v <= 150)
-            dlss_nr_prev = v;   /* so shift+D comes back to the last real one */
+        /* dlss_nr_str / dlss_nr_prev were the old adjustable strength; they are
+         * read and dropped so an existing file does not carry a 0 back in. */
+        else if (sscanf(line, "dlss_nr_str=%d", &v) == 1 ||
+                 sscanf(line, "dlss_nr_prev=%d", &v) == 1)
+            ;
     }
     fclose(f);
 }
@@ -1595,8 +1599,7 @@ static void save_settings(VideoState *is)
     fprintf(f, "vsr=%d\n", vsr);
     fprintf(f, "vsr_scale=%d\n", vsr_scale);
     fprintf(f, "dlss_nr=%d\n", dlss_nr);
-    fprintf(f, "dlss_nr_str=%d\n", dlss_nr_str);
-    fprintf(f, "dlss_nr_prev=%d\n", dlss_nr_prev);
+
     fclose(f);
 }
 
@@ -1731,11 +1734,11 @@ static void status_hud_update(int fps)
         /* "NR" above is the RCAS denoise term; this line is the DLSS model.
          * N/A means it was asked for but could not run here - no RTX 50, no
          * snippet DLL, or a software-decoded source. */
-        if (dlss_nr_str && n < (int)sizeof(buf)) {
+        if (dlss_nr && n < (int)sizeof(buf)) {
             char nr_state[8];
 
             if (fsr_nr_active())
-                snprintf(nr_state, sizeof(nr_state), "%d", dlss_nr_str);
+                snprintf(nr_state, sizeof(nr_state), "%d", DLSS_NR_STRENGTH);
             else
                 snprintf(nr_state, sizeof(nr_state), "N/A");
             n += snprintf(buf + n, sizeof(buf) - n, "\nDLSS %s", nr_state);
@@ -1775,41 +1778,19 @@ static void fps_tick(void)
 
 /* The single place the DLSS neural-rendering strength changes, so the 'n'
  * cycle, the shift+D toggle and the context-menu item cannot drift apart.
- * percent 0 turns the pass off; anything else also pins dlss_nr on, because
- * asking for it explicitly should override the resolution cap that the -1
- * auto setting applies. */
-static void apply_dlss_nr(int percent)
+ * Turning it on pins dlss_nr rather than leaving it at -1, because asking for
+ * it explicitly should override the resolution cap the auto setting applies. */
+static void apply_dlss_nr(int on)
 {
-    char toast[24];
-
-    dlss_nr_str = av_clip(percent, 0, 150);
-    if (dlss_nr_str)
-        dlss_nr_prev = dlss_nr_str;      /* what the on/off toggle restores */
-    fsr_nr_set_strength(dlss_nr_str / 100.0f);
-    fsr_nr_set(dlss_nr_str ? 1 : 0);
-    dlss_nr = dlss_nr_str ? 1 : 0;
-    av_log(NULL, AV_LOG_INFO, "DLSS neural rendering: %d%%\n", dlss_nr_str);
-    if (renderer) {
-        if (dlss_nr_str)
-            snprintf(toast, sizeof(toast), "DLSS %d", dlss_nr_str);
-        else
-            snprintf(toast, sizeof(toast), "DLSS OFF");
-        fsr_toast_show(renderer, toast);
-    }
+    dlss_nr = !!on;
+    fsr_nr_set_strength(DLSS_NR_STRENGTH / 100.0f);
+    fsr_nr_set(dlss_nr);
+    av_log(NULL, AV_LOG_INFO, "DLSS neural rendering: %s\n",
+           dlss_nr ? "on" : "off");
+    if (renderer)
+        fsr_toast_show(renderer, dlss_nr ? "DLSS ON" : "DLSS OFF");
     if (show_fps)
         status_hud_update(-1);
-}
-
-/* Next strength on the cycle; back walks the same list in reverse. */
-static int dlss_nr_step(int cur, int back)
-{
-    static const int steps[] = { 0, 35, 60, 100 };
-    int n = FF_ARRAY_ELEMS(steps), at = 0;
-
-    for (int i = 0; i < n; i++)
-        if (steps[i] == cur)
-            at = i;
-    return steps[(at + (back ? n - 1 : 1)) % n];
 }
 
 static double get_master_clock(VideoState *is);
@@ -5065,7 +5046,7 @@ static char *wait_for_input_file(void)
                 ev.button.button == SDL_BUTTON_RIGHT) {
                 /* No file open yet: no audio tracks to offer. */
                 switch (ui_context_menu(fsr, fsr_denoise, fsr_fg, fg_mult,
-                                        dlss_nr_str > 0, audio_stereo,
+                                        dlss_nr > 0, audio_stereo,
                                         video_scaling, subtitle_shown,
                                         NULL, NULL, NULL)) {
                 case UI_MENU_OPEN: {
@@ -5084,10 +5065,7 @@ static char *wait_for_input_file(void)
                 case UI_MENU_DLSSNR:
                     /* No video yet, so just record the choice; it takes
                      * effect when a file opens. */
-                    if (dlss_nr_str)
-                        dlss_nr_prev = dlss_nr_str;
-                    dlss_nr_str = dlss_nr_str ? 0 : dlss_nr_prev;
-                    dlss_nr = dlss_nr_str ? 1 : 0;
+                    dlss_nr = !dlss_nr;
                     break;
                 case UI_MENU_AOUT_ORIG:   audio_stereo = 0; break;
                 case UI_MENU_AOUT_STEREO: audio_stereo = 1; break;
@@ -5174,7 +5152,7 @@ static int handle_ui_event(VideoState *cur_stream, const SDL_Event *event)
 
         build_audio_tracks(cur_stream, &atracks, amap);
         cmd = ui_context_menu(fsr, fsr_denoise, fsr_fg, fg_mult,
-                              dlss_nr_str > 0, audio_stereo, video_scaling,
+                              dlss_nr > 0, audio_stereo, video_scaling,
                               subtitle_shown, &atracks,
                               menu_idle_present, cur_stream);
         switch (cmd) {
@@ -5186,7 +5164,7 @@ static int handle_ui_event(VideoState *cur_stream, const SDL_Event *event)
         case UI_MENU_NR:  sym = SDLK_d; break;
         case UI_MENU_FG:  sym = SDLK_g; break;
         case UI_MENU_DLSSNR:
-            apply_dlss_nr(dlss_nr_str ? 0 : dlss_nr_prev);
+            apply_dlss_nr(!dlss_nr);
             cur_stream->force_refresh = 1;
             break;
         case UI_MENU_SCALE_FIT:     set_video_scaling(cur_stream, 0); break;
@@ -5456,10 +5434,9 @@ static void event_loop(VideoState *cur_stream)
                 cur_stream->force_refresh = 1;
                 break;
             case SDLK_n:
-                /* Cycle the strength: judging this needs an A/B against a
-                 * middle setting, not just on/off. Shift walks back down. */
-                apply_dlss_nr(dlss_nr_step(dlss_nr_str,
-                                           (event.key.keysym.mod & KMOD_SHIFT) != 0));
+                /* On/off. The strength behind it is fixed, so there is
+                 * nothing left for this key to step through. */
+                apply_dlss_nr(!dlss_nr);
                 cur_stream->force_refresh = 1;
                 break;
             case SDLK_h: {
@@ -5483,7 +5460,7 @@ static void event_loop(VideoState *cur_stream)
                 /* Shift+D is the DLSS on/off next to it; plain 'd' stays the
                  * RCAS denoise term it has always been. */
                 if (event.key.keysym.mod & KMOD_SHIFT) {
-                    apply_dlss_nr(dlss_nr_str ? 0 : dlss_nr_prev);
+                    apply_dlss_nr(!dlss_nr);
                     cur_stream->force_refresh = 1;
                     break;
                 }
@@ -5937,8 +5914,7 @@ static const OptionDef options[] = {
     { "fsr_fg",             OPT_TYPE_BOOL,  OPT_EXPERT, { &fsr_fg }, "frame generation via NVIDIA hardware optical flow, on by default (-nofsr_fg disables); toggle at runtime with 'g' (remembered across runs)" },
     { "rife",               OPT_TYPE_BOOL,  OPT_EXPERT, { &fsr_rife }, "start with RIFE (per-pixel, ncnn+Vulkan) as the frame-generation engine instead of the block-grid optical flow; off by default (optical flow), remembered per session; RIFE still loads so 'r' toggles it at runtime" },
     { "fg_mult",            OPT_TYPE_INT,   OPT_EXPERT, { &fg_mult }, "frame generation factor: 2, 3 or 4 (source x2/x3/x4, capped by display refresh); pick at runtime from the right-click menu", "N" },
-    { "dlss_nr",            OPT_TYPE_BOOL,  OPT_EXPERT, { &dlss_nr }, "DLSS 5 neural rendering: resynthesise detail a low-bitrate encode threw away; default is on up to ~1080p and off above (-dlss_nr forces it on at any size, -nodlss_nr off). Needs an RTX 50 series GPU, hardware decoding, and nvngx_dlssnr.dll beside ffplay.exe; cycle strength at runtime with 'n' (remembered across runs)" },
-    { "dlss_nr_strength",   OPT_TYPE_INT,   OPT_EXPERT, { &dlss_nr_str }, "how far the picture moves toward the model's answer, percent (0 = off, 60 = default, above ~100 the synthesised grain shows)", "percent" },
+    { "dlss_nr",            OPT_TYPE_BOOL,  OPT_EXPERT, { &dlss_nr }, "DLSS 5 neural rendering: resynthesise detail a low-bitrate encode threw away; default is on up to ~1080p and off above (-dlss_nr forces it on at any size, -nodlss_nr off). Needs an RTX 50 series GPU, hardware decoding, and nvngx_dlssnr.dll beside ffplay.exe; toggle at runtime with 'n' or shift+'d' (remembered across runs)" },
     { "vsr",                OPT_TYPE_BOOL,  OPT_EXPERT, { &vsr }, "NVIDIA RTX Video Super Resolution: the D3D11 VideoProcessor that already does the colour conversion renders the frame at 2x through NVIDIA's model, and the FSR passes take it from there. On by default for sources up to 1080p; above that the source already has the detail and 2x would mean 8K slot textures, so it is refused and -vsr does not override that. -novsr turns it off. Needs an RTX card, a recent driver and hardware decoding; toggle at runtime with 'u' (remembered across runs)" },
     { "vsr_scale",          OPT_TYPE_INT,   OPT_EXPERT, { &vsr_scale }, "how far RTX Video Super Resolution upscales, 2 to 4 (default 2). Capped per source so the VideoProcessor never outputs more than 4K, which leaves a small source free to take the whole factor while 1080p settles at 2x by itself; every slot texture grows with it. Shift+'u' steps it at runtime (remembered across runs)", "factor" },
     { "install",            OPT_TYPE_BOOL,  OPT_EXPERT, { &install_assoc }, "register .mp4/.mkv file associations for the current user and exit" },
@@ -6208,9 +6184,8 @@ int main(int argc, char **argv)
             fsr_rife_set(fsr_rife);
             /* Neural rendering comes up with the first hardware frame, so
              * this only records the preference. */
-            dlss_nr_str = av_clip(dlss_nr_str, 0, 150);
-            fsr_nr_set_strength(dlss_nr_str / 100.0f);
-            fsr_nr_set(dlss_nr_str ? dlss_nr : 0);
+            fsr_nr_set_strength(DLSS_NR_STRENGTH / 100.0f);
+            fsr_nr_set(dlss_nr);
             vsr_scale = av_clip(vsr_scale, 2, 4);
             fsr_vsr_set_scale(vsr_scale);
             fsr_vsr_set(vsr);
