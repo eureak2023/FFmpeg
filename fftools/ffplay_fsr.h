@@ -77,6 +77,15 @@ void fsr_set_hdr_brightness(float level);
 /* Nonzero while the displayed stream is being tone-mapped from HDR10. */
 int  fsr_hdr_active(void);
 
+/* Colour intensity as a factor: 1 leaves the picture alone, 0 is
+ * greyscale, 2 is twice as colourful. Luma-preserving, so it moves colour
+ * without moving brightness, and it rides along in the shaders that
+ * already write the final pixel - no pass of its own. Display side only,
+ * like the rest of this file: the decoded frame is never touched. Takes
+ * effect on the next frame; safe to call from the main thread any time. */
+void  fsr_set_saturation(float v);
+float fsr_saturation(void);
+
 /* Zero-copy display of AV_PIX_FMT_D3D11 hardware frames: the decoded NV12
  * texture is converted to RGBA by the D3D11 VideoProcessor on the GPU and
  * shared into GL via WGL_NV_DX_interop2, then flows through the FSR passes

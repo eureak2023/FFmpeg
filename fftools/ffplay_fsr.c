@@ -317,6 +317,10 @@ static char         gl_renderer_str[256];
 static GLuint       easu_prog, rcas_prog, copy_prog;
 static GLint        easu_con0_loc, rcas_sharp_loc, rcas_dns_loc, copy_invout_loc;
 static GLint        rcas_hdr_loc, rcas_peak_loc, copy_hdr_loc, copy_peak_loc;
+static GLint        rcas_sat_loc, copy_sat_loc;
+/* Colour intensity: 1 leaves the picture alone, 0 is greyscale. Display-side
+ * only, like everything else here - the decoded frame is never touched. */
+static float        sat_amount = 1.0f;
 static GLint        rcas_gain_loc, copy_gain_loc;
 static const char  *fsr_dump_prefix;  /* FSR_DEBUG_DUMP, see fsr_dump_ppm() */
 static int          fsr_dump_n, fsr_dump_done;
@@ -521,6 +525,17 @@ static const char *easu_src =
  * players put it; verified against libplacebo's own bt.2446a output.
  * Appended to the shaders that produce final SDR output. */
 #define HDR_TM_GLSL \
+    /* Colour intensity, applied by every shader that writes the final\
+     * pixel. Luma-preserving: the grey it interpolates against is the\
+     * BT.709 luma of the pixel itself, so 0 lands on the correct\
+     * greyscale and brightness does not drift on the way out.\
+     * Clamped at zero because values above 1 can push a saturated\
+     * channel negative. */\
+    "uniform float satAmt;\n" \
+    "vec3 apply_sat(vec3 c) {\n" \
+    "    float l = dot(c, vec3(0.2126, 0.7152, 0.0722));\n" \
+    "    return max(mix(vec3(l), c, satAmt), vec3(0.0));\n" \
+    "}\n" \
     "uniform float hdrMode;\n" /* 0 = passthrough, 1 = PQ BT.2020 input */ \
     "uniform float hdrPeak;\n" /* content peak, nits */ \
     "uniform float hdrGain;\n" /* exposure, 1 = BT.2446-A as specified */ \
@@ -620,7 +635,7 @@ static const char *rcas_src =
     "    vec3 pix = (lobe * (b + d + f + h) + e) * rcpL;\n"
     "    if (hdrMode > 0.5)\n"
     "        pix = hdr_tonemap(pix);\n"
-    "    fragColor = vec4(pix, 1.0);\n"
+    "    fragColor = vec4(apply_sat(pix), 1.0);\n"
     "}\n";
 
 /* Plain textured blit, used when a zero-copy hardware frame is displayed
@@ -635,7 +650,7 @@ static const char *copy_src =
     "    vec3 c = texture(srcTex, gl_FragCoord.xy * invOut).rgb;\n"
     "    if (hdrMode > 0.5)\n"
     "        c = hdr_tonemap(c);\n"
-    "    fragColor = vec4(c, 1.0);\n"
+    "    fragColor = vec4(apply_sat(c), 1.0);\n"
     "}\n";
 
 static int load_gl_functions(void)
@@ -792,6 +807,8 @@ int fsr_init(SDL_Renderer *renderer)
     rcas_sharp_loc  = gl.GetUniformLocation(rcas_prog, "sharp");
     rcas_dns_loc    = gl.GetUniformLocation(rcas_prog, "dns");
     copy_invout_loc = gl.GetUniformLocation(copy_prog, "invOut");
+    rcas_sat_loc    = gl.GetUniformLocation(rcas_prog, "satAmt");
+    copy_sat_loc    = gl.GetUniformLocation(copy_prog, "satAmt");
     rcas_hdr_loc    = gl.GetUniformLocation(rcas_prog, "hdrMode");
     rcas_peak_loc   = gl.GetUniformLocation(rcas_prog, "hdrPeak");
     copy_hdr_loc    = gl.GetUniformLocation(copy_prog, "hdrMode");
@@ -820,6 +837,15 @@ int fsr_init(SDL_Renderer *renderer)
     av_log(NULL, AV_LOG_INFO, "FSR: EASU+RCAS OpenGL pipeline initialized\n");
     return 0;
 }
+
+/* Colour intensity, 0 to 2. Takes effect on the next frame drawn; the
+ * uniform is set per pass, so nothing has to be rebuilt. */
+void fsr_set_saturation(float v)
+{
+    sat_amount = av_clipf(v, 0.0f, 2.0f);
+}
+
+float fsr_saturation(void) { return sat_amount; }
 
 void fsr_set_hdr_brightness(float level)
 {
@@ -937,12 +963,14 @@ static int run_pass2(SDL_Renderer *renderer, GLuint prog, SDL_Texture *src,
     if (prog == easu_prog && con0)
         gl.Uniform4f(easu_con0_loc, con0[0], con0[1], con0[2], con0[3]);
     if (prog == rcas_prog) {
+        gl.Uniform1f(rcas_sat_loc, sat_amount);
         gl.Uniform1f(rcas_sharp_loc, sharp);
         gl.Uniform1f(rcas_hdr_loc, hdr_active ? 1.0f : 0.0f);
         gl.Uniform1f(rcas_peak_loc, hdr_peak);
         gl.Uniform1f(rcas_gain_loc, hdr_gain);
     }
     if (prog == copy_prog) {
+        gl.Uniform1f(copy_sat_loc, sat_amount);
         gl.Uniform2f(copy_invout_loc, 1.0f / dw, 1.0f / dh);
         gl.Uniform1f(copy_hdr_loc, hdr_active ? 1.0f : 0.0f);
         gl.Uniform1f(copy_peak_loc, hdr_peak);
@@ -2573,7 +2601,7 @@ static const char *fg_src =
     "    vec3 mid = mix(xfade, mix(cPrev, cCur, phase), w);\n"
     "    if (hdrMode > 0.5)\n"
     "        mid = hdr_tonemap(mid);\n"
-    "    fragColor = vec4(mid, 1.0);\n"
+    "    fragColor = vec4(apply_sat(mid), 1.0);\n"
     "}\n";
 
 static struct {
@@ -2611,7 +2639,7 @@ static struct {
     GLint phase_loc;
     GLint outsize_loc;
     GLint flowgrid_loc;
-    GLint hdr_loc, peak_loc, gain_loc;
+    GLint hdr_loc, peak_loc, gain_loc, sat_loc;
     const void *in_frame[2];              /* what each OF input buffer holds */
     int64_t in_pts[2];
     const void *pair_a, *pair_b;          /* frames the current flow refers to */
@@ -3010,6 +3038,7 @@ static int fg_init_body(void)
         fg.phase_loc    = gl.GetUniformLocation(fg.prog, "phase");
         fg.outsize_loc  = gl.GetUniformLocation(fg.prog, "outSize");
         fg.flowgrid_loc = gl.GetUniformLocation(fg.prog, "flowGrid");
+        fg.sat_loc      = gl.GetUniformLocation(fg.prog, "satAmt");
         fg.hdr_loc      = gl.GetUniformLocation(fg.prog, "hdrMode");
         fg.peak_loc     = gl.GetUniformLocation(fg.prog, "hdrPeak");
         fg.gain_loc     = gl.GetUniformLocation(fg.prog, "hdrGain");
@@ -3241,6 +3270,7 @@ static int fg_warp(SDL_Renderer *renderer, int sp, int sn, float phase,
     gl.Uniform1f(fg.phase_loc, phase);
     gl.Uniform2f(fg.outsize_loc, (GLfloat)ow, (GLfloat)oh);
     gl.Uniform1f(fg.flowgrid_loc, (GLfloat)fg.grid);
+    gl.Uniform1f(fg.sat_loc, sat_amount);
     gl.Uniform1f(fg.hdr_loc, tonemap && hdr_active ? 1.0f : 0.0f);
     gl.Uniform1f(fg.peak_loc, hdr_peak);
     gl.Uniform1f(fg.gain_loc, hdr_gain);
