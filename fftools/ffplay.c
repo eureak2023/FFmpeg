@@ -421,6 +421,7 @@ static int vsr = 1;                /* NVIDIA RTX Video Super Resolution. On for
                                     * sources up to 1080p, which is the only
                                     * size it runs at anyway; -novsr turns it
                                     * off. Remembered in ffplay.ini. */
+static float saturation = 1.0f;   /* colour intensity, 1 = untouched */
 static int vsr_scale = 2;          /* how far the model upscales, 2 to 4; what
                                     * a source actually gets is capped so the
                                     * processor stays within 4K */
@@ -1584,6 +1585,8 @@ static void load_settings(void)
             vsr = v;
         else if (sscanf(line, "vsr_scale=%d", &v) == 1 && v >= 2 && v <= 4)
             vsr_scale = v;
+        else if (sscanf(line, "saturation=%d", &v) == 1 && v >= 0 && v <= 200)
+            saturation = v / 100.0f;
         /* dlss_nr_str / dlss_nr_prev were the old adjustable strength; they are
          * read and dropped so an existing file does not carry a 0 back in. */
         else if (sscanf(line, "dlss_nr_str=%d", &v) == 1 ||
@@ -1621,6 +1624,7 @@ static void save_settings(VideoState *is)
     fprintf(f, "video_vis=%d\n", video_vis);
     fprintf(f, "vsr=%d\n", vsr);
     fprintf(f, "vsr_scale=%d\n", vsr_scale);
+    fprintf(f, "saturation=%d\n", (int)lrintf(saturation * 100.0f));
     fprintf(f, "dlss_nr=%d\n", dlss_nr);
 
     fclose(f);
@@ -1787,6 +1791,10 @@ static void status_hud_update(int fps)
             else
                 n += snprintf(buf + n, sizeof(buf) - n, "\nVSR N/A");
         }
+        /* only worth a line while it is actually changing the picture */
+        if (saturation != 1.0f && n < (int)sizeof(buf))
+            n += snprintf(buf + n, sizeof(buf) - n, "\nCOLOR %d",
+                          (int)lrintf(saturation * 100.0f));
         /* only worth a line while there is a tone map to tune */
         if (fsr_hdr_active() && n < (int)sizeof(buf))
             snprintf(buf + n, sizeof(buf) - n, "\nHDR %d", hdr_bright);
@@ -5637,6 +5645,24 @@ static void event_loop(VideoState *cur_stream)
                     status_hud_update(-1);
                 cur_stream->force_refresh = 1;
                 break;
+            case SDLK_k: {
+                /* Colour intensity in 10% steps; shift walks back down.
+                 * Clamped rather than wrapped so holding one key settles
+                 * at an end instead of jumping to the other. */
+                char toast[24];
+
+                saturation += (event.key.keysym.mod & KMOD_SHIFT) ? -0.1f : 0.1f;
+                saturation = av_clipf(saturation, 0.0f, 2.0f);
+                fsr_set_saturation(saturation);
+                snprintf(toast, sizeof(toast), "COLOR %d",
+                         (int)lrintf(saturation * 100.0f));
+                if (renderer)
+                    fsr_toast_show(renderer, toast);
+                if (show_fps)
+                    status_hud_update(-1);
+                cur_stream->force_refresh = 1;
+                break;
+            }
             case SDLK_n:
                 /* On/off. The strength behind it is fixed, so there is
                  * nothing left for this key to step through. */
@@ -6125,6 +6151,7 @@ static const OptionDef options[] = {
     { "jasna_home",         OPT_TYPE_STRING, OPT_EXPERT, { &jasna_home }, "path to the jasna source checkout (contains .venv and model_weights)", "dir" },
     { "dlss_nr",            OPT_TYPE_BOOL,  OPT_EXPERT, { &dlss_nr }, "DLSS 5 neural rendering: resynthesise detail a low-bitrate encode threw away; default is on up to ~1080p and off above (-dlss_nr forces it on at any size, -nodlss_nr off). Needs an RTX 50 series GPU, hardware decoding, and nvngx_dlssnr.dll beside ffplay.exe; toggle at runtime with 'n' or shift+'d' (remembered across runs)" },
     { "vsr",                OPT_TYPE_BOOL,  OPT_EXPERT, { &vsr }, "NVIDIA RTX Video Super Resolution: the D3D11 VideoProcessor that already does the colour conversion renders the frame at 2x through NVIDIA's model, and the FSR passes take it from there. On by default for sources up to 1080p; above that the source already has the detail and 2x would mean 8K slot textures, so it is refused and -vsr does not override that. -novsr turns it off. Needs an RTX card, a recent driver and hardware decoding; toggle at runtime with 'u' (remembered across runs)" },
+    { "saturation",         OPT_TYPE_FLOAT, OPT_EXPERT, { &saturation }, "colour intensity, 0 to 2: 1 leaves the picture alone (default), 0 is greyscale, 1.2 or so lifts a flat-looking transfer. Luma-preserving, so it moves colour without moving brightness; 'k' steps it at runtime and shift+'k' steps back (remembered across runs)", "factor" },
     { "vsr_scale",          OPT_TYPE_INT,   OPT_EXPERT, { &vsr_scale }, "how far RTX Video Super Resolution upscales, 2 to 4 (default 2). Capped per source so the VideoProcessor never outputs more than 4K, which leaves a small source free to take the whole factor while 1080p settles at 2x by itself; every slot texture grows with it. Shift+'u' steps it at runtime (remembered across runs)", "factor" },
     { "install",            OPT_TYPE_BOOL,  OPT_EXPERT, { &install_assoc }, "register .mp4/.mkv file associations for the current user and exit" },
     { "uninstall",          OPT_TYPE_BOOL,  OPT_EXPERT, { &uninstall_assoc }, "remove the .mp4/.mkv file associations and exit" },
@@ -6399,6 +6426,8 @@ int main(int argc, char **argv)
             fsr_nr_set_strength(DLSS_NR_STRENGTH / 100.0f);
             fsr_nr_set(dlss_nr);
             vsr_scale = av_clip(vsr_scale, 2, 4);
+            saturation = av_clipf(saturation, 0.0f, 2.0f);
+            fsr_set_saturation(saturation);
             fsr_vsr_set_scale(vsr_scale);
             fsr_vsr_set(vsr);
             update_fg_refresh();
