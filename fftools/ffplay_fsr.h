@@ -251,11 +251,10 @@ char *fsr_single_instance_take_path(void);
  * Non-Windows builds return NULL. */
 char *fsr_sibling_media_path(const char *cur_path, int dir);
 
-/* Show a modal confirmation (owned by window) asking whether to delete
- * utf8_path; returns 1 if the user confirmed. fsr_delete_file() sends the
- * (already-closed) file to the Recycle Bin, returning 0 on success. Used by
- * the Delete hotkey. Non-Windows builds are no-ops. */
-int   fsr_confirm_delete(SDL_Window *window, const char *utf8_path);
+/* Delete the (already-closed) file at utf8_path, returning 0 on success.
+ * Permanent - it does not go to the Recycle Bin - and silent: the Delete
+ * hotkey asks nothing first, so there is no prompt on either side of it.
+ * Non-Windows builds are no-ops. */
 int   fsr_delete_file(const char *utf8_path);
 
 /* Lift a modal dialog above a fullscreen (topmost) player window. The call

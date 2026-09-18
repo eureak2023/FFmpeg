@@ -5255,45 +5255,9 @@ void fsr_raise_modal_end(void *handle)
     av_free(c);
 }
 
-/* Modal "delete this file?" confirmation, owned by the player window so it
- * comes to front even over a fullscreen window. Returns 1 if the user chose
- * OK. utf8_path is shown so it is clear which file is about to go. */
-int fsr_confirm_delete(SDL_Window *window, const char *utf8_path)
-{
-    wchar_t wpath[1024], wmsg[1200];
-    HWND    owner = NULL;
-    void   *raise;
-    int     ok;
-
-    if (!utf8_path || !utf8_path[0])
-        return 0;
-    if (MultiByteToWideChar(CP_UTF8, 0, utf8_path, -1, wpath,
-                            (int)(sizeof(wpath) / sizeof(wpath[0]))) <= 0)
-        wpath[0] = L'\0';
-
-    if (window) {
-        SDL_SysWMinfo info;
-        SDL_VERSION(&info.version);
-        if (SDL_GetWindowWMInfo(window, &info) &&
-            info.subsystem == SDL_SYSWM_WINDOWS)
-            owner = info.info.win.window;
-    }
-
-    _snwprintf(wmsg, sizeof(wmsg) / sizeof(wmsg[0]),
-               L"이 파일을 삭제하시겠습니까?\n\n%ls", wpath);
-    /* MB_SETFOREGROUND|MB_TOPMOST is not enough over a fullscreen player (the
-     * foreground lock denies it), so raise the box from a helper thread. */
-    raise = fsr_raise_modal_begin(owner);
-    ok = MessageBoxW(owner, wmsg, L"파일 삭제",
-                     MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2 |
-                     MB_SETFOREGROUND | MB_TOPMOST) == IDOK;
-    fsr_raise_modal_end(raise);
-    return ok;
-}
-
-/* Send utf8_path to the Recycle Bin (FOF_ALLOWUNDO, so a mistaken delete is
- * recoverable). The file must already be closed by the player. Returns 0 on
- * success. The SHFILEOP source list is double-NUL terminated. */
+/* Delete utf8_path outright - not to the Recycle Bin. The file must already
+ * be closed by the player. Returns 0 on success. The SHFILEOP source list is
+ * double-NUL terminated. */
 int fsr_delete_file(const char *utf8_path)
 {
     wchar_t          wpath[1024 + 1];
@@ -5311,7 +5275,11 @@ int fsr_delete_file(const char *utf8_path)
     SDL_memset(&op, 0, sizeof(op));
     op.wFunc  = FO_DELETE;
     op.pFrom  = wpath;
-    op.fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI;
+    /* No FOF_ALLOWUNDO: the file is unlinked, not sent to the Recycle Bin.
+     * The remaining flags keep the shell from putting up a prompt or an
+     * error box of its own, since the Delete hotkey is meant to be one
+     * keypress with nothing in the way. */
+    op.fFlags = FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI;
     return SHFileOperationW(&op) == 0 ? 0 : -1;
 }
 #else  /* !_WIN32 */
@@ -5320,7 +5288,6 @@ int   fsr_single_instance_forward(const char *p)  { (void)p; return -1; }
 void  fsr_single_instance_setup(SDL_Window *w)    { (void)w; }
 char *fsr_single_instance_take_path(void)         { return NULL; }
 char *fsr_sibling_media_path(const char *p, int d){ (void)p; (void)d; return NULL; }
-int   fsr_confirm_delete(SDL_Window *w, const char *p) { (void)w; (void)p; return 0; }
 void *fsr_raise_modal_begin(void *o)              { (void)o; return NULL; }
 void  fsr_raise_modal_end(void *h)                { (void)h; }
 int   fsr_delete_file(const char *p)              { (void)p; return -1; }

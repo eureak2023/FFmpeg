@@ -5775,17 +5775,24 @@ static void event_loop(VideoState *cur_stream)
                 continue;
             }
             case SDLK_DELETE: {
-                /* Delete the current file (to the Recycle Bin) after a
-                 * confirmation, then play the next file in the folder. The
-                 * demuxer holds the file open, so the stream must be closed
-                 * before the delete: switch to the next file first (that
-                 * releases the handle), then delete the old path; when it is
-                 * the only file, close and quit. */
+                /* Delete the current file and play the next one in the
+                 * folder. The demuxer holds the file open, so the stream
+                 * must be closed before the delete: switch to the next file
+                 * first (that releases the handle), then delete the old
+                 * path; when it is the only file, close and quit.
+                 *
+                 * Nothing is asked first and nothing is recoverable after:
+                 * this key exists for a keep-or-bin pass over a folder, and
+                 * a dialog per discard is the entire cost of that pass, so
+                 * the confirmation went and fsr_delete_file unlinks rather
+                 * than filling the Recycle Bin. One press, one file gone.
+                 * Deliberate, and the reason DEL sits nowhere near the
+                 * transport keys. */
                 char *cur = cur_stream->filename ?
                             av_strdup(cur_stream->filename) : NULL;
                 char *nxt = cur ? fsr_sibling_media_path(cur, 1) : NULL;
 
-                if (cur && fsr_confirm_delete(window, cur)) {
+                if (cur) {
                     if (nxt) {
                         cur_stream = switch_input(cur_stream, nxt);
                         nxt = NULL;                 /* owned by switch_input */
