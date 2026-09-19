@@ -1209,7 +1209,11 @@ static void video_image_display(VideoState *is)
 
             if (!sw_frame)
                 return;
-            if (av_hwframe_transfer_data(sw_frame, vp->frame, 0) < 0) {
+            /* Properties too, not just pixels: set_sdl_yuv_conversion_mode
+             * below picks the YUV->RGB matrix from colorspace and
+             * color_range, which transfer_data alone leaves unset. */
+            if (av_hwframe_transfer_data(sw_frame, vp->frame, 0) < 0 ||
+                av_frame_copy_props(sw_frame, vp->frame) < 0) {
                 av_frame_free(&sw_frame);
                 return;
             }
@@ -2806,6 +2810,15 @@ static int get_video_frame(VideoState *is, AVFrame *frame)
             if (!sw_frame)
                 return -1;
             ret = av_hwframe_transfer_data(sw_frame, frame, 0);
+            /* transfer_data moves the pixels and nothing else - its own
+             * documentation says to use av_frame_copy_props for the rest.
+             * Without it the frame that replaces the hardware one below has
+             * no pts, so dpts stays NAN for every copy-back frame: the
+             * mosaic sidecar was then OPENed at NAN and could never match a
+             * restored frame to a displayed one, and colour space, range and
+             * SAR were lost along with it. */
+            if (ret >= 0)
+                ret = av_frame_copy_props(sw_frame, frame);
             if (ret < 0) {
                 av_frame_free(&sw_frame);
                 av_log(NULL, AV_LOG_ERROR,
