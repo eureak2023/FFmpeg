@@ -723,6 +723,43 @@ void lada_set_enabled(int on)
     SDL_UnlockMutex(L.mtx);
 }
 
+/* Point the running sidecar at a different file instead of restarting it.
+ *
+ * The models are the expensive part - seconds of TensorRT engine loading - and
+ * they are per-process, not per-file: the sidecar's OPEN already carries a
+ * path, and re-points its pipeline at it while everything stays resident. So
+ * stepping through a folder used to pay a full reload per file for nothing.
+ *
+ * The state reset is the disable half of lada_set_enabled() plus the new path:
+ * bump the generation so frames still in flight for the old file are dropped
+ * on arrival, clear the FIFO and the held frame, and leave `opened` at 0 so the
+ * next lada_frame_for() sends OPEN for the new path at whatever pts the new
+ * stream starts on.
+ *
+ * Returns 0 when the running sidecar took the file, -1 when there is nothing
+ * to retarget and the caller should lada_start() instead. */
+int lada_retarget(const char *input_path)
+{
+    if (!L.running || !input_path || !*input_path)
+        return -1;
+
+    SDL_LockMutex(L.mtx);
+    L.gen++;
+    send_cmd("STOP\n");
+    fifo_flush();
+    lada_frame_free(L.held); L.held = NULL;
+    absolutize_path(input_path, L.path, sizeof(L.path));
+    L.opened       = 0;
+    L.last_pts     = NAN;
+    L.announced    = 0;
+    L.warmed       = 0;
+    L.buffering    = 0;
+    L.seek_pending = 0;
+    dbg_applying   = 0;
+    SDL_UnlockMutex(L.mtx);
+    return 0;
+}
+
 int lada_active(void)
 {
     return L.running && L.enabled && !L.died;
@@ -972,6 +1009,7 @@ int  lada_default_on(void) { return 0; }
 int  lada_start(const char *input_path, const char *lada_home, const char *device)
 { (void)input_path; (void)lada_home; (void)device; return -1; }
 void lada_stop(void) {}
+int  lada_retarget(const char *p) { (void)p; return -1; }
 void lada_set_enabled(int on) { (void)on; }
 int  lada_active(void) { return 0; }
 void lada_notify_seek(void) {}

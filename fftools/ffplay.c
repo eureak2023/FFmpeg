@@ -5168,12 +5168,23 @@ static VideoState *switch_input(VideoState *old, char *filename)
         carry_muted  = old->muted;
         stream_close(old);
     }
-    lada_stop();                /* re-point the restoration sidecar at the new file */
-    input_filename = filename;
-    ui_set_window(window, filename);
-    new_is = stream_open(filename, NULL);
-    if (lada && lada_start(filename, lada_home, "cuda") == 0)
+    /* Re-point the restoration sidecar rather than restarting it: its models
+     * take seconds to load and are not file-specific, so stepping through a
+     * folder should not pay for them again. Only spawn one when there is
+     * none to re-point. */
+    if (lada && lada_retarget(filename) == 0) {
+        input_filename = filename;
+        ui_set_window(window, filename);
+        new_is = stream_open(filename, NULL);
         lada_set_enabled(1);
+    } else {
+        lada_stop();
+        input_filename = filename;
+        ui_set_window(window, filename);
+        new_is = stream_open(filename, NULL);
+        if (lada && lada_start(filename, lada_home, "cuda") == 0)
+            lada_set_enabled(1);
+    }
     if (!new_is) {
         av_log(NULL, AV_LOG_FATAL, "Failed to initialize VideoState!\n");
         do_exit(NULL);

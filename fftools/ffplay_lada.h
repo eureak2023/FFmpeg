@@ -47,6 +47,12 @@ int  lada_start(const char *input_path, const char *lada_home, const char *devic
 /* Stop the sidecar and free everything (kills the process). Safe when not started. */
 void lada_stop(void);
 
+/* Point the already-running sidecar at another file, keeping its loaded
+ * models. Returns 0 on success, -1 if nothing is running - in which case
+ * the caller should lada_start(). Used when stepping through a folder, so
+ * a file change costs an OPEN rather than a process restart. */
+int  lada_retarget(const char *input_path);
+
 /* Turn restoration streaming on/off without killing the sidecar - the models stay
  * resident so toggling is instant and resumes at the current playback position. The
  * first enable still pays the one-time model-load cost inside the sidecar. */
