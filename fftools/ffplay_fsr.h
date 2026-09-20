@@ -252,8 +252,9 @@ char *fsr_single_instance_take_path(void);
 char *fsr_sibling_media_path(const char *cur_path, int dir);
 
 /* Delete the (already-closed) file at utf8_path, returning 0 on success.
- * Any .nfo or .jpg named after it goes too, in either of the two usual
- * spellings (movie.nfo and movie.mp4.nfo). Permanent - none of it goes to
+ * Anything named after it goes too - .nfo, .jpg and the numbered
+ * screenshots _1.jpg to _3.jpg - in either of the two usual spellings
+ * (movie.nfo and movie.mp4.nfo). Permanent - none of it goes to
  * the Recycle Bin - and silent: the Delete hotkey asks nothing first, so
  * there is no prompt on either side of it. Non-Windows builds are
  * no-ops. */

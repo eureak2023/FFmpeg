@@ -5257,12 +5257,19 @@ void fsr_raise_modal_end(void *handle)
 
 #define FSR_DEL_PATH 1024
 
-/* Sidecar files a media file collects: the metadata written next to it and
- * the cover image. Both naming habits are covered - the scrapers that replace
- * the extension (movie.nfo) and the downloaders that append to the whole name
- * (movie.mp4.jpg) - because both are named after this one video and are
- * orphans the moment it goes. */
-static const wchar_t *const fsr_companion_ext[] = { L".nfo", L".jpg" };
+/* Sidecar files a media file collects: the metadata written next to it, the
+ * cover image, and the numbered screenshots that come with it. Both naming
+ * habits are covered - the scrapers that replace the extension (movie.nfo)
+ * and the downloaders that append to the whole name (movie.mp4.jpg) -
+ * because both are named after this one video and are orphans the moment it
+ * goes.
+ *
+ * The screenshots are listed one by one rather than matched as _<digits>,
+ * which would also swallow a movie_2024.jpg that has nothing to do with
+ * this. Add _4 and beyond here if the sets get longer. */
+static const wchar_t *const fsr_companion_suffix[] = {
+    L".nfo", L".jpg", L"_1.jpg", L"_2.jpg", L"_3.jpg"
+};
 
 /* Append path to a double-NUL-terminated SHFILEOP source list if the file is
  * there. *used counts the characters written so far, each entry's NUL
@@ -5289,7 +5296,7 @@ int fsr_delete_file(const char *utf8_path)
     wchar_t          cand[FSR_DEL_PATH + 8];
     /* the video plus both naming habits for each companion extension */
     wchar_t          list[(FSR_DEL_PATH + 8) *
-                          (1 + 2 * FF_ARRAY_ELEMS(fsr_companion_ext)) + 1];
+                          (1 + 2 * FF_ARRAY_ELEMS(fsr_companion_suffix)) + 1];
     SHFILEOPSTRUCTW  op;
     size_t           used = 0;
     int              n, extra;
@@ -5306,8 +5313,8 @@ int fsr_delete_file(const char *utf8_path)
     if (!used)                           /* the video itself is already gone */
         return -1;
 
-    for (size_t i = 0; i < FF_ARRAY_ELEMS(fsr_companion_ext); i++) {
-        const wchar_t *ext = fsr_companion_ext[i];
+    for (size_t i = 0; i < FF_ARRAY_ELEMS(fsr_companion_suffix); i++) {
+        const wchar_t *ext = fsr_companion_suffix[i];
         wchar_t *dot;
 
         /* movie.mp4 -> movie.mp4.jpg */
@@ -5315,7 +5322,7 @@ int fsr_delete_file(const char *utf8_path)
         cand[FF_ARRAY_ELEMS(cand) - 1] = L'\0';
         fsr_del_add(list, FF_ARRAY_ELEMS(list) - 1, &used, cand);
 
-        /* movie.mp4 -> movie.jpg. Only when the dot really starts an
+        /* movie.mp4 -> movie.jpg, movie_1.jpg. Only when the dot really starts an
          * extension: a directory like C:\\v1.2\\clip has one too, and
          * truncating there would name something else entirely. */
         wcscpy(cand, wpath);
