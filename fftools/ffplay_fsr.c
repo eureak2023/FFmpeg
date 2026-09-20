@@ -5166,32 +5166,100 @@ void fsr_raise_modal_end(void *handle)
     av_free(c);
 }
 
-/* Delete utf8_path outright - not to the Recycle Bin. The file must already
- * be closed by the player. Returns 0 on success. The SHFILEOP source list is
- * double-NUL terminated. */
+#define FSR_DEL_PATH 1024
+
+/* Sidecar files a media file collects: the metadata written next to it and
+ * the cover image. Both naming habits are covered - the scrapers that replace
+ * the extension (movie.nfo) and the downloaders that append to the whole name
+ * (movie.mp4.jpg) - because both are named after this one video and are
+ * orphans the moment it goes. */
+static const wchar_t *const fsr_companion_ext[] = { L".nfo", L".jpg" };
+
+/* Append path to a double-NUL-terminated SHFILEOP source list if the file is
+ * there. *used counts the characters written so far, each entry's NUL
+ * included; the caller writes the closing second NUL. */
+static void fsr_del_add(wchar_t *list, size_t cap, size_t *used,
+                        const wchar_t *path)
+{
+    size_t len = wcslen(path);
+
+    if (*used + len + 2 > cap)
+        return;
+    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES)
+        return;
+    wmemcpy(list + *used, path, len + 1);
+    *used += len + 1;
+}
+
+/* Delete utf8_path outright - not to the Recycle Bin - together with any .nfo
+ * or .jpg named after it. The file must already be closed by the player.
+ * Returns 0 on success. The SHFILEOP source list is double-NUL terminated. */
 int fsr_delete_file(const char *utf8_path)
 {
-    wchar_t          wpath[1024 + 1];
+    wchar_t          wpath[FSR_DEL_PATH + 1];
+    wchar_t          cand[FSR_DEL_PATH + 8];
+    /* the video plus both naming habits for each companion extension */
+    wchar_t          list[(FSR_DEL_PATH + 8) *
+                          (1 + 2 * FF_ARRAY_ELEMS(fsr_companion_ext)) + 1];
     SHFILEOPSTRUCTW  op;
-    int              n;
+    size_t           used = 0;
+    int              n, extra;
 
     if (!utf8_path || !utf8_path[0])
         return -1;
     n = MultiByteToWideChar(CP_UTF8, 0, utf8_path, -1, wpath,
-                            (int)(sizeof(wpath) / sizeof(wpath[0])) - 1);
+                            (int)FF_ARRAY_ELEMS(wpath) - 1);
     if (n <= 0)
         return -1;
-    wpath[n] = L'\0';                    /* extra terminator for the list */
+    wpath[n] = L'\0';
+
+    fsr_del_add(list, FF_ARRAY_ELEMS(list) - 1, &used, wpath);
+    if (!used)                           /* the video itself is already gone */
+        return -1;
+
+    for (size_t i = 0; i < FF_ARRAY_ELEMS(fsr_companion_ext); i++) {
+        const wchar_t *ext = fsr_companion_ext[i];
+        wchar_t *dot;
+
+        /* movie.mp4 -> movie.mp4.jpg */
+        _snwprintf(cand, FF_ARRAY_ELEMS(cand), L"%ls%ls", wpath, ext);
+        cand[FF_ARRAY_ELEMS(cand) - 1] = L'\0';
+        fsr_del_add(list, FF_ARRAY_ELEMS(list) - 1, &used, cand);
+
+        /* movie.mp4 -> movie.jpg. Only when the dot really starts an
+         * extension: a directory like C:\\v1.2\\clip has one too, and
+         * truncating there would name something else entirely. */
+        wcscpy(cand, wpath);
+        dot = wcsrchr(cand, L'.');
+        if (dot && !wcspbrk(dot, L"\\/")) {
+            *dot = L'\0';
+            if (wcslen(cand) + wcslen(ext) < FF_ARRAY_ELEMS(cand)) {
+                wcscat(cand, ext);
+                if (_wcsicmp(cand, wpath))   /* never the video itself */
+                    fsr_del_add(list, FF_ARRAY_ELEMS(list) - 1, &used, cand);
+            }
+        }
+    }
+    list[used] = L'\0';                  /* closing terminator for the list */
 
     SDL_memset(&op, 0, sizeof(op));
     op.wFunc  = FO_DELETE;
-    op.pFrom  = wpath;
-    /* No FOF_ALLOWUNDO: the file is unlinked, not sent to the Recycle Bin.
+    op.pFrom  = list;
+    /* No FOF_ALLOWUNDO: the files are unlinked, not sent to the Recycle Bin.
      * The remaining flags keep the shell from putting up a prompt or an
      * error box of its own, since the Delete hotkey is meant to be one
      * keypress with nothing in the way. */
     op.fFlags = FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI;
-    return SHFileOperationW(&op) == 0 ? 0 : -1;
+    if (SHFileOperationW(&op) != 0)
+        return -1;
+    extra = 0;
+    for (size_t i = 0; i < used; i++)
+        if (!list[i])
+            extra++;
+    if (--extra > 0)
+        av_log(NULL, AV_LOG_INFO, "deleted %d companion file(s) alongside it\n",
+               extra);
+    return 0;
 }
 #else  /* !_WIN32 */
 int   fsr_single_instance_begin(void)             { return 1; }

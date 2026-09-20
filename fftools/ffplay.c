@@ -5590,6 +5590,10 @@ static void event_loop(VideoState *cur_stream)
                  * first (that releases the handle), then delete the old
                  * path; when it is the only file, close and quit.
                  *
+                 * Any .nfo or .jpg named after the video goes with it -
+                 * see fsr_delete_file - since they are orphans once it is
+                 * gone.
+                 *
                  * Nothing is asked first and nothing is recoverable after:
                  * this key exists for a keep-or-bin pass over a folder, and
                  * a dialog per discard is the entire cost of that pass, so
