@@ -5257,19 +5257,25 @@ void fsr_raise_modal_end(void *handle)
 
 #define FSR_DEL_PATH 1024
 
-/* Sidecar files a media file collects: the metadata written next to it, the
- * cover image, and the numbered screenshots that come with it. Both naming
- * habits are covered - the scrapers that replace the extension (movie.nfo)
- * and the downloaders that append to the whole name (movie.mp4.jpg) -
- * because both are named after this one video and are orphans the moment it
- * goes.
- *
- * The screenshots are listed one by one rather than matched as _<digits>,
- * which would also swallow a movie_2024.jpg that has nothing to do with
- * this. Add _4 and beyond here if the sets get longer. */
-static const wchar_t *const fsr_companion_suffix[] = {
-    L".nfo", L".jpg", L"_1.jpg", L"_2.jpg", L"_3.jpg"
-};
+/* Sidecar files a media file collects: the metadata written next to it and
+ * the cover image. Both naming habits are covered - the scrapers that replace
+ * the extension (movie.nfo) and the downloaders that append to the whole name
+ * (movie.mp4.jpg) - because both are named after this one video and are
+ * orphans the moment it goes. */
+static const wchar_t *const fsr_companion_suffix[] = { L".nfo", L".jpg" };
+
+/* The screenshot set beside them: movie_1.jpg up to movie_20.jpg, the length
+ * the scrapers here actually write (no zero padding - movie_01.jpg does not
+ * occur). Each number is probed by name rather than matching _<digits>.jpg,
+ * which would also take a movie_2024.jpg that has nothing to do with the
+ * screenshots - and there is no Recycle Bin to get it back from. Raise the
+ * count if the sets get longer. */
+#define FSR_DEL_SHOTS 20
+
+/* Every path we may end up listing: the video, plus both naming habits for
+ * each fixed suffix and each screenshot number. */
+#define FSR_DEL_MAX (1 + 2 * (FF_ARRAY_ELEMS(fsr_companion_suffix) + \
+                              FSR_DEL_SHOTS))
 
 /* Append path to a double-NUL-terminated SHFILEOP source list if the file is
  * there. *used counts the characters written so far, each entry's NUL
@@ -5287,19 +5293,46 @@ static void fsr_del_add(wchar_t *list, size_t cap, size_t *used,
     *used += len + 1;
 }
 
-/* Delete utf8_path outright - not to the Recycle Bin - together with any .nfo
- * or .jpg named after it. The file must already be closed by the player.
- * Returns 0 on success. The SHFILEOP source list is double-NUL terminated. */
+/* Try both spellings of one companion suffix and list whichever exists. */
+static void fsr_del_try(wchar_t *list, size_t cap, size_t *used,
+                        const wchar_t *wpath, const wchar_t *suffix)
+{
+    wchar_t  cand[FSR_DEL_PATH + 16];
+    wchar_t *dot;
+
+    /* movie.mp4 -> movie.mp4.jpg */
+    _snwprintf(cand, FF_ARRAY_ELEMS(cand), L"%ls%ls", wpath, suffix);
+    cand[FF_ARRAY_ELEMS(cand) - 1] = L'\0';
+    fsr_del_add(list, cap, used, cand);
+
+    /* movie.mp4 -> movie.jpg, movie_1.jpg. Only when the dot really starts an
+     * extension: a directory like C:\\v1.2\\clip has one too, and
+     * truncating there would name something else entirely. */
+    wcscpy(cand, wpath);
+    dot = wcsrchr(cand, L'.');
+    if (!dot || wcspbrk(dot, L"\\/"))
+        return;
+    *dot = L'\0';
+    if (wcslen(cand) + wcslen(suffix) >= FF_ARRAY_ELEMS(cand))
+        return;
+    wcscat(cand, suffix);
+    if (_wcsicmp(cand, wpath))           /* never the video itself */
+        fsr_del_add(list, cap, used, cand);
+}
+
+/* Delete utf8_path outright - not to the Recycle Bin - together with the .nfo,
+ * the cover .jpg and the numbered screenshots named after it. The file must
+ * already be closed by the player. Returns 0 on success. The SHFILEOP source
+ * list is double-NUL terminated. */
 int fsr_delete_file(const char *utf8_path)
 {
     wchar_t          wpath[FSR_DEL_PATH + 1];
-    wchar_t          cand[FSR_DEL_PATH + 8];
-    /* the video plus both naming habits for each companion extension */
-    wchar_t          list[(FSR_DEL_PATH + 8) *
-                          (1 + 2 * FF_ARRAY_ELEMS(fsr_companion_suffix)) + 1];
+    wchar_t          suffix[16];
+    wchar_t         *list;
     SHFILEOPSTRUCTW  op;
-    size_t           used = 0;
-    int              n, extra;
+    size_t           cap = FSR_DEL_MAX * (FSR_DEL_PATH + 16);
+    size_t           used = 0, i;
+    int              n, extra, rc;
 
     if (!utf8_path || !utf8_path[0])
         return -1;
@@ -5309,34 +5342,25 @@ int fsr_delete_file(const char *utf8_path)
         return -1;
     wpath[n] = L'\0';
 
-    fsr_del_add(list, FF_ARRAY_ELEMS(list) - 1, &used, wpath);
-    if (!used)                           /* the video itself is already gone */
+    /* Heap, not stack: the candidate list is ~90 KB once the screenshots are
+     * in it, and only the handful that exist are ever written. */
+    list = av_malloc((cap + 1) * sizeof(*list));
+    if (!list)
         return -1;
 
-    for (size_t i = 0; i < FF_ARRAY_ELEMS(fsr_companion_suffix); i++) {
-        const wchar_t *ext = fsr_companion_suffix[i];
-        wchar_t *dot;
-
-        /* movie.mp4 -> movie.mp4.jpg */
-        _snwprintf(cand, FF_ARRAY_ELEMS(cand), L"%ls%ls", wpath, ext);
-        cand[FF_ARRAY_ELEMS(cand) - 1] = L'\0';
-        fsr_del_add(list, FF_ARRAY_ELEMS(list) - 1, &used, cand);
-
-        /* movie.mp4 -> movie.jpg, movie_1.jpg. Only when the dot really starts an
-         * extension: a directory like C:\\v1.2\\clip has one too, and
-         * truncating there would name something else entirely. */
-        wcscpy(cand, wpath);
-        dot = wcsrchr(cand, L'.');
-        if (dot && !wcspbrk(dot, L"\\/")) {
-            *dot = L'\0';
-            if (wcslen(cand) + wcslen(ext) < FF_ARRAY_ELEMS(cand)) {
-                wcscat(cand, ext);
-                if (_wcsicmp(cand, wpath))   /* never the video itself */
-                    fsr_del_add(list, FF_ARRAY_ELEMS(list) - 1, &used, cand);
-            }
-        }
+    fsr_del_add(list, cap, &used, wpath);
+    if (!used) {                         /* the video itself is already gone */
+        av_free(list);
+        return -1;
     }
-    list[used] = L'\0';                  /* closing terminator for the list */
+
+    for (i = 0; i < FF_ARRAY_ELEMS(fsr_companion_suffix); i++)
+        fsr_del_try(list, cap, &used, wpath, fsr_companion_suffix[i]);
+    for (i = 1; i <= FSR_DEL_SHOTS; i++) {
+        _snwprintf(suffix, FF_ARRAY_ELEMS(suffix), L"_%d.jpg", (int)i);
+        fsr_del_try(list, cap, &used, wpath, suffix);
+    }
+    list[used] = L'\0';               /* closing terminator for the list */
 
     SDL_memset(&op, 0, sizeof(op));
     op.wFunc  = FO_DELETE;
@@ -5346,16 +5370,18 @@ int fsr_delete_file(const char *utf8_path)
      * error box of its own, since the Delete hotkey is meant to be one
      * keypress with nothing in the way. */
     op.fFlags = FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI;
-    if (SHFileOperationW(&op) != 0)
-        return -1;
-    extra = 0;
-    for (size_t i = 0; i < used; i++)
-        if (!list[i])
-            extra++;
-    if (--extra > 0)
-        av_log(NULL, AV_LOG_INFO, "deleted %d companion file(s) alongside it\n",
-               extra);
-    return 0;
+    rc = SHFileOperationW(&op);
+    if (rc == 0) {
+        extra = -1;                      /* the video is one of the entries */
+        for (i = 0; i < used; i++)
+            if (!list[i])
+                extra++;
+        if (extra > 0)
+            av_log(NULL, AV_LOG_INFO,
+                   "deleted %d companion file(s) alongside it\n", extra);
+    }
+    av_free(list);
+    return rc == 0 ? 0 : -1;
 }
 #else  /* !_WIN32 */
 int   fsr_single_instance_begin(void)             { return 1; }
