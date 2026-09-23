@@ -102,6 +102,12 @@ int  lada_should_buffer(double display_pts);
  * lada_stop() to clean up the dead process. */
 int  lada_poll_toast(char *buf, int buflen);
 
+/* Tell lada the decoded source dimensions. Only used to pick how far ahead of
+ * playback restoration starts: a 1080p-or-smaller source restores fast enough here
+ * to need only a short head start, a larger one keeps the conservative default.
+ * Call it when the video stream opens; 0 or unset means "assume the large case". */
+void lada_set_source_size(int w, int h);
+
 /* Ask for the restored frame matching a displayed frame at presentation time
  * pts_sec (seconds) with duration dur_sec (seconds, used as the match tolerance).
  * On success returns 1 and points *rgb at an internal RGB24 buffer (tightly packed,

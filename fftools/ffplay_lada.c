@@ -50,14 +50,33 @@
  * frames (~11 s) or ~85 4K frames (~3 s). */
 #define LADA_MAX_BUFFER_BYTES (2ull * 1024 * 1024 * 1024)
 
-/* Restoration starts a few seconds AHEAD of the current playback position. The sidecar
- * needs ~5 s to emit its first restored frame (decode + detect + fill the first clip),
- * during which playback would move on and the restored output would land behind the
- * display forever (it produces only ~20% faster than real time, so catching up from a
- * standing start takes ~20 s of visible original). By opening ahead, the upcoming
- * segment is already restored by the time playback reaches it: the first ~LEAD seconds
- * show the original, then restoration is applied cleanly with no long catch-up. */
-#define LADA_LEAD_SEC 7.0
+/* Restoration starts a few seconds AHEAD of the current playback position, because the
+ * sidecar takes a moment to emit its first restored frame (decode + detect + fill the
+ * first clip). By opening ahead, the upcoming segment is already restored by the time
+ * playback reaches it: the first ~LEAD seconds show the original, then restoration is
+ * applied cleanly with no catch-up. The lead is also what a SEEK pays, so it is the
+ * single biggest contributor to how long the original stays on screen.
+ *
+ * How far ahead depends on how much faster than real time the sidecar restores.
+ *
+ * The old 7 s came from lada, which managed only ~1.2x real time - from a standing
+ * start it needed ~20 s to catch up, so it had to be handed a big head start. jasna is
+ * not in that position. Measured on this machine (RTX 5080), driving the sidecar over
+ * its own pipe with a 1080p29.97 source and sampling nvidia-smi alongside:
+ *
+ *     from 0 s    114.9 fps (3.8x real time)   GPU 59%
+ *     from 240 s  110.7 fps (3.7x real time)   GPU 67%
+ *
+ * At 3.7x, every second of playback buys 2.7 s of extra lead, so a small head start is
+ * rebuilt almost immediately. The floor is the sidecar's own first-frame latency, which
+ * its log puts at 0.2-1.6 s; 2 s leaves margin above that without the buffer gate
+ * engaging straight away.
+ *
+ * Above 1080p the lead stays at the old value: the measurements above are 1080p, 4K is
+ * far heavier (the 2 GB buffer below spans only ~3 s of it), and there is no reason to
+ * shorten a head start we have not measured. */
+#define LADA_LEAD_SEC     7.0   /* unmeasured sources (above 1080p) */
+#define LADA_LEAD_FAST_SEC 2.0  /* 1080p and below - see the measurements above */
 
 /* Seek coalescing window. Dragging the seek bar fires a burst of seeks (one per
  * intermediate position). Each SEEK makes the sidecar tear down and re-open the whole
@@ -332,6 +351,24 @@ static void send_cmd(const char *cmd)
     DWORD wr = 0;
     if (L.stdin_wr && L.stdin_wr != INVALID_HANDLE_VALUE)
         WriteFile(L.stdin_wr, cmd, (DWORD)strlen(cmd), &wr, NULL);
+}
+
+/* Source dimensions, so lada_lead_sec() can tell a measured source from an unmeasured
+ * one. Module scope rather than in L: it is set when the video stream opens, which is
+ * not ordered against lada_start()'s memset of L. 0 until then - treated as unmeasured. */
+static int g_src_w, g_src_h;
+
+void lada_set_source_size(int w, int h)
+{
+    g_src_w = w > 0 ? w : 0;
+    g_src_h = h > 0 ? h : 0;
+}
+
+static double lada_lead_sec(void)
+{
+    if (g_src_w > 0 && g_src_h > 0 && (int64_t)g_src_w * g_src_h <= 1920 * 1080)
+        return LADA_LEAD_FAST_SEC;
+    return LADA_LEAD_SEC;
 }
 
 /* The sidecar runs with its cwd at lada_home, so it must receive an absolute path.
@@ -890,7 +927,8 @@ int lada_frame_for(double pts_sec, double dur_sec, const uint8_t **rgb, int *w, 
             SDL_UnlockMutex(L.mtx);
             return 0;
         }
-        snprintf(cmd, sizeof(cmd), "OPEN\t%.6f\t%u\t%s\n", pts_sec + LADA_LEAD_SEC, L.gen, L.path);
+        snprintf(cmd, sizeof(cmd), "OPEN\t%.6f\t%u\t%s\n",
+                 pts_sec + lada_lead_sec(), L.gen, L.path);
         send_cmd(cmd);
         L.opened = 1;
         L.warmed = 0;
@@ -1009,6 +1047,7 @@ int  lada_default_on(void) { return 0; }
 int  lada_start(const char *input_path, const char *lada_home, const char *device)
 { (void)input_path; (void)lada_home; (void)device; return -1; }
 void lada_stop(void) {}
+void lada_set_source_size(int w, int h) { (void)w; (void)h; }
 int  lada_retarget(const char *p) { (void)p; return -1; }
 void lada_set_enabled(int on) { (void)on; }
 int  lada_active(void) { return 0; }

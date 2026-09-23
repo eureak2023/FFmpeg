@@ -4260,6 +4260,8 @@ static int stream_component_open(VideoState *is, int stream_index)
                           NULL, NULL);
             hud_src_w   = avctx->width;
             hud_src_h   = avctx->height;
+            /* picks the restoration head start - see LADA_LEAD_SEC */
+            lada_set_source_size(avctx->width, avctx->height);
             hud_src_fps = fr.num && fr.den ? av_q2d(fr) : 0.0;
             hud_hw      = !!avctx->hw_device_ctx;
         }
