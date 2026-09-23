@@ -2663,6 +2663,27 @@ static int queue_picture(VideoState *is, AVFrame *src_frame, double pts, double 
     return 0;
 }
 
+/* The rotation this frame will be displayed with, read the same way
+ * configure_video_filters() reads it: the frame's own display matrix first,
+ * the stream's as a fallback. 0 when there is none. */
+static double frame_rotation(VideoState *is, const AVFrame *frame)
+{
+    const int32_t   *displaymatrix = NULL;
+    AVFrameSideData *sd = av_frame_get_side_data(frame, AV_FRAME_DATA_DISPLAYMATRIX);
+
+    if (sd)
+        displaymatrix = (const int32_t *)sd->data;
+    if (!displaymatrix && is->video_st) {
+        const AVPacketSideData *psd =
+            av_packet_side_data_get(is->video_st->codecpar->coded_side_data,
+                                    is->video_st->codecpar->nb_coded_side_data,
+                                    AV_PKT_DATA_DISPLAYMATRIX);
+        if (psd)
+            displaymatrix = (const int32_t *)psd->data;
+    }
+    return get_rotation(displaymatrix);
+}
+
 static int get_video_frame(VideoState *is, AVFrame *frame)
 {
     int got_picture;
@@ -2672,14 +2693,23 @@ static int get_video_frame(VideoState *is, AVFrame *frame)
 
     if (got_picture) {
         double dpts = NAN;
-
+        /* A stream carrying a display matrix is rotated by transpose/rotate
+         * in the filter graph, and those cannot take a hardware frame. Left
+         * on the GPU the graph simply fails to configure - "Impossible to
+         * convert between the formats supported by the filter ffplay_buffer
+         * and the filter auto_scale_0", src d3d11 - and the file does not
+         * play at all. Phone clips carry one as a matter of course, so copy
+         * those back and let the filter rotate them: the decode still runs
+         * on the GPU, the frame just does not stay there. */
+        int rotated  = autorotate && fabs(frame_rotation(is, frame)) > 1.0;
         /* Hardware-decoded frames are copied back to system memory (NV12)
          * so the regular SDL/FSR display path can consume them. The vulkan
          * renderer displays hardware frames directly instead, and D3D11
          * frames stay on the GPU when zero-copy GL interop is usable. */
-        if (frame->hw_frames_ctx && !vk_renderer &&
-            !(frame->format == AV_PIX_FMT_D3D11 && fsr_available() &&
-              !fsr_hw_interop_failed())) {
+        int on_gpu   = frame->format == AV_PIX_FMT_D3D11 && fsr_available() &&
+                       !fsr_hw_interop_failed() && !rotated;
+
+        if (frame->hw_frames_ctx && !vk_renderer && !on_gpu) {
             static int copyback_logged;
             AVFrame *sw_frame = av_frame_alloc();
             int ret;
