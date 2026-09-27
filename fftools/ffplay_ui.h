@@ -145,4 +145,10 @@ int  ui_window_dragging(void);
 
 void ui_uninit(void);
 
+/* Media info overlay (the TAB block in the top-left corner). ffplay.c builds
+ * the text - one "Label: value" per line, leading spaces indent - and these
+ * lay it out. ui_info_draw() returns the height it occupied, or 0. */
+void ui_info_set(SDL_Renderer *r, const char *text);
+int  ui_info_draw(SDL_Renderer *r, int top);
+
 #endif /* FFTOOLS_FFPLAY_UI_H */

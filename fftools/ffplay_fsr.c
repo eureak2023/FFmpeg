@@ -314,6 +314,17 @@ static struct {
 
 static int          fsr_state;      /* 0 = uninitialized, 1 = ready, -1 = unavailable */
 static char         gl_renderer_str[256];
+
+/* The display GPU's name for the info overlay. Filled when the D3D11 decode
+ * device is validated against the GL one; until then the GL renderer string is
+ * the only name we have, and it names the same card. */
+static char hw_gpu_name[128];
+
+const char *fsr_gpu_name(void)
+{
+    return hw_gpu_name[0] ? hw_gpu_name : gl_renderer_str;
+}
+
 static GLuint       easu_prog, rcas_prog, copy_prog;
 static GLint        easu_con0_loc, rcas_sharp_loc, rcas_dns_loc, copy_invout_loc;
 static GLint        rcas_hdr_loc, rcas_peak_loc, copy_hdr_loc, copy_peak_loc;
@@ -1826,6 +1837,7 @@ static int hwgl_init(AVFrame *frame)
             IDXGIDevice_Release(dxgi_dev);
         }
         av_log(NULL, AV_LOG_INFO, "FSR: D3D11 decode device on '%s'\n", name);
+        av_strlcpy(hw_gpu_name, name, sizeof(hw_gpu_name));
         if (!name[0] || !gl_renderer_str[0] || !strstr(gl_renderer_str, name)) {
             av_log(NULL, AV_LOG_WARNING,
                    "FSR: decode GPU '%s' differs from GL GPU '%s'\n",
@@ -4048,6 +4060,12 @@ int fsr_hud_draw(SDL_Renderer *renderer)
 static SDL_Texture *hud_left_tex;
 static int          hud_left_w, hud_left_h;
 static int          hud_left_sys;   /* the texture came from the system font */
+static int          hud_left_bot;   /* plate bottom, for the info block below */
+
+int fsr_hud_left_bottom(void)
+{
+    return hud_left_bot;
+}
 
 void fsr_hud_left_set(SDL_Renderer *renderer, const char *text)
 {
@@ -4083,8 +4101,10 @@ int fsr_hud_left_draw(SDL_Renderer *renderer)
     int ow = 0, oh = 0, scale;
     SDL_Rect dst;
 
-    if (!hud_left_tex)
+    if (!hud_left_tex) {
+        hud_left_bot = 0;
         return 0;
+    }
     SDL_GetRendererOutputSize(renderer, &ow, &oh);
     /* Only the pixel-font fallback needs scaling up; the system font is already
      * rasterized at the intended size. */
@@ -4097,6 +4117,7 @@ int fsr_hud_left_draw(SDL_Renderer *renderer)
     dst.y = 50;   /* below the UI title bar (34px) so the status doesn't overlap it */
     hud_plate(renderer, &dst, scale * 6);
     SDL_RenderCopy(renderer, hud_left_tex, NULL, &dst);
+    hud_left_bot = dst.y + dst.h + scale * 6;
     return 1;
 }
 

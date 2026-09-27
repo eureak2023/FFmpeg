@@ -201,6 +201,15 @@ int  fsr_hud_draw(SDL_Renderer *renderer);
 void fsr_hud_left_set(SDL_Renderer *renderer, const char *text);
 int  fsr_hud_left_draw(SDL_Renderer *renderer);
 
+/* Bottom edge of the left HUD's plate as of the last draw, so the media info
+ * block can start under it; 0 when that HUD is not up. */
+int  fsr_hud_left_bottom(void);
+
+/* Name of the GPU the display path runs on, for the info overlay. The D3D11
+ * adapter description once the zero-copy path is up, the GL renderer string
+ * before that; never NULL. */
+const char *fsr_gpu_name(void);
+
 /* Album-art "now playing" visualizer for audio-only playback (a port of
  * WinVibe's LPPlayerView): an animated rainbow-blob background with the cover
  * art laid flat and a vinyl LP spinning out from behind it. Drawn with the

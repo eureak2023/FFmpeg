@@ -27,6 +27,8 @@
 #include "config_components.h"
 #include <math.h>
 #include <limits.h>
+#include <time.h>
+#include <inttypes.h>
 #include <signal.h>
 #include <stdint.h>
 
@@ -440,6 +442,7 @@ static const char *lada_home = "D:/Source_AI/ffplay-fsr1/lada"; /* lada project 
 static const char *jasna_home = "D:/Source_AI/ffplay-fsr1/jasna"; /* jasna source checkout (.venv + model_weights) */
 static SDL_Texture *lada_texture = NULL; /* upload target for restored RGB24 frames */
 static int show_fps = 0;           /* FPS overlay, toggled with TAB */
+static VideoState *hud_is;         /* stream the TAB media info block reports on */
 static int install_assoc = 0;      /* register .mp4/.mkv associations and exit */
 static int uninstall_assoc = 0;
 static double fg_refresh = 1.0 / 60.0; /* display refresh period for frame generation */
@@ -1484,6 +1487,8 @@ static void stream_component_close(VideoState *is, int stream_index)
 
 static void stream_close(VideoState *is)
 {
+    if (hud_is == is)
+        hud_is = NULL;          /* nothing left for the info block to read */
     /* XXX: use a special url_shutdown call to abort parse cleanly */
     is->abort_request = 1;
     SDL_WaitThread(is->read_tid, NULL);
@@ -1715,6 +1720,7 @@ static int video_open(VideoState *is)
     return 0;
 }
 
+static int64_t hud_frames_shown;      /* frames presented, for the info block */
 static int    hud_src_w, hud_src_h;   /* source video dimensions */
 static double hud_src_fps;            /* source frame rate */
 static int    hud_hw;                 /* hardware decoding in use */
@@ -1723,14 +1729,16 @@ static int    hud_album;              /* album view is up (audio playback) */
 /* Refresh the TAB-toggled status overlay: source resolution, source ->
  * presented frame rate (incl. generated frames) and the current
  * FSR/denoise/sharpness/FG state. */
+static int  hud_last_fps;     /* presented frame rate, shared with the info block */
+static void info_hud_update(void);
+
 static void status_hud_update(int fps)
 {
-    static int last_fps;
     char buf[128];
     int n = 0;
 
     if (fps >= 0)
-        last_fps = fps;
+        hud_last_fps = fps;
     if (!show_fps || !renderer)
         return;
     if (hud_src_w && hud_src_h)
@@ -1738,9 +1746,9 @@ static void status_hud_update(int fps)
                       hud_src_w, hud_src_h);
     if (hud_src_fps > 0)
         n += snprintf(buf + n, sizeof(buf) - n, "%d -> %d FPS\n",
-                      (int)lrint(hud_src_fps), last_fps);
+                      (int)lrint(hud_src_fps), hud_last_fps);
     else
-        n += snprintf(buf + n, sizeof(buf) - n, "%d FPS\n", last_fps);
+        n += snprintf(buf + n, sizeof(buf) - n, "%d FPS\n", hud_last_fps);
     /* show FG's effective state for this file: it only runs on the hardware
      * zero-copy path and when the source interval leaves room before the next
      * display refresh (mirrors the pacing gate in video_refresh). The multiplier
@@ -1804,6 +1812,7 @@ static void status_hud_update(int fps)
             snprintf(buf + n, sizeof(buf) - n, "\nHDR %d", hdr_bright);
     }
     fsr_hud_set(renderer, buf);
+    info_hud_update();
     {   /* restore-engine status on the left (e.g. "JASNA ACTIVE" / "LADA WAIT"),
          * shown only while an engine is engaged - nothing when it is off, so no
          * stray "JASNA OFF" sits in the corner. */
@@ -1820,6 +1829,224 @@ static void status_hud_update(int fps)
     }
 }
 
+
+/* h:mm:ss.mmm, the way a player writes a position. */
+static void hud_hms(char *out, size_t size, double t)
+{
+    int64_t ms;
+
+    if (isnan(t) || t < 0)
+        t = 0;
+    ms = (int64_t)llrint(t * 1000.0);
+    snprintf(out, size, "%d:%02d:%02d.%03d", (int)(ms / 3600000),
+             (int)(ms / 60000 % 60), (int)(ms / 1000 % 60), (int)(ms % 1000));
+}
+
+static double get_master_clock(VideoState *is);
+
+/* The media info block PotPlayer puts in the top-left corner, built here
+ * because this is the only place that can see the format context, both codec
+ * contexts and the display-pipeline state at the same time. It is deliberately
+ * separate from status_hud_update() above: that one is the short pipeline
+ * readout people watch while tuning, this is the "what am I actually playing"
+ * dump. TAB raises both.
+ *
+ * Every line is "Label: value" - ui_info_set() splits on the first colon that
+ * has a space after it to colour the halves, which is why the wall clock in
+ * the Current Time line does not confuse it. Leading spaces indent.
+ *
+ * Nothing here is invented: a field that cannot be answered from the stream or
+ * from the pipeline is left off the line rather than guessed at. */
+static void info_hud_update(void)
+{
+    VideoState *is = hud_is;
+    char buf[3072];
+    int n = 0;
+
+    if (!renderer)
+        return;
+    if (!show_fps || !is) {
+        ui_info_set(renderer, NULL);
+        return;
+    }
+
+    {   /* file, wall clock, and where in the track we are */
+        const char *base = is->filename ? is->filename : "";
+        time_t now = time(NULL);
+        struct tm *lt = localtime(&now);
+        double pos = get_master_clock(is);
+        double dur = is->ic && is->ic->duration != AV_NOPTS_VALUE ?
+                     is->ic->duration / (double)AV_TIME_BASE : 0.0;
+        char cpos[32], cdur[32];
+
+        for (const char *p = base; *p; p++)
+            if (*p == '/' || *p == '\\')
+                base = p + 1;
+        if (isnan(pos))
+            pos = 0;
+        hud_hms(cpos, sizeof(cpos), pos);
+        hud_hms(cdur, sizeof(cdur), dur);
+        n += snprintf(buf + n, sizeof(buf) - n, "File Name: %s\n", base);
+        n += snprintf(buf + n, sizeof(buf) - n, "Current Time: %02d:%02d:%02d",
+                      lt ? lt->tm_hour : 0, lt ? lt->tm_min : 0,
+                      lt ? lt->tm_sec : 0);
+        n += snprintf(buf + n, sizeof(buf) - n, ", Track: %s/%s", cpos, cdur);
+        if (dur > 0)
+            n += snprintf(buf + n, sizeof(buf) - n, "(%.1f%%)", pos / dur * 100.0);
+        /* Frame numbers are derived from the clock rather than counted,
+         * because a seek lands wherever it lands and a counter would then be
+         * wrong for the rest of the file. nb_frames when the container knows,
+         * duration x rate when it does not. */
+        if (hud_src_fps > 0) {
+            int64_t total = is->video_st && is->video_st->nb_frames > 0 ?
+                            is->video_st->nb_frames :
+                            (int64_t)llrint(dur * hud_src_fps);
+
+            n += snprintf(buf + n, sizeof(buf) - n, ", #Frame: %"PRId64,
+                          (int64_t)llrint(pos * hud_src_fps));
+            if (total > 0)
+                n += snprintf(buf + n, sizeof(buf) - n, "/%"PRId64, total);
+        }
+        n += snprintf(buf + n, sizeof(buf) - n, "\n");
+        n += snprintf(buf + n, sizeof(buf) - n,
+                      "Version: ffplay %s, SDL %d.%d.%d\n", av_version_info(),
+                      SDL_MAJOR_VERSION, SDL_MINOR_VERSION, SDL_PATCHLEVEL);
+    }
+
+    if (is->video_st && is->viddec.avctx) {
+        AVCodecContext  *avc = is->viddec.avctx;
+        AVCodecParameters *par = is->video_st->codecpar;
+        enum AVPixelFormat sw = avc->sw_pix_fmt != AV_PIX_FMT_NONE ?
+                                avc->sw_pix_fmt : avc->pix_fmt;
+        const AVPixFmtDescriptor *d = av_pix_fmt_desc_get(sw);
+        AVRational sar = par->sample_aspect_ratio;
+        double par_r = sar.num > 0 && sar.den > 0 ?
+                       sar.num / (double)sar.den : 1.0;
+        double dar = avc->height > 0 ?
+                     avc->width * par_r / avc->height : 0.0;
+        int64_t br = par->bit_rate;
+        char tag[AV_FOURCC_MAX_STRING_SIZE] = "";
+        int zero_copy = hud_hw && fsr_available() && !fsr_hw_interop_failed();
+
+        if (par->codec_tag)
+            av_fourcc_make_string(tag, par->codec_tag);
+        n += snprintf(buf + n, sizeof(buf) - n, "\nVideo Codec: %s (%s)",
+                      avc->codec ? avc->codec->name : "?",
+                      hud_hw ? "D3D11 DXVA hardware decoder" : "software decoder");
+        if (hud_hw && *fsr_gpu_name())
+            n += snprintf(buf + n, sizeof(buf) - n, " - %s", fsr_gpu_name());
+        n += snprintf(buf + n, sizeof(buf) - n, "\n");
+
+        n += snprintf(buf + n, sizeof(buf) - n,
+                      "Input: %s(%d bit), %dx%d(%.2f:1), FPS: %.3f",
+                      tag[0] ? tag : (avc->codec ? avc->codec->name : "?"),
+                      d ? d->comp[0].depth : 8, avc->width, avc->height,
+                      dar, hud_src_fps > 0 ? hud_src_fps : 0.0);
+        if (br > 0)
+            n += snprintf(buf + n, sizeof(buf) - n, ", BitRate: %"PRId64"kbps",
+                          br / 1000);
+        n += snprintf(buf + n, sizeof(buf) - n, "\n");
+
+        n += snprintf(buf + n, sizeof(buf) - n,
+                      "Format: %dp, Pixel: %s, Range: %s, ChromaLoc: %s\n",
+                      avc->height, av_get_pix_fmt_name(sw) ? av_get_pix_fmt_name(sw) : "?",
+                      av_color_range_name(avc->color_range) ?
+                          av_color_range_name(avc->color_range) : "unknown",
+                      av_chroma_location_name(avc->chroma_sample_location) ?
+                          av_chroma_location_name(avc->chroma_sample_location) : "unknown");
+
+        n += snprintf(buf + n, sizeof(buf) - n,
+                      "Output: %s, %dx%d, FPS: %.3f(%d presented)\n",
+                      av_get_pix_fmt_name(avc->pix_fmt) ?
+                          av_get_pix_fmt_name(avc->pix_fmt) : "?",
+                      avc->width, avc->height,
+                      hud_src_fps > 0 ? hud_src_fps : 0.0, hud_last_fps);
+
+        /* ---- what this player then did with it ---- */
+        n += snprintf(buf + n, sizeof(buf) - n, "Video Renderer: %s\n",
+                      zero_copy ? "FSR1 OpenGL (D3D11 zero-copy)" :
+                      fsr_available() ? "FSR1 OpenGL (copy-back)" :
+                                        "SDL2 (no OpenGL)");
+        n += snprintf(buf + n, sizeof(buf) - n,
+                      "  - Pixel Format: %s(Input)->%s->RGBA8(Display)\n",
+                      av_get_pix_fmt_name(sw) ? av_get_pix_fmt_name(sw) : "?",
+                      zero_copy ? "BGRA8(VideoProcessor)" : "BGRA8(CPU)");
+        {
+            char chain[96];
+            int c = 0;
+
+            if (zero_copy)
+                c += snprintf(chain + c, sizeof(chain) - c, "D3D11 VideoProcessor");
+            if (fsr_vsr_active())
+                c += snprintf(chain + c, sizeof(chain) - c, "%sVSR %dX",
+                              c ? " + " : "", fsr_vsr_scale());
+            if (fsr_nr_active())
+                c += snprintf(chain + c, sizeof(chain) - c, "%sDLSS-NR", c ? " + " : "");
+            {   /* EASU only engages on a genuine upscale, so mirror the test
+                 * in fsr_hw_draw() instead of reporting the setting - a 4K
+                 * source in a small window would otherwise read "EASU+RCAS"
+                 * for a downscale EASU never touched. */
+                const SDL_Rect *tr = &is->render_params.target_rect;
+                int vs = fsr_vsr_scale();
+                int up = tr->w > avc->width * vs || tr->h > avc->height * vs;
+
+                c += snprintf(chain + c, sizeof(chain) - c, "%s%s", c ? " -> " : "",
+                              !fsr ? "bilinear" : up ? "EASU+RCAS" : "RCAS");
+            }
+            n += snprintf(buf + n, sizeof(buf) - n,
+                          "  - Resizer: %s, Device: %s\n", chain, fsr_gpu_name());
+        }
+        {
+            SDL_RendererInfo ri;
+            const char *drv = SDL_GetRendererInfo(renderer, &ri) == 0 ?
+                              ri.name : "?";
+
+            n += snprintf(buf + n, sizeof(buf) - n,
+                          "  - Present: %s, Frame: %"PRId64", Dropped: %d, "
+                          "Queue: %d, Refresh Rate: %.1fHz\n",
+                          drv, hud_frames_shown,
+                          is->frame_drops_early + is->frame_drops_late,
+                          frame_queue_nb_remaining(&is->pictq),
+                          fg_refresh > 0 ? 1.0 / fg_refresh : 0.0);
+        }
+        {
+            SDL_Rect *tr = &is->render_params.target_rect;
+
+            if (tr->w > 0 && tr->h > 0)
+                n += snprintf(buf + n, sizeof(buf) - n,
+                              "Video Frame Size: %dx%d(%.2f:1)\n",
+                              tr->w, tr->h, tr->w / (double)tr->h);
+        }
+    }
+
+    if (is->audio_st && is->auddec.avctx && n < (int)sizeof(buf)) {
+        AVCodecContext *avc = is->auddec.avctx;
+        AVCodecParameters *par = is->audio_st->codecpar;
+        const char *drv = SDL_GetCurrentAudioDriver();
+
+        n += snprintf(buf + n, sizeof(buf) - n, "\nAudio Codec: %s\n",
+                      avc->codec ? avc->codec->name : "?");
+        n += snprintf(buf + n, sizeof(buf) - n, "Input: %dHz, %dCh, %s",
+                      par->sample_rate, par->ch_layout.nb_channels,
+                      av_get_sample_fmt_name(avc->sample_fmt) ?
+                          av_get_sample_fmt_name(avc->sample_fmt) : "?");
+        if (par->bit_rate > 0)
+            n += snprintf(buf + n, sizeof(buf) - n, ", %"PRId64"kbps",
+                          par->bit_rate / 1000);
+        n += snprintf(buf + n, sizeof(buf) - n, "\n");
+        n += snprintf(buf + n, sizeof(buf) - n,
+                      "Output: %dHz, %dCh, %s, Volume: %d%%\n",
+                      is->audio_tgt.freq, is->audio_tgt.ch_layout.nb_channels,
+                      av_get_sample_fmt_name(is->audio_tgt.fmt) ?
+                          av_get_sample_fmt_name(is->audio_tgt.fmt) : "?",
+                      is->muted ? 0 :
+                          (int)lrint(is->audio_volume * 100.0 / SDL_MIX_MAXVOLUME));
+        snprintf(buf + n, sizeof(buf) - n, "Audio Renderer: SDL2 (%s)\n",
+                 drv ? drv : "?");
+    }
+    ui_info_set(renderer, buf);
+}
+
 static void fps_tick(void)
 {
     static int64_t win_start;
@@ -1829,6 +2056,7 @@ static void fps_tick(void)
     count++;
     if (!win_start)
         win_start = now;
+    hud_frames_shown++;
     if (now - win_start >= 500000) {
         status_hud_update((int)lrint(count * 1000000.0 / (now - win_start)));
         win_start = now;
@@ -1852,8 +2080,6 @@ static void apply_dlss_nr(int on)
     if (show_fps)
         status_hud_update(-1);
 }
-
-static double get_master_clock(VideoState *is);
 
 /* Draw the on-screen controls with the current position/duration. */
 static void ui_draw_overlay(VideoState *is)
@@ -2153,6 +2379,8 @@ static void video_display(VideoState *is)
     fsr_toast_draw(renderer);
     fsr_hud_draw(renderer);
     fsr_hud_left_draw(renderer);
+    /* under the restore-engine line when that is up, in its place when not */
+    ui_info_draw(renderer, fsr_hud_left_bottom() ? fsr_hud_left_bottom() + 12 : 50);
     fg_debug_marker(0);                /* this path only ever shows a real frame */
     SDL_RenderPresent(renderer);
     fps_tick();
@@ -2467,6 +2695,8 @@ static void video_fg_display(VideoState *is, double phase)
     fsr_toast_draw(renderer);
     fsr_hud_draw(renderer);
     fsr_hud_left_draw(renderer);
+    /* under the restore-engine line when that is up, in its place when not */
+    ui_info_draw(renderer, fsr_hud_left_bottom() ? fsr_hud_left_bottom() + 12 : 50);
     fg_debug_marker(drew);             /* red on a genuinely interpolated frame */
     SDL_RenderPresent(renderer);
     fps_tick();
@@ -4827,6 +5057,7 @@ static VideoState *stream_open(const char *filename,
     is->seek_disp_ts = NAN;
     is->last_subtitle_stream = is->subtitle_stream = -1;
     is->filename = av_strdup(filename);
+    hud_is = is;                /* what the TAB media info block reports on */
     if (!is->filename)
         goto fail;
     is->iformat = iformat;
@@ -5865,6 +6096,7 @@ static void event_loop(VideoState *cur_stream)
                 } else {
                     fsr_hud_set(renderer, NULL);
                     fsr_hud_left_set(renderer, NULL);
+                    ui_info_set(renderer, NULL);
                 }
                 cur_stream->force_refresh = 1;
                 break;

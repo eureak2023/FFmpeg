@@ -855,6 +855,8 @@ void ui_set_chapters(const double *fracs, int n)
     ui.nb_chapters = n;
 }
 
+static void info_reset(void);   /* defined with the info overlay below */
+
 void ui_uninit(void)
 {
     if (ui.text_tex) {
@@ -878,6 +880,7 @@ void ui_uninit(void)
             SDL_DestroyTexture(ui.badge_tex[i]);
             ui.badge_tex[i] = NULL;
         }
+    info_reset();
     ui_sub_clear();
     if (subs.lock) {
         SDL_DestroyMutex(subs.lock);
@@ -1293,6 +1296,175 @@ static void round_rect(SDL_Renderer *r, int x, int y, int w, int h, float rad,
             0.0f, (float)(M_PI / 2), c);
     arc_fan(r, (float)(x + ir),     (float)(y + h - ir), rad,
             (float)(M_PI / 2), (float)M_PI, c);
+}
+
+/* ---- media info overlay (TAB) -------------------------------------------
+ *
+ * The block PotPlayer shows in the top-left corner: what the file is, what the
+ * decoder made of it, and what this player's display chain then did with it.
+ * ffplay.c owns the content - it is the only place that can see the format
+ * context, the codec contexts and the pipeline state at once - and this owns
+ * the drawing.
+ *
+ * Each line is rasterized as two textures rather than one so the label and the
+ * value can take different colours, which is what makes a block this long
+ * scannable at all; one flat colour reads as a wall. Lines are cached by
+ * content because only two of them (the wall clock and the frame counters)
+ * change between updates, and re-running GDI over twenty lines twice a second
+ * to move a clock would be silly. */
+#define INFO_MAX_LINES 28
+#define INFO_MAX_CHARS 208
+
+static struct {
+    char         line[INFO_MAX_LINES][INFO_MAX_CHARS];
+    SDL_Texture *lab[INFO_MAX_LINES], *val[INFO_MAX_LINES];
+    int          lab_w[INFO_MAX_LINES], lab_h[INFO_MAX_LINES];
+    int          val_w[INFO_MAX_LINES], val_h[INFO_MAX_LINES];
+    int          indent[INFO_MAX_LINES];
+    int          n, px;
+} info;
+
+static void info_line_free(int i)
+{
+    if (info.lab[i]) {
+        SDL_DestroyTexture(info.lab[i]);
+        info.lab[i] = NULL;
+    }
+    if (info.val[i]) {
+        SDL_DestroyTexture(info.val[i]);
+        info.val[i] = NULL;
+    }
+    info.lab_w[i] = info.lab_h[i] = info.val_w[i] = info.val_h[i] = 0;
+    info.indent[i] = 0;
+}
+
+static void info_reset(void)
+{
+    for (int i = 0; i < INFO_MAX_LINES; i++) {
+        info_line_free(i);
+        info.line[i][0] = 0;
+    }
+    info.n = 0;
+}
+
+/* Split "Label: value" at the first colon followed by a space - which is why
+ * the clock in "Current Time: 20:31:20" does not split the line, its colons
+ * have digits after them. The label keeps its colon so the two halves butt
+ * together the way one string would have. */
+static void info_render_line(SDL_Renderer *r, int i, const char *s)
+{
+    char lab[INFO_MAX_CHARS];
+    const char *sep;
+    size_t nlab;
+    int ind = 0;
+
+    info_line_free(i);
+    while (*s == ' ') {       /* DrawText would eat a leading space, so the
+                               * indent is laid out rather than drawn */
+        ind++;
+        s++;
+    }
+    if (!*s)
+        return;
+    info.indent[i] = ind * (info.px / 3);
+    sep  = strstr(s, ": ");
+    nlab = sep ? (size_t)(sep - s) + 1 : strlen(s);
+    if (nlab >= sizeof(lab))
+        nlab = sizeof(lab) - 1;
+    memcpy(lab, s, nlab);
+    lab[nlab] = 0;
+    info.lab[i] = render_text_sys(r, lab, info.px,
+                                  &info.lab_w[i], &info.lab_h[i], 0, NULL);
+    if (info.lab[i])
+        SDL_SetTextureColorMod(info.lab[i], 226, 231, 240);
+    if (sep) {
+        info.val[i] = render_text_sys(r, sep + 2, info.px,
+                                      &info.val_w[i], &info.val_h[i], 0, NULL);
+        if (info.val[i])
+            SDL_SetTextureColorMod(info.val[i], ACCENT_R, ACCENT_G, ACCENT_B);
+    }
+}
+
+void ui_info_set(SDL_Renderer *r, const char *text)
+{
+    int ow = 0, oh = 0, px, n = 0;
+
+    if (!r || !text || !text[0]) {
+        info_reset();
+        return;
+    }
+    SDL_GetRendererOutputSize(r, &ow, &oh);
+    px = oh > 0 ? oh / 58 : 16;
+    if (px < 12)
+        px = 12;
+    if (px != info.px) {          /* the window resized: everything re-rasterizes */
+        info_reset();
+        info.px = px;
+    }
+    while (*text && n < INFO_MAX_LINES) {
+        const char *e = strchr(text, '\n');
+        size_t len = e ? (size_t)(e - text) : strlen(text);
+        char cur[INFO_MAX_CHARS];
+
+        if (len >= sizeof(cur))
+            len = sizeof(cur) - 1;
+        memcpy(cur, text, len);
+        cur[len] = 0;
+        if (strcmp(cur, info.line[n])) {
+            snprintf(info.line[n], sizeof(info.line[n]), "%s", cur);
+            info_render_line(r, n, cur);
+        }
+        n++;
+        if (!e)
+            break;
+        text = e + 1;
+    }
+    for (int i = n; i < INFO_MAX_LINES; i++)
+        if (info.line[i][0]) {
+            info_line_free(i);
+            info.line[i][0] = 0;
+        }
+    info.n = n;
+}
+
+int ui_info_draw(SDL_Renderer *r, int top)
+{
+    SDL_Color plate = { 0, 0, 0, 165 };
+    int x = 16, y, w = 0, lh, pad, gap;
+
+    if (!info.n || info.px <= 0)
+        return 0;
+    lh  = info.px + info.px / 3;
+    gap = info.px / 3;
+    pad = info.px / 2 + 4;
+    for (int i = 0; i < info.n; i++) {
+        int lw = info.indent[i] + info.lab_w[i] +
+                 (info.val[i] ? gap + info.val_w[i] : 0);
+
+        if (lw > w)
+            w = lw;
+    }
+    round_rect(r, x - pad, top - pad, w + 2 * pad, info.n * lh + 2 * pad,
+               8.f, plate);
+    y = top;
+    for (int i = 0; i < info.n; i++, y += lh) {
+        SDL_Rect d;
+
+        if (!info.lab[i])
+            continue;               /* blank separator line: just the gap */
+        d.x = x + info.indent[i];
+        d.y = y;
+        d.w = info.lab_w[i];
+        d.h = info.lab_h[i];
+        SDL_RenderCopy(r, info.lab[i], NULL, &d);
+        if (info.val[i]) {
+            d.x += info.lab_w[i] + gap;
+            d.w  = info.val_w[i];
+            d.h  = info.val_h[i];
+            SDL_RenderCopy(r, info.val[i], NULL, &d);
+        }
+    }
+    return info.n * lh + 2 * pad;
 }
 
 /* Render a string into a texture (transparent background, light 8x8 pixel
