@@ -1201,6 +1201,40 @@ static void disc(SDL_Renderer *r, float cx, float cy, float rad, SDL_Color c)
     SDL_RenderGeometry(r, NULL, v, SEG + 1, idx, SEG * 3);
 }
 
+/* Filled circular sector: the slice of a disc that a rounded end or corner
+ * actually needs. It exists because the obvious construction - a whole disc
+ * centred on the corner, drawn over a rectangle that already covers half of
+ * it - blends the same translucent colour twice in the overlap, and the
+ * overlap is exactly a half or a quarter circle. At the stream badges' alpha
+ * of 46 that came out as a row of bright blobs along the chips. Angles are in
+ * radians and run clockwise, because y grows downwards here. */
+static void arc_fan(SDL_Renderer *r, float cx, float cy, float rad,
+                    float a0, float a1, SDL_Color c)
+{
+    enum { SEG = 14 };
+    SDL_Vertex v[SEG + 2];
+    int idx[SEG * 3];
+
+    v[0].position.x = cx;
+    v[0].position.y = cy;
+    v[0].color      = c;
+    v[0].tex_coord.x = v[0].tex_coord.y = 0;
+    for (int i = 0; i <= SEG; i++) {
+        float a = a0 + (a1 - a0) * i / (float)SEG;
+
+        v[i + 1].position.x = cx + rad * cosf(a);
+        v[i + 1].position.y = cy + rad * sinf(a);
+        v[i + 1].color      = c;
+        v[i + 1].tex_coord.x = v[i + 1].tex_coord.y = 0;
+    }
+    for (int i = 0; i < SEG; i++) {
+        idx[i * 3 + 0] = 0;
+        idx[i * 3 + 1] = i + 1;
+        idx[i * 3 + 2] = i + 2;
+    }
+    SDL_RenderGeometry(r, NULL, v, SEG + 2, idx, SEG * 3);
+}
+
 /* Rounded bar: a rectangle with semicircular ends. Everything bar-shaped in
  * the overlay - the seek and volume tracks, the played fill, the pause blades,
  * the badge backgrounds - is drawn with this rather than a hard rectangle. */
@@ -1211,16 +1245,26 @@ static void pill(SDL_Renderer *r, int x, int y, int w, int h, SDL_Color c)
     if (w <= 0 || h <= 0)
         return;
     if (w >= h) {                      /* lying down: round the left/right ends */
+        int ir = h / 2;
+
         rad = h / 2.0f;
         if (w > h)
-            fill(r, x + (int)rad, y, w - 2 * (int)rad, h, c.r, c.g, c.b, c.a);
-        disc(r, x + rad,     y + rad, rad, c);
-        disc(r, x + w - rad, y + rad, rad, c);
+            fill(r, x + ir, y, w - 2 * ir, h, c.r, c.g, c.b, c.a);
+        /* the flat side of each half sits exactly on the fill's edge, so
+         * there is neither a seam nor a doubly-blended overlap */
+        arc_fan(r, (float)(x + ir),     y + rad, rad,
+                (float)(M_PI / 2), (float)(3 * M_PI / 2), c);
+        arc_fan(r, (float)(x + w - ir), y + rad, rad,
+                (float)(-M_PI / 2), (float)(M_PI / 2), c);
     } else {                           /* standing up: round top/bottom instead */
+        int ir = w / 2;
+
         rad = w / 2.0f;
-        fill(r, x, y + (int)rad, w, h - 2 * (int)rad, c.r, c.g, c.b, c.a);
-        disc(r, x + rad, y + rad,     rad, c);
-        disc(r, x + rad, y + h - rad, rad, c);
+        fill(r, x, y + ir, w, h - 2 * ir, c.r, c.g, c.b, c.a);
+        arc_fan(r, x + rad, (float)(y + ir),     rad,
+                (float)M_PI, (float)(2 * M_PI), c);
+        arc_fan(r, x + rad, (float)(y + h - ir), rad,
+                0.0f, (float)M_PI, c);
     }
 }
 
@@ -1231,15 +1275,24 @@ static void round_rect(SDL_Renderer *r, int x, int y, int w, int h, float rad,
 {
     if (w <= 0 || h <= 0)
         return;
+    int ir;
+
     rad = FFMIN(rad, FFMIN(w, h) / 2.0f);
-    fill(r, x + (int)rad, y, w - (int)(2 * rad), h, c.r, c.g, c.b, c.a);
-    fill(r, x, y + (int)rad, (int)rad, h - (int)(2 * rad), c.r, c.g, c.b, c.a);
-    fill(r, x + w - (int)rad, y + (int)rad, (int)rad, h - (int)(2 * rad),
-         c.r, c.g, c.b, c.a);
-    disc(r, x + rad,         y + rad,         rad, c);
-    disc(r, x + w - rad,     y + rad,         rad, c);
-    disc(r, x + rad,         y + h - rad,     rad, c);
-    disc(r, x + w - rad,     y + h - rad,     rad, c);
+    ir  = (int)rad;
+    /* one full-width band across the middle plus two inset bands top and
+     * bottom; the corner squares are left to the four quarter sectors, so
+     * every pixel of the shape is painted exactly once */
+    fill(r, x, y + ir, w, h - 2 * ir, c.r, c.g, c.b, c.a);
+    fill(r, x + ir, y, w - 2 * ir, ir, c.r, c.g, c.b, c.a);
+    fill(r, x + ir, y + h - ir, w - 2 * ir, ir, c.r, c.g, c.b, c.a);
+    arc_fan(r, (float)(x + ir),     (float)(y + ir),     rad,
+            (float)M_PI, (float)(1.5 * M_PI), c);
+    arc_fan(r, (float)(x + w - ir), (float)(y + ir),     rad,
+            (float)(1.5 * M_PI), (float)(2 * M_PI), c);
+    arc_fan(r, (float)(x + w - ir), (float)(y + h - ir), rad,
+            0.0f, (float)(M_PI / 2), c);
+    arc_fan(r, (float)(x + ir),     (float)(y + h - ir), rad,
+            (float)(M_PI / 2), (float)M_PI, c);
 }
 
 /* Render a string into a texture (transparent background, light 8x8 pixel
@@ -1616,15 +1669,19 @@ controls:
         ui.badges_dirty = 0;
     }
     {
-        int bx = win_w - 14;
+        /* the chip is the text plus CHIP_PAD either side, and CHIP_GAP keeps
+         * neighbouring chips apart - without it the advance equalled the chip
+         * width exactly and they merged into one slab */
+        enum { CHIP_PAD = 6, CHIP_GAP = 7 };
+        int bx = win_w - 14 + CHIP_GAP;
 
         for (int i = NBADGE - 1; i >= 0; i--) {
             SDL_Rect dst;
 
             if (!ui.badge_tex[i])
                 continue;
-            bx -= ui.badge_w[i] + 12;
-            dst.x = bx + 6;
+            bx -= ui.badge_w[i] + 2 * CHIP_PAD + CHIP_GAP;
+            dst.x = bx + CHIP_PAD;
             dst.y = cy - ui.badge_h[i] / 2;
             dst.w = ui.badge_w[i];
             dst.h = ui.badge_h[i];
@@ -1635,11 +1692,11 @@ controls:
                  * a glance; plain SDR stays a normal grey chip */
                 SDL_Color hdr = { 150, 90, 200, 235 };
 
-                round_rect(renderer, bx, cy - 11, ui.badge_w[i] + 12, 22, 6.f, hdr);
+                round_rect(renderer, bx, cy - 11, ui.badge_w[i] + 2 * CHIP_PAD, 22, 6.f, hdr);
             } else {
                 SDL_Color chip = { 255, 255, 255, 46 };
 
-                round_rect(renderer, bx, cy - 11, ui.badge_w[i] + 12, 22, 6.f, chip);
+                round_rect(renderer, bx, cy - 11, ui.badge_w[i] + 2 * CHIP_PAD, 22, 6.f, chip);
             }
             SDL_RenderCopy(renderer, ui.badge_tex[i], NULL, &dst);
         }
