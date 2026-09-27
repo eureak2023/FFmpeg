@@ -50,6 +50,10 @@
  * frames (~11 s) or ~85 4K frames (~3 s). */
 #define LADA_MAX_BUFFER_BYTES (2ull * 1024 * 1024 * 1024)
 
+/* Kernel buffer for the pipe the restored frames arrive on - see CreatePipe()
+ * in lada_start(). Five 1080p frames' worth. */
+#define LADA_PIPE_BYTES (32u * 1024 * 1024)
+
 /* Restoration starts a few seconds AHEAD of the current playback position, because the
  * sidecar takes a moment to emit its first restored frame (decode + detect + fill the
  * first clip). By opening ahead, the upcoming segment is already restored by the time
@@ -93,6 +97,16 @@
  * in "BUFFER", we disengage and play the originals - degrade, never stall. */
 #define LADA_BUFFER_STALL_MS 10000
 
+/* How much restored video must be buffered ahead before playback resumes
+ * from a pause-to-buffer. In seconds - see lada_should_buffer(). */
+#define LADA_RESUME_SEC 1.5
+
+/* How long the restored buffer has to stay empty before the gate pauses
+ * playback. A momentary dip to zero is normal - frames arrive out of pts
+ * order and the head start is short - and pausing on it does more harm
+ * than the missing frames would. See lada_should_buffer(). */
+#define LADA_DRAIN_GRACE_MS 300
+
 typedef struct LadaFrame {
     uint32_t gen;
     double   pts;
@@ -127,6 +141,9 @@ static struct {
     char       model[32];    /* detection model it picked, from READY      */
     int        opened;       /* OPEN already sent                          */
     double     last_pts;     /* previous requested pts (seek detection)    */
+    double     frame_dur;    /* displayed frame duration, from lada_frame_for;
+                              * lets the buffer gate size its cushion in seconds
+                              * instead of frames (30 vs 60 fps sources)     */
 
     char       path[4096];   /* UTF-8 input path                           */
 
@@ -135,6 +152,8 @@ static struct {
     int        announced;    /* "LADA ACTIVE" already toasted this enable session */
     int        buffering;    /* pause-to-buffer state (hysteresis for lada_should_buffer) */
     Uint32     buffer_since; /* when the current buffer-pause last grew (stall watchdog) */
+    Uint32     empty_since;  /* when the buffer first ran dry, 0 while it has frames;
+                              * the gate only pauses once it stays dry (see above)   */
     int        buffer_best;  /* deepest `ahead` seen during the current buffer-pause     */
     int        warmed;       /* restoration for the current generation has started arriving
                              * (or been applied) since the last OPEN/SEEK; gates pause-to-
@@ -324,12 +343,21 @@ static int reader_thread(void *arg)
 }
 
 /* FIFO helpers; caller holds L.mtx. */
-static LadaFrame *fifo_pop(void)
+
+/* Unlink one frame from anywhere in the FIFO. prev is the node before it, or
+ * NULL when it is the head. There is no pop-the-front helper because restored
+ * frames do not arrive in pts order, so neither the frame we want nor the ones
+ * we discard are necessarily at the front - see lada_frame_for(). */
+static LadaFrame *fifo_unlink(LadaFrame *prev, LadaFrame *f)
 {
-    LadaFrame *f = L.head;
-    if (!f) return NULL;
-    L.head = f->next;
-    if (!L.head) L.tail = NULL;
+    if (!f)
+        return NULL;
+    if (prev)
+        prev->next = f->next;
+    else
+        L.head = f->next;
+    if (L.tail == f)
+        L.tail = prev;
     L.count--;
     L.bytes -= f->len;
     SDL_CondSignal(L.space);
@@ -619,8 +647,19 @@ int lada_start(const char *input_path, const char *lada_home, const char *device
     sa.lpSecurityDescriptor = NULL;
 
     /* Child stdout -> our read handle; child stdin <- our write handle. Only the
-     * child ends are inheritable; keep our ends private so the pipes close cleanly. */
-    if (!CreatePipe(&child_stdout_rd, &child_stdout_wr, &sa, 0) ||
+     * child ends are inheritable; keep our ends private so the pipes close cleanly.
+     *
+     * The frame pipe gets an explicit, large buffer. A restored 1080p frame is
+     * 6.2 MB of raw RGB, so a 60 fps source pushes 373 MB/s through it; with
+     * CreatePipe's default buffer (4 KB) each frame crosses in ~1500 blocking
+     * chunks - about 90,000 handovers a second, both processes waking for every
+     * one. That overhead is what made 60 fps playback stutter while the restorer
+     * itself had throughput to spare. A few frames' worth of buffer lets the
+     * sidecar write a whole frame without stalling and the reader take it in a
+     * handful of ReadFiles. The size is only a hint: the kernel allocates it
+     * lazily and CreatePipe falls back to its default if it cannot honour it.
+     * The command pipe stays small - it carries one short line at a time. */
+    if (!CreatePipe(&child_stdout_rd, &child_stdout_wr, &sa, LADA_PIPE_BYTES) ||
         !CreatePipe(&child_stdin_rd,  &child_stdin_wr,  &sa, 0)) {
         av_log(NULL, AV_LOG_WARNING, "lada: CreatePipe failed\n");
         goto fail;
@@ -814,8 +853,9 @@ void lada_notify_seek(void)
     if (!L.running)
         return;
     SDL_LockMutex(L.mtx);
-    L.warmed    = 0;
-    L.buffering = 0;
+    L.warmed      = 0;
+    L.buffering   = 0;
+    L.empty_since = 0;
     SDL_UnlockMutex(L.mtx);
 }
 
@@ -864,11 +904,17 @@ int lada_should_buffer(double display_pts)
     for (f = L.head; f; f = f->next)
         if (f->gen == L.gen && f->pts >= display_pts - 0.05)
             ahead++;
-    cap  = L.max_count > 0 ? L.max_count : 60;
-    high = 45;                       /* resume once ~1.5 s (@30fps) is buffered ahead;
-                                      * a fixed count, since the byte-budget cap can be
-                                      * hundreds of frames (a fraction of which would be a
-                                      * many-second pause). Override with LADA_RESUME_FRAMES. */
+    cap = L.max_count > 0 ? L.max_count : 60;
+    /* Resume once about LADA_RESUME_SEC of restored video is buffered ahead.
+     *
+     * Measured in seconds rather than frames. It used to be a flat 45 frames,
+     * which the comment called "~1.5 s" - true at 30 fps, but only 0.75 s at
+     * 60, so a high-frame-rate source resumed on half the intended cushion and
+     * drained straight back into another pause. A fraction of the byte-budget
+     * cap is no good either: that cap is hundreds of frames, and waiting for a
+     * fraction of it would be a many-second freeze. Override with
+     * LADA_RESUME_FRAMES. */
+    high = L.frame_dur > 0.0 ? (int)(LADA_RESUME_SEC / L.frame_dur + 0.5) : 45;
     {
         const char *e = getenv("LADA_RESUME_FRAMES");
         if (e && atoi(e) > 0) high = atoi(e);
@@ -891,11 +937,34 @@ int lada_should_buffer(double display_pts)
                    "lada: no restored frames for %d s while buffering at %.2f - "
                    "resuming on the original video\n", LADA_BUFFER_STALL_MS / 1000, display_pts);
         }
+    } else if (ahead > 0) {
+        L.empty_since = 0;                    /* buffer has something - not draining */
     } else {
-        if (ahead <= 0) {                     /* drained -> pause (still on held frame) */
+        /* Drained. Wait for it to STAY drained before pausing.
+         *
+         * Pausing on the first empty sample made 60 fps playback judder badly.
+         * Restored frames arrive out of pts order (see lada_frame_for) and the
+         * head start is only a couple of seconds, so `ahead` dips to zero for a
+         * moment quite normally - the restorer is not actually behind. Each of
+         * those dips used to stop and restart playback, and every stop/start
+         * nudged the clocks: the position then jumped, the jump looked like a
+         * seek, the seek flushed the buffer, and that emptied it for real. With
+         * the gate off entirely the same clip ran clean - no jumps, no stalls -
+         * which is what pinned the fault here rather than on the restorer, whose
+         * measured throughput at this spot is 174 fps against the 60 needed.
+         *
+         * Showing the original for a few frames is a far smaller blemish than
+         * freezing the picture, so only a shortfall that persists is worth a
+         * pause. */
+        Uint32 now = SDL_GetTicks();
+
+        if (!L.empty_since)
+            L.empty_since = now ? now : 1;
+        else if ((int)(now - L.empty_since) >= LADA_DRAIN_GRACE_MS) {
             L.buffering    = 1;
             L.buffer_best  = ahead;
-            L.buffer_since = SDL_GetTicks();
+            L.buffer_since = now;
+            L.empty_since  = 0;
         }
     }
     ahead = L.buffering;
@@ -918,6 +987,8 @@ int lada_frame_for(double pts_sec, double dur_sec, const uint8_t **rgb, int *w, 
     if (fwd < 0.5) fwd = 0.5;
 
     SDL_LockMutex(L.mtx);
+    if (dur_sec > 0.0)
+        L.frame_dur = dur_sec;
 
     if (!L.opened) {
         char cmd[4160];
@@ -1006,15 +1077,48 @@ int lada_frame_for(double pts_sec, double dur_sec, const uint8_t **rgb, int *w, 
     }
     lada_frame_free(L.held); L.held = NULL;
 
-    /* Drop pre-seek leftovers and frames that fell behind the display. */
-    while ((f = L.head)) {
-        if (f->gen != L.gen)          { lada_frame_free(fifo_pop()); continue; }
-        if (f->pts < pts_sec - tol)   { lada_frame_free(fifo_pop()); continue; }
-        break;
+    /* Restored frames do NOT arrive in pts order.
+     *
+     * Measured by driving the sidecar directly on a 59.94 fps source: it emits
+     * every frame, at the right average spacing, but shuffled in threes -
+     * n+1, n+2, n, n+4, n+5, n+3, ... Reading only the head and discarding
+     * anything behind it therefore threw away the third frame of each group
+     * just before the display reached it, and that frame's turn then found the
+     * next group's head sitting one frame AHEAD and outside the tolerance. The
+     * result was a restored/original alternation - the mosaic area flickering
+     * - while the queue was 50-odd frames deep the whole time.
+     *
+     * So: sweep the whole queue rather than the front of it. Drop the stale
+     * wherever it sits, then take the closest match anywhere in what is left.
+     */
+    {
+        LadaFrame *prev = NULL, *next;
+
+        for (f = L.head; f; f = next) {
+            next = f->next;
+            if (f->gen != L.gen || f->pts < pts_sec - tol) {
+                lada_frame_free(fifo_unlink(prev, f));
+                continue;
+            }
+            prev = f;
+        }
     }
 
-    if (f && f->gen == L.gen && fabs(f->pts - pts_sec) <= tol) {
-        L.held = fifo_pop();
+    {
+        LadaFrame *best = NULL, *best_prev = NULL, *prev = NULL;
+
+        for (f = L.head; f; prev = f, f = f->next)
+            if (f->gen == L.gen && fabs(f->pts - pts_sec) <= tol &&
+                (!best || fabs(f->pts - pts_sec) < fabs(best->pts - pts_sec))) {
+                best      = f;
+                best_prev = prev;
+            }
+        f = best;
+        if (f)
+            L.held = fifo_unlink(best_prev, f);
+    }
+
+    if (f) {
         *rgb = L.held->rgb; *w = L.held->w; *h = L.held->h;
         L.warmed = 1;         /* restoration is applied at this position - arm the buffer gate */
         if (!dbg_applying) {
