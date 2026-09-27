@@ -43,6 +43,13 @@
 #include "ffplay_thumb.h"
 #include "ffplay_res.h"
 
+/* One accent colour for everything that means "this is the playing/active
+ * part": the seek fill, the volume fill, the hardware-decode badge and the
+ * hovered icon. Kept in one place so they cannot drift apart. */
+#define ACCENT_R       250
+#define ACCENT_G       200
+#define ACCENT_B        40
+
 #define BAR_H          48       /* control bar height, px */
 #define SEEK_H         28       /* seek row height used for layout, px */
 #define SEEK_HIT_H     46       /* how far the seek/volume hit area reaches up
@@ -121,6 +128,7 @@ static struct {
 
     SDL_Texture *text_tex; /* rendered time string */
     int          text_w, text_h;
+    int          text_scale;  /* 1 for the system font, 2 for the pixel fallback */
     char         text_str[64];
 
     /* seek-bar hover thumbnail preview */
@@ -1164,6 +1172,76 @@ static void tri(SDL_Renderer *r, float x1, float y1, float x2, float y2,
     SDL_RenderGeometry(r, NULL, v, 3, NULL, 0);
 }
 
+/* Filled circle, as a triangle fan. SDL has no circle primitive and the
+ * row-by-row rectangle version has visibly stepped edges at the sizes used
+ * here (slider knobs, hover haloes), which is exactly the blocky look this
+ * overlay is trying not to have. RenderGeometry interpolates along the edge
+ * instead, so the rim blends against the video. */
+static void disc(SDL_Renderer *r, float cx, float cy, float rad, SDL_Color c)
+{
+    enum { SEG = 28 };
+    SDL_Vertex v[SEG + 1];
+    int idx[SEG * 3];
+
+    v[0].position.x = cx;
+    v[0].position.y = cy;
+    v[0].color      = c;
+    v[0].tex_coord.x = v[0].tex_coord.y = 0;
+    for (int i = 0; i < SEG; i++) {
+        float a = (float)(i * 2.0 * M_PI / SEG);
+
+        v[i + 1].position.x = cx + rad * cosf(a);
+        v[i + 1].position.y = cy + rad * sinf(a);
+        v[i + 1].color      = c;
+        v[i + 1].tex_coord.x = v[i + 1].tex_coord.y = 0;
+        idx[i * 3 + 0] = 0;
+        idx[i * 3 + 1] = i + 1;
+        idx[i * 3 + 2] = (i + 1) % SEG + 1;
+    }
+    SDL_RenderGeometry(r, NULL, v, SEG + 1, idx, SEG * 3);
+}
+
+/* Rounded bar: a rectangle with semicircular ends. Everything bar-shaped in
+ * the overlay - the seek and volume tracks, the played fill, the pause blades,
+ * the badge backgrounds - is drawn with this rather than a hard rectangle. */
+static void pill(SDL_Renderer *r, int x, int y, int w, int h, SDL_Color c)
+{
+    float rad;
+
+    if (w <= 0 || h <= 0)
+        return;
+    if (w >= h) {                      /* lying down: round the left/right ends */
+        rad = h / 2.0f;
+        if (w > h)
+            fill(r, x + (int)rad, y, w - 2 * (int)rad, h, c.r, c.g, c.b, c.a);
+        disc(r, x + rad,     y + rad, rad, c);
+        disc(r, x + w - rad, y + rad, rad, c);
+    } else {                           /* standing up: round top/bottom instead */
+        rad = w / 2.0f;
+        fill(r, x, y + (int)rad, w, h - 2 * (int)rad, c.r, c.g, c.b, c.a);
+        disc(r, x + rad, y + rad,     rad, c);
+        disc(r, x + rad, y + h - rad, rad, c);
+    }
+}
+
+/* Rounded rectangle with a corner radius of its own (not a full pill), for
+ * the stop icon and anything squarer than a bar. */
+static void round_rect(SDL_Renderer *r, int x, int y, int w, int h, float rad,
+                       SDL_Color c)
+{
+    if (w <= 0 || h <= 0)
+        return;
+    rad = FFMIN(rad, FFMIN(w, h) / 2.0f);
+    fill(r, x + (int)rad, y, w - (int)(2 * rad), h, c.r, c.g, c.b, c.a);
+    fill(r, x, y + (int)rad, (int)rad, h - (int)(2 * rad), c.r, c.g, c.b, c.a);
+    fill(r, x + w - (int)rad, y + (int)rad, (int)rad, h - (int)(2 * rad),
+         c.r, c.g, c.b, c.a);
+    disc(r, x + rad,         y + rad,         rad, c);
+    disc(r, x + w - rad,     y + rad,         rad, c);
+    disc(r, x + rad,         y + h - rad,     rad, c);
+    disc(r, x + w - rad,     y + h - rad,     rad, c);
+}
+
 /* Render a string into a texture (transparent background, light 8x8 pixel
  * font). Returns NULL on failure. */
 static SDL_Texture *render_text(SDL_Renderer *r, const char *str,
@@ -1204,22 +1282,33 @@ static SDL_Texture *render_text(SDL_Renderer *r, const char *str,
     return tex;
 }
 
-/* Cached time-string texture, rebuilt only when the text changes. */
+/* Cached time-string texture, rebuilt only when the text changes.
+ *
+ * The system font, not the built-in 8x8 pixel one. The timecode changes every
+ * second and sits right in the middle of the bar, so it sets the tone for the
+ * whole overlay - drawn with the pixel font at double size it was the single
+ * most dated thing on screen. The pixel font stays as the fallback for a box
+ * with no usable system font. */
 static void text_update(SDL_Renderer *r, const char *str)
 {
     if (!strcmp(str, ui.text_str) && ui.text_tex)
         return;
     if (ui.text_tex)
         SDL_DestroyTexture(ui.text_tex);
-    ui.text_tex = render_text(r, str, &ui.text_w, &ui.text_h);
+    ui.text_scale = 1;
+    ui.text_tex = render_text_sys(r, str, 17, &ui.text_w, &ui.text_h, 0, NULL);
+    if (!ui.text_tex) {
+        ui.text_scale = 2;
+        ui.text_tex = render_text(r, str, &ui.text_w, &ui.text_h);
+    }
     if (ui.text_tex)
         snprintf(ui.text_str, sizeof(ui.text_str), "%s", str);
 }
 
 static SDL_Color icon_color(int el)
 {
-    SDL_Color on  = { 250, 200,  40, 255 }; /* hovered: PotPlayer yellow */
-    SDL_Color off = { 225, 225, 225, 255 };
+    SDL_Color on  = { ACCENT_R, ACCENT_G, ACCENT_B, 255 };
+    SDL_Color off = { 235, 235, 235, 230 };
 
     return ui.hover == el ? on : off;
 }
@@ -1339,73 +1428,101 @@ void ui_draw(SDL_Renderer *renderer, int win_w, int win_h,
      * the buttons/timecode need contrast. */
     fill_vgrad(renderer, 0, seek_top, win_w, SEEK_H + BAR_H, 14, 14, 14, 0, 220);
 
-    /* seek track, chapter markers, played fill, handle */
-    fill(renderer, SEEK_PAD, track_y - 2, track_w, 4, 85, 85, 85, 255);
-    fill(renderer, SEEK_PAD, track_y - 2, fill_w, 4, 250, 200, 40, 255);
-    for (int i = 0; i < ui.nb_chapters; i++) {
-        int cx = SEEK_PAD + (int)lrint(ui.chapters[i] * track_w);
+    /* seek track, chapter markers, played fill, handle.
+     *
+     * Rounded ends and a round knob, and the knob only grows when the track is
+     * hovered or being dragged - a slider that is a quiet hairline until you
+     * reach for it, rather than a permanent chunky block. */
+    {
+        int      act = ui.hover == EL_SEEK || ui.dragging;
+        int      th  = act ? 6 : 4;                  /* track thickness */
+        SDL_Color trk = { 255, 255, 255, 60 };
+        SDL_Color acc = { ACCENT_R, ACCENT_G, ACCENT_B, 255 };
+        SDL_Color knob = { 255, 255, 255, 255 };
+        SDL_Color chap = { 255, 255, 255, 120 };
 
-        fill(renderer, cx - 2, track_y - 6, 5, 13, 235, 235, 235, 255);
+        pill(renderer, SEEK_PAD, track_y - th / 2, track_w, th, trk);
+        pill(renderer, SEEK_PAD, track_y - th / 2, fill_w, th, acc);
+        /* chapter marks: short ticks sitting in the track, not blocks over it */
+        for (int i = 0; i < ui.nb_chapters; i++) {
+            int cx = SEEK_PAD + (int)lrint(ui.chapters[i] * track_w);
+
+            fill(renderer, cx, track_y - th / 2, 2, th,
+                 chap.r, chap.g, chap.b, chap.a);
+        }
+        disc(renderer, SEEK_PAD + fill_w, (float)track_y, act ? 8.f : 6.f, knob);
     }
-    fill(renderer, SEEK_PAD + fill_w - 5, track_y - 9, 11, 18,
-         ui.hover == EL_SEEK || ui.dragging ? 250 : 235,
-         ui.hover == EL_SEEK || ui.dragging ? 200 : 235,
-         ui.hover == EL_SEEK || ui.dragging ?  40 : 235, 255);
 
     /* volume: speaker icon + slider at the right end of the seek row */
     {
         int vx = win_w - VOL_TRACK - 12;   /* track left edge */
         int sx = vx - 24;                  /* speaker icon */
         int vw = (int)lrint(volume * VOL_TRACK);
+        int act = ui.hover == EL_VOL || ui.vol_dragging;
+        SDL_Color trk = { 255, 255, 255, 60 };
+        SDL_Color acc = { ACCENT_R, ACCENT_G, ACCENT_B, 255 };
+        SDL_Color knob = { 255, 255, 255, 255 };
 
         c = icon_color(EL_VOL);
-        fill(renderer, sx, track_y - 3, 4, 7, c.r, c.g, c.b, 255);
+        pill(renderer, sx, track_y - 3, 5, 7, c);
         tri(renderer, sx + 4.f, (float)track_y,
                       sx + 12.f, track_y - 8.f,
                       sx + 12.f, track_y + 8.f, c);
-        fill(renderer, vx, track_y - 1, VOL_TRACK, 3, 85, 85, 85, 255);
-        fill(renderer, vx, track_y - 1, vw, 3, 250, 200, 40, 255);
-        fill(renderer, vx + vw - 3, track_y - 5, 7, 11,
-             ui.hover == EL_VOL || ui.vol_dragging ? 250 : 235,
-             ui.hover == EL_VOL || ui.vol_dragging ? 200 : 235,
-             ui.hover == EL_VOL || ui.vol_dragging ?  40 : 235, 255);
+        pill(renderer, vx, track_y - 2, VOL_TRACK, 4, trk);
+        pill(renderer, vx, track_y - 2, vw, 4, acc);
+        disc(renderer, (float)(vx + vw), (float)track_y, act ? 7.f : 5.5f, knob);
     }
 
-    /* pause / play */
-    c = icon_color(EL_PAUSE);
-    if (paused)
-        tri(renderer, BTN_W / 2 - 7.f, cy - 9.f,
-                      BTN_W / 2 - 7.f, cy + 9.f,
-                      BTN_W / 2 + 9.f, (float)cy, c);
-    else {
-        fill(renderer, BTN_W / 2 - 8, cy - 9, 6, 18, c.r, c.g, c.b, 255);
-        fill(renderer, BTN_W / 2 + 2, cy - 9, 6, 18, c.r, c.g, c.b, 255);
+    /* transport buttons.
+     *
+     * Each sits on a soft round highlight that only appears under the cursor,
+     * which is what makes them read as buttons without drawing a frame around
+     * every one of them. The glyphs themselves are pills and triangles rather
+     * than bare rectangles, so nothing has a hard 90-degree corner. */
+    for (int b = 0; b < 5; b++) {
+        static const int els[5] = { EL_PAUSE, EL_STOP, EL_BACK, EL_FWD, EL_OPEN };
+        int bcx = b * BTN_W + BTN_W / 2;
+
+        if (ui.hover == els[b]) {
+            SDL_Color halo = { 255, 255, 255, 28 };
+
+            disc(renderer, (float)bcx, (float)cy, 18.f, halo);
+        }
+        c = icon_color(els[b]);
+        switch (els[b]) {
+        case EL_PAUSE:
+            if (paused)
+                tri(renderer, bcx - 6.f, cy - 9.f,
+                              bcx - 6.f, cy + 9.f,
+                              bcx + 9.f, (float)cy, c);
+            else {
+                pill(renderer, bcx - 7, cy - 9, 5, 18, c);
+                pill(renderer, bcx + 2, cy - 9, 5, 18, c);
+            }
+            break;
+        case EL_STOP:
+            round_rect(renderer, bcx - 8, cy - 8, 16, 16, 3.5f, c);
+            break;
+        case EL_BACK:
+            pill(renderer, bcx - 9, cy - 8, 3, 16, c);
+            tri(renderer, bcx + 9.f, cy - 8.f,
+                          bcx + 9.f, cy + 8.f,
+                          bcx - 4.f, (float)cy, c);
+            break;
+        case EL_FWD:
+            tri(renderer, bcx - 9.f, cy - 8.f,
+                          bcx - 9.f, cy + 8.f,
+                          bcx + 4.f, (float)cy, c);
+            pill(renderer, bcx + 6, cy - 8, 3, 16, c);
+            break;
+        case EL_OPEN:
+            tri(renderer, bcx - 9.f, cy + 2.f,
+                          bcx + 9.f, cy + 2.f,
+                          (float)bcx, cy - 9.f, c);
+            pill(renderer, bcx - 9, cy + 6, 19, 3, c);
+            break;
+        }
     }
-
-    /* stop */
-    c = icon_color(EL_STOP);
-    fill(renderer, BTN_W + BTN_W / 2 - 8, cy - 8, 16, 16, c.r, c.g, c.b, 255);
-
-    /* back: |< */
-    c = icon_color(EL_BACK);
-    fill(renderer, 2 * BTN_W + BTN_W / 2 - 9, cy - 8, 3, 16, c.r, c.g, c.b, 255);
-    tri(renderer, 2 * BTN_W + BTN_W / 2 + 9.f, cy - 8.f,
-                  2 * BTN_W + BTN_W / 2 + 9.f, cy + 8.f,
-                  2 * BTN_W + BTN_W / 2 - 4.f, (float)cy, c);
-
-    /* forward: >| */
-    c = icon_color(EL_FWD);
-    tri(renderer, 3 * BTN_W + BTN_W / 2 - 9.f, cy - 8.f,
-                  3 * BTN_W + BTN_W / 2 - 9.f, cy + 8.f,
-                  3 * BTN_W + BTN_W / 2 + 4.f, (float)cy, c);
-    fill(renderer, 3 * BTN_W + BTN_W / 2 + 6, cy - 8, 3, 16, c.r, c.g, c.b, 255);
-
-    /* open file: eject-style triangle over a bar */
-    c = icon_color(EL_OPEN);
-    tri(renderer, 4 * BTN_W + BTN_W / 2 - 9.f, cy + 2.f,
-                  4 * BTN_W + BTN_W / 2 + 9.f, cy + 2.f,
-                  4 * BTN_W + BTN_W / 2, cy - 9.f, c);
-    fill(renderer, 4 * BTN_W + BTN_W / 2 - 9, cy + 6, 19, 3, c.r, c.g, c.b, 255);
 
     /* ---- title bar; in fullscreen it appears only while the cursor sits
      * in the top zone and hides as soon as it moves away */
@@ -1466,7 +1583,7 @@ void ui_draw(SDL_Renderer *renderer, int win_w, int win_h,
 
 controls:
     /* separator + time text "cur / total" */
-    fill(renderer, 5 * BTN_W + 6, bar_top + 10, 1, BAR_H - 20, 70, 70, 70, 255);
+    fill(renderer, 5 * BTN_W + 6, bar_top + 14, 1, BAR_H - 28, 255, 255, 255, 40);
     {
         int ps = pos < 0 || isnan(pos) ? 0 : (int)pos;
         int ts = dur < 0 ? 0 : (int)dur;
@@ -1477,8 +1594,9 @@ controls:
     }
     text_update(renderer, buf);
     if (ui.text_tex) {
-        SDL_Rect dst = { 5 * BTN_W + 18, cy - ui.text_h,
-                         ui.text_w * 2, ui.text_h * 2 };
+        int s = ui.text_scale;
+        SDL_Rect dst = { 5 * BTN_W + 18, cy - ui.text_h * s / 2,
+                         ui.text_w * s, ui.text_h * s };
 
         SDL_RenderCopy(renderer, ui.text_tex, NULL, &dst);
     }
@@ -1510,16 +1628,19 @@ controls:
             dst.y = cy - ui.badge_h[i] / 2;
             dst.w = ui.badge_w[i];
             dst.h = ui.badge_h[i];
-            if (i == BADGE_HW) /* hardware decode: PotPlayer yellow */
-                SDL_SetTextureColorMod(ui.badge_tex[i], 250, 200, 40);
-            else if (i == BADGE_HDR && strcmp(ui.badge_str[i], "SDR"))
+            if (i == BADGE_HW) { /* hardware decode: accent, no chip behind it */
+                SDL_SetTextureColorMod(ui.badge_tex[i], ACCENT_R, ACCENT_G, ACCENT_B);
+            } else if (i == BADGE_HDR && strcmp(ui.badge_str[i], "SDR")) {
                 /* an actual HDR flavour (HDR10/HLG/DV) is worth spotting at
-                 * a glance; plain SDR stays a normal grey badge */
-                fill(renderer, bx, cy - 11, ui.badge_w[i] + 12, 22,
-                     150, 90, 200, 255);
-            else
-                fill(renderer, bx, cy - 11, ui.badge_w[i] + 12, 22,
-                     45, 45, 45, 255);
+                 * a glance; plain SDR stays a normal grey chip */
+                SDL_Color hdr = { 150, 90, 200, 235 };
+
+                round_rect(renderer, bx, cy - 11, ui.badge_w[i] + 12, 22, 6.f, hdr);
+            } else {
+                SDL_Color chip = { 255, 255, 255, 46 };
+
+                round_rect(renderer, bx, cy - 11, ui.badge_w[i] + 12, 22, 6.f, chip);
+            }
             SDL_RenderCopy(renderer, ui.badge_tex[i], NULL, &dst);
         }
     }
