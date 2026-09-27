@@ -1950,6 +1950,25 @@ static int hwgl_ensure_size(int w, int h)
     tdesc.Height           = oh;
     tdesc.MipLevels        = 1;
     tdesc.ArraySize        = 1;
+    /* 8-bit BGRA, and staying that way is a measured decision rather than an
+     * oversight. DXGI_FORMAT_R10G10B10A2_UNORM works everywhere it has to:
+     * CheckVideoProcessorFormat reports output support, VideoProcessorBlt
+     * fills it, and a CPU readback of the result matched the 8-bit path to
+     * within the two extra bits (R 765/1023 where BGRA read 191/255). It buys
+     * nothing, though - against a 10-bit HEVC gradient upscaled 640x360 ->
+     * 1600x900 the captured screen row came out identical either way: 31
+     * distinct levels, 84 steps, longest flat run 51. Nothing on the path
+     * dithers, so the extra bits round back to the same 8-bit level at the
+     * framebuffer, and the framebuffer is where the chain ends whatever the
+     * desktop's output colour depth is set to.
+     *
+     * It is also not a one-line change, which is worth knowing before anyone
+     * tries it again: nr_gl_setup's textures below are B8G8R8A8 as well, and
+     * R10G10B10A2 is a different format family, so the CopyResource feeding
+     * the model would be an invalid cross-family copy - which D3D11 drops
+     * without complaint. The model input and the "original" it composes
+     * against stay black, the whole picture goes black, and every call on the
+     * path still returns S_OK. fg.cuda_tex has the same coupling. */
     tdesc.Format           = DXGI_FORMAT_B8G8R8A8_UNORM;
     tdesc.SampleDesc.Count = 1;
     tdesc.Usage            = D3D11_USAGE_DEFAULT;
