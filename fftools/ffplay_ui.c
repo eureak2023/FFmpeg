@@ -669,7 +669,7 @@ static LRESULT CALLBACK menu_wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
 
 int ui_context_menu(int fsr_on, int nr_on, int fg_on, int lada_on, int jasna_on,
                     int fg_mult, int dlss_on,
-                    int stereo_on, int scale_mode, int sub_on,
+                    int aout_mode, int scale_mode, int sub_on,
                     const UIAudioTracks *atracks,
                     void (*on_idle)(void *), void *idle_ctx)
 {
@@ -720,10 +720,13 @@ int ui_context_menu(int fsr_on, int nr_on, int fg_on, int lada_on, int jasna_on,
         AppendMenuW(fx, MF_SEPARATOR, 0, NULL);
         AppendMenuW(fx, MF_POPUP, (UINT_PTR)sc, L"화면 비율(&R)");
         AppendMenuW(menu, MF_POPUP, (UINT_PTR)fx, L"영상 효과(&E)");
-        AppendMenuW(ao, MF_STRING | (!stereo_on ? MF_CHECKED : 0),
+        /* aout_mode: 0 source, 1 stereo downmix, 2 surround upmix */
+        AppendMenuW(ao, MF_STRING | (aout_mode == 0 ? MF_CHECKED : 0),
                     UI_MENU_AOUT_ORIG, L"원본 그대로 출력");
-        AppendMenuW(ao, MF_STRING | (stereo_on ? MF_CHECKED : 0),
+        AppendMenuW(ao, MF_STRING | (aout_mode == 1 ? MF_CHECKED : 0),
                     UI_MENU_AOUT_STEREO, L"2.0 스테레오");
+        AppendMenuW(ao, MF_STRING | (aout_mode == 2 ? MF_CHECKED : 0),
+                    UI_MENU_AOUT_SURROUND, L"서라운드 업믹스 (2.0 소스)");
         /* Only worth showing when the file actually has something to choose
          * between; a single-track file gets the plain 소리 출력 menu. */
         if (atracks && atracks->nb > 1 && (at = CreatePopupMenu())) {
