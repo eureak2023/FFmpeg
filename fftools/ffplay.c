@@ -3300,6 +3300,84 @@ fail:
     return ret;
 }
 
+
+/* Write a pan description that mirrors the surround pair the source has into
+ * the one it does not, or leave `out` empty when there is nothing to mirror.
+ *
+ * This exists because of a hole in how channels are matched: a conversion
+ * leaves an output channel silent when the input has nothing to put in it, and
+ * the back and side surround pairs do not count as each other. Shared-mode
+ * WASAPI makes the endpoint's own mix format the only format an application
+ * can write, so a Windows device configured for 7.1 takes eight channels
+ * whatever the file holds - and a 5.1 film then plays with the side pair stone
+ * dead. The matrix says so outright, its SL and SR rows come back all zeroes.
+ * Letting SDL convert instead of the filter graph changes nothing; its own
+ * 5.1 -> 7.1 upmix writes the same two columns of silence (measured).
+ *
+ * The copy goes in at full level rather than the -3 dB that would hold total
+ * power constant. The case this exists for is a 5.1 rig on a 7.1-configured
+ * endpoint, where only one of the two pairs is actually connected and
+ * attenuating would just make the surrounds quiet; a real 7.1 rig gets the 5.1
+ * surround out of two speakers per side instead of one, which is what a
+ * receiver does with the same material anyway.
+ *
+ * Deliberately narrow: it bows out unless the output keeps every input channel
+ * and the only gap is that one substitution, so the downmix paths - 5.1 to
+ * stereo above all - are never touched. */
+static void audio_surround_pan(char *out, size_t size,
+                               const AVChannelLayout *in,
+                               const AVChannelLayout *tgt)
+{
+    static const enum AVChannel sub[][2] = {
+        { AV_CHAN_SIDE_LEFT,  AV_CHAN_BACK_LEFT  },
+        { AV_CHAN_SIDE_RIGHT, AV_CHAN_BACK_RIGHT },
+        { AV_CHAN_BACK_LEFT,  AV_CHAN_SIDE_LEFT  },
+        { AV_CHAN_BACK_RIGHT, AV_CHAN_SIDE_RIGHT },
+    };
+    char name[32], layout[64];
+    int mirrored = 0, n;
+
+    *out = 0;
+    if (in->nb_channels >= tgt->nb_channels || tgt->nb_channels > 16)
+        return;
+    for (int i = 0; i < in->nb_channels; i++) {
+        enum AVChannel id = av_channel_layout_channel_from_index(in, i);
+
+        if (id == AV_CHAN_NONE ||
+            av_channel_layout_index_from_channel(tgt, id) < 0)
+            return;             /* a channel would be dropped: not our case */
+    }
+    if (av_channel_layout_describe(tgt, layout, sizeof(layout)) < 0)
+        return;
+
+    n = snprintf(out, size, "pan=%s", layout);
+    for (int o = 0; o < tgt->nb_channels && n > 0 && n < (int)size; o++) {
+        enum AVChannel id = av_channel_layout_channel_from_index(tgt, o);
+        enum AVChannel src = id;
+
+        if (id == AV_CHAN_NONE)
+            return;
+        if (av_channel_layout_index_from_channel(in, id) < 0) {
+            src = AV_CHAN_NONE;
+            for (int p = 0; p < FF_ARRAY_ELEMS(sub); p++)
+                if (id == sub[p][0] &&
+                    av_channel_layout_index_from_channel(in, sub[p][1]) >= 0) {
+                    src = sub[p][1];
+                    mirrored++;
+                    break;
+                }
+            if (src == AV_CHAN_NONE)
+                continue;       /* pan leaves an unnamed output silent, as now */
+        }
+        av_channel_name(name, sizeof(name), id);
+        n += snprintf(out + n, size - n, "|%s=", name);
+        av_channel_name(name, sizeof(name), src);
+        n += snprintf(out + n, size - n, "%s", name);
+    }
+    if (!mirrored || n <= 0 || n >= (int)size)
+        *out = 0;
+}
+
 static int configure_audio_filters(VideoState *is, const char *afilters, int force_output_format)
 {
     AVFilterContext *filt_asrc = NULL, *filt_asink = NULL;
@@ -3397,11 +3475,26 @@ static int configure_audio_filters(VideoState *is, const char *afilters, int for
         if ((ret = configure_filtergraph(is->agraph, af_stereo, filt_asrc, filt_asink)) < 0)
             goto end;
     } else {
-        char af_all[600];
+        char af_all[800], mirror[256];
 
-        snprintf(af_all, sizeof(af_all), "%s%s" AUDIO_BATCH_FILTER,
+        /* Only meaningful once the sink is pinned to the device layout; before
+         * that the graph still outputs the source's own layout. */
+        audio_surround_pan(mirror, sizeof(mirror), &is->audio_filter_src.ch_layout,
+                           force_output_format ? &is->audio_tgt.ch_layout
+                                               : &is->audio_filter_src.ch_layout);
+        if (*mirror) {
+            /* the graph is rebuilt more than once per file; say this once */
+            static char said[sizeof(mirror)];
+
+            if (strcmp(said, mirror)) {
+                av_strlcpy(said, mirror, sizeof(said));
+                av_log(NULL, AV_LOG_INFO, "Audio: %s\n", mirror);
+            }
+        }
+        snprintf(af_all, sizeof(af_all), "%s%s%s%s" AUDIO_BATCH_FILTER,
                  afilters && *afilters ? afilters : "",
-                 afilters && *afilters ? "," : "");
+                 afilters && *afilters ? "," : "",
+                 mirror, *mirror ? "," : "");
         if ((ret = configure_filtergraph(is->agraph, af_all, filt_asrc, filt_asink)) < 0)
             goto end;
     }
@@ -4096,6 +4189,11 @@ reuse:
             return -1;
         }
     }
+
+    if (spec.channels != wanted_nb_channels)
+        av_log(NULL, AV_LOG_INFO,
+               "Audio: %d-channel source into a %d-channel output device\n",
+               wanted_nb_channels, spec.channels);
 
     audio_hw_params->fmt = AV_SAMPLE_FMT_S16;
     audio_hw_params->freq = spec.freq;
