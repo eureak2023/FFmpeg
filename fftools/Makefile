@@ -70,7 +70,9 @@ fftools/ffplay_rife.o fftools/rife/rife.o fftools/rife/warp.o: \
     CXXFLAGS += -I$(SRC_PATH)/fftools/rife -I$(NCNN_DIR)/include/ncnn -fopenmp
 EXTRALIBS-ffplay += -L$(NCNN_DIR)/lib -lncnn -lglslang -lSPIRV \
     -lMachineIndependent -lGenericCodeGen -lOSDependent \
-    -lglslang-default-resource-limits -fopenmp -lstdc++
+    -lglslang-default-resource-limits \
+    -lSPIRV-Tools-opt -lSPIRV-Tools \
+    -fopenmp -lstdc++
 # DLSS 5 neural rendering (NGX "dlssnr"). The model runs on a private D3D12
 # device; d3d12.dll is loaded at runtime, so only the static GUID archive is
 # linked and the executable's import table is unchanged.
