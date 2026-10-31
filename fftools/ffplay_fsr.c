@@ -2396,6 +2396,22 @@ int fsr_hw_draw(SDL_Renderer *renderer, AVFrame *frame, const SDL_Rect *rect,
 
     SDL_RenderFlush(renderer); /* make sure the renderer's GL context is current */
 
+    /* Opening another file builds a new D3D11 decode device, and every interop
+     * object cached here belongs to the old one. Rebuild against the new
+     * device instead of locking a stale share: that lock fails, and the
+     * failure path switches zero-copy off permanently, which took VSR and
+     * DLSS-NR down with it until the player restarted. */
+    if (hwgl.state == 1 && frame->hw_frames_ctx) {
+        AVHWFramesContext *fctx = (AVHWFramesContext *)frame->hw_frames_ctx->data;
+        AVD3D11VADeviceContext *d3d = fctx->device_ctx->hwctx;
+
+        if (d3d->device != hwgl.device) {
+            av_log(NULL, AV_LOG_INFO,
+                   "FSR: decode device changed, rebuilding the zero-copy path\n");
+            hwgl_destroy();       /* leaves state at 0 so the block below re-inits */
+        }
+    }
+
     if (hwgl.state == 0) {
         if (hwgl_init(frame) < 0) {
             av_log(NULL, AV_LOG_WARNING,
