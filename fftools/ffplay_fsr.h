@@ -189,6 +189,21 @@ int   fsr_vsr_scale(void);
  * Shown top-left for ~1.8s with a fade-out; draw it right before
  * SDL_RenderPresent(). fsr_toast_draw()/fsr_toast_active() return whether
  * the toast is still live (callers use this to force refreshes). */
+/* 360 viewer for dual-fisheye footage (two circles side by side in a 2:1
+ * frame, the raw output of a Samsung Gear 360 and friends). The sphere is
+ * sampled straight from the decoded frame by a shader - nothing is stitched
+ * to an intermediate equirectangular picture. */
+void  fsr_sphere_set(int on);
+int   fsr_sphere_setting(void);
+int   fsr_sphere_active(void);
+int   fsr_sphere_fits(int w, int h);      /* frame looks like dual fisheye */
+void  fsr_sphere_look(float dyaw, float dpitch);  /* radians, relative */
+void  fsr_sphere_zoom(int steps);
+void  fsr_sphere_reset(void);
+float fsr_sphere_fov_deg(void);
+float fsr_sphere_yaw_deg(void);
+float fsr_sphere_pitch_deg(void);
+
 void fsr_toast_show(SDL_Renderer *renderer, const char *text);
 int  fsr_toast_draw(SDL_Renderer *renderer);
 int  fsr_toast_active(void);

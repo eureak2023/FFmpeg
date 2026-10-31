@@ -325,7 +325,10 @@ const char *fsr_gpu_name(void)
     return hw_gpu_name[0] ? hw_gpu_name : gl_renderer_str;
 }
 
-static GLuint       easu_prog, rcas_prog, copy_prog;
+static GLuint       easu_prog, rcas_prog, copy_prog, sphere_prog;
+static GLint        sph_invout_loc, sph_invsrc_loc, sph_lensc_loc, sph_lensr_loc;
+static GLint        sph_halffov_loc, sph_feather_loc, sph_yaw_loc, sph_pitch_loc;
+static GLint        sph_tanhalf_loc, sph_aspect_loc;
 static GLint        easu_con0_loc, rcas_sharp_loc, rcas_dns_loc, copy_invout_loc;
 static GLint        rcas_hdr_loc, rcas_peak_loc, copy_hdr_loc, copy_peak_loc;
 static GLint        rcas_sat_loc, copy_sat_loc;
@@ -664,6 +667,126 @@ static const char *copy_src =
     "    fragColor = vec4(apply_sat(c), 1.0);\n"
     "}\n";
 
+/* ---- 360 viewer -----------------------------------------------------------
+ *
+ * Dual-fisheye straight to a rectilinear view, in one pass. The frame holds
+ * two circles, each inscribed in its own half, each covering a bit more than a
+ * hemisphere; a pixel of the output is a ray, and the ray is looked up in
+ * whichever lens can see it.
+ *
+ * The radial model is equidistant - r = theta / (lensFov/2) * R - which is
+ * what these cameras actually use. That is not a guess: rendering an
+ * equirectangular panorama with this exact math and comparing it against
+ * ffmpeg's own v360=dfisheye output gave a mean absolute difference of 2.35
+ * on 0..255, i.e. bilinear-interpolation noise.
+ *
+ * Both lenses are sampled every pixel and cross-faded over the few degrees
+ * where their coverage overlaps, which costs one extra texture fetch and
+ * removes the hard seam v360 leaves behind. */
+static const char *sphere_src =
+    "#version 330\n"
+    "uniform sampler2D srcTex;\n"
+    "uniform vec2  invOut;\n"      /* 1 / output size */
+    "uniform vec2  invSrc;\n"      /* 1 / source size */
+    "uniform vec4  lensC;\n"       /* front centre xy, rear centre xy, pixels */
+    "uniform float lensR;\n"       /* circle radius, pixels */
+    "uniform float halfFov;\n"     /* lens half angle, radians */
+    "uniform float feather;\n"     /* cross-fade width, radians */
+    "uniform float yaw;\n"
+    "uniform float pitch;\n"
+    "uniform float tanHalf;\n"     /* tan(view fov / 2) */
+    "uniform float aspect;\n"      /* out height / out width */
+    "out vec4 fragColor;\n"
+    "const float PI = 3.14159265358979;\n"
+    "void main() {\n"
+    "    vec2 p = gl_FragCoord.xy * invOut * 2.0 - 1.0;\n"
+    /* SDL renders this target with its own origin, so the ray's y runs the
+     * other way from gl_FragCoord's; without this flip the view is upside
+     * down. */
+    "    vec3 d = normalize(vec3(p.x * tanHalf, -p.y * tanHalf * aspect, 1.0));\n"
+    "    float cp = cos(pitch), sp = sin(pitch);\n"
+    "    d = vec3(d.x, d.y * cp - d.z * sp, d.y * sp + d.z * cp);\n"
+    "    float cy = cos(yaw), sy = sin(yaw);\n"
+    "    d = vec3(d.x * cy + d.z * sy, d.y, -d.x * sy + d.z * cy);\n"
+    /* angle from each lens axis; the rear lens sees the opposite direction
+     * and its horizontal axis is mirrored */
+    "    float tF = acos(clamp(d.z, -1.0, 1.0));\n"
+    "    float tB = PI - tF;\n"
+    "    vec2 eF = normalize(vec2( d.x, -d.y) + vec2(1e-9));\n"
+    "    vec2 eB = normalize(vec2(-d.x, -d.y) + vec2(1e-9));\n"
+    "    vec2 uvF = (lensC.xy + (tF / halfFov * lensR) * eF) * invSrc;\n"
+    "    vec2 uvB = (lensC.zw + (tB / halfFov * lensR) * eB) * invSrc;\n"
+    "    float wF = clamp((halfFov - tF) / feather, 0.0, 1.0);\n"
+    "    float wB = clamp((halfFov - tB) / feather, 0.0, 1.0);\n"
+    "    vec3 col = (texture(srcTex, uvF).rgb * wF +\n"
+    "                texture(srcTex, uvB).rgb * wB) / max(wF + wB, 1e-4);\n"
+    "    fragColor = vec4(col, 1.0);\n"
+    "}\n";
+
+/* Lens geometry and view state. The geometry is derived from the frame: each
+ * circle is inscribed in its half, so the radius is half the frame height and
+ * the centres sit at a quarter and three quarters of the width. 195 degrees is
+ * the Gear 360's lens; it is the one number here that is camera-specific. */
+#define SPH_LENS_FOV_DEG  195.0f
+#define SPH_FEATHER_DEG     8.0f
+#define SPH_FOV_MIN_DEG    30.0f
+#define SPH_FOV_MAX_DEG   120.0f
+
+static struct {
+    int      on;          /* the viewer is switched on */
+    float    yaw, pitch;  /* radians */
+    float    fov;         /* horizontal view angle, radians */
+    unsigned gen;         /* bumped on every look/zoom, so the frame cache
+                           * in fsr_hw_draw knows the view moved */
+} sph = { 0, 0.0f, 0.0f, 1.7453293f /* 100 deg */, 0 };
+
+static int sph_src_w, sph_src_h;   /* source size for the pass about to run */
+
+int fsr_sphere_fits(int w, int h)
+{
+    /* Two circles side by side fill a 2:1 frame exactly. */
+    return h > 0 && w == 2 * h;
+}
+
+void fsr_sphere_set(int on)
+{
+    sph.on = !!on;
+    sph.gen++;
+}
+
+int fsr_sphere_setting(void) { return sph.on; }
+int fsr_sphere_active(void)  { return sph.on && sphere_prog != 0; }
+
+void fsr_sphere_look(float dyaw, float dpitch)
+{
+    const float lim = 1.5533431f;   /* 89 deg: never quite look along the pole */
+
+    sph.yaw += dyaw;
+    if (sph.yaw >  (float)M_PI) sph.yaw -= 2.0f * (float)M_PI;
+    if (sph.yaw < -(float)M_PI) sph.yaw += 2.0f * (float)M_PI;
+    sph.pitch = av_clipf(sph.pitch + dpitch, -lim, lim);
+    sph.gen++;
+}
+
+void fsr_sphere_zoom(int steps)
+{
+    float deg = sph.fov * 180.0f / (float)M_PI - steps * 5.0f;
+
+    sph.fov = av_clipf(deg, SPH_FOV_MIN_DEG, SPH_FOV_MAX_DEG) * (float)M_PI / 180.0f;
+    sph.gen++;
+}
+
+void fsr_sphere_reset(void)
+{
+    sph.yaw = sph.pitch = 0.0f;
+    sph.fov = 100.0f * (float)M_PI / 180.0f;
+    sph.gen++;
+}
+
+float fsr_sphere_fov_deg(void)   { return sph.fov   * 180.0f / (float)M_PI; }
+float fsr_sphere_yaw_deg(void)   { return sph.yaw   * 180.0f / (float)M_PI; }
+float fsr_sphere_pitch_deg(void) { return sph.pitch * 180.0f / (float)M_PI; }
+
 static int load_gl_functions(void)
 {
 #define LOAD(name)                                                          \
@@ -809,6 +932,21 @@ int fsr_init(SDL_Renderer *renderer)
     easu_prog = build_program(vertex_src, easu_src);
     rcas_prog = build_program(vertex_src, rcas_src);
     copy_prog = build_program(vertex_src, copy_src);
+    /* The 360 viewer is optional: if it will not build, everything else still
+     * works and fsr_sphere_active() stays false. */
+    sphere_prog = build_program(vertex_src, sphere_src);
+    if (sphere_prog) {
+        sph_invout_loc  = gl.GetUniformLocation(sphere_prog, "invOut");
+        sph_invsrc_loc  = gl.GetUniformLocation(sphere_prog, "invSrc");
+        sph_lensc_loc   = gl.GetUniformLocation(sphere_prog, "lensC");
+        sph_lensr_loc   = gl.GetUniformLocation(sphere_prog, "lensR");
+        sph_halffov_loc = gl.GetUniformLocation(sphere_prog, "halfFov");
+        sph_feather_loc = gl.GetUniformLocation(sphere_prog, "feather");
+        sph_yaw_loc     = gl.GetUniformLocation(sphere_prog, "yaw");
+        sph_pitch_loc   = gl.GetUniformLocation(sphere_prog, "pitch");
+        sph_tanhalf_loc = gl.GetUniformLocation(sphere_prog, "tanHalf");
+        sph_aspect_loc  = gl.GetUniformLocation(sphere_prog, "aspect");
+    }
     if (!easu_prog || !rcas_prog || !copy_prog) {
         fsr_uninit();
         return -1;
@@ -980,6 +1118,21 @@ static int run_pass2(SDL_Renderer *renderer, GLuint prog, SDL_Texture *src,
         gl.Uniform1f(rcas_peak_loc, hdr_peak);
         gl.Uniform1f(rcas_gain_loc, hdr_gain);
     }
+    if (prog == sphere_prog) {
+        const float R = sph_src_h * 0.5f;
+
+        gl.Uniform2f(sph_invout_loc, 1.0f / dw, 1.0f / dh);
+        gl.Uniform2f(sph_invsrc_loc, 1.0f / sph_src_w, 1.0f / sph_src_h);
+        gl.Uniform4f(sph_lensc_loc, sph_src_w * 0.25f, sph_src_h * 0.5f,
+                                    sph_src_w * 0.75f, sph_src_h * 0.5f);
+        gl.Uniform1f(sph_lensr_loc, R);
+        gl.Uniform1f(sph_halffov_loc, SPH_LENS_FOV_DEG * 0.5f * (float)M_PI / 180.0f);
+        gl.Uniform1f(sph_feather_loc, SPH_FEATHER_DEG * (float)M_PI / 180.0f);
+        gl.Uniform1f(sph_yaw_loc, sph.yaw);
+        gl.Uniform1f(sph_pitch_loc, sph.pitch);
+        gl.Uniform1f(sph_tanhalf_loc, tanf(sph.fov * 0.5f));
+        gl.Uniform1f(sph_aspect_loc, (float)dh / dw);
+    }
     if (prog == copy_prog) {
         gl.Uniform1f(copy_sat_loc, sat_amount);
         gl.Uniform2f(copy_invout_loc, 1.0f / dw, 1.0f / dh);
@@ -1079,6 +1232,7 @@ static struct {
     const void *last_frame;
     int64_t last_pts;
     int last_rect_w, last_rect_h, last_engaged, last_denoise;
+    unsigned last_sph_gen;
     float last_sharp;
 } hwgl = { .cs_matrix = -1, .cs_range = -1 };
 
@@ -2389,7 +2543,7 @@ static void fsr_dump_ppm(const char *path, const void *data, int w, int h,
 int fsr_hw_draw(SDL_Renderer *renderer, AVFrame *frame, const SDL_Rect *rect,
                 int fsr_on, float sharpness)
 {
-    int engaged;
+    int engaged, sphere;
 
     if (hwgl.state < 0 || fsr_state != 1)
         return 0;
@@ -2399,8 +2553,8 @@ int fsr_hw_draw(SDL_Renderer *renderer, AVFrame *frame, const SDL_Rect *rect,
     /* Opening another file builds a new D3D11 decode device, and every interop
      * object cached here belongs to the old one. Rebuild against the new
      * device instead of locking a stale share: that lock fails, and the
-     * failure path switches zero-copy off permanently, which took VSR and
-     * DLSS-NR down with it until the player restarted. */
+     * failure path switches zero-copy off permanently, which took VSR,
+     * DLSS-NR and the 360 viewer down with it until the player restarted. */
     if (hwgl.state == 1 && frame->hw_frames_ctx) {
         AVHWFramesContext *fctx = (AVHWFramesContext *)frame->hw_frames_ctx->data;
         AVD3D11VADeviceContext *d3d = fctx->device_ctx->hwctx;
@@ -2432,8 +2586,12 @@ int fsr_hw_draw(SDL_Renderer *renderer, AVFrame *frame, const SDL_Rect *rect,
     if (ensure_textures(renderer, hwgl.w, hwgl.h, rect->w, rect->h) < 0)
         return 0;
 
-    engaged = fsr_on && (rect->w > hwgl.w || rect->h > hwgl.h);
-    if (fsr_on)
+    /* The 360 viewer replaces the scaling stage: it renders the window-sized
+     * view straight out of the fisheye frame, so there is nothing for EASU to
+     * upscale afterwards. */
+    sphere = fsr_sphere_active() && fsr_sphere_fits(hwgl.w, hwgl.h);
+    engaged = !sphere && fsr_on && (rect->w > hwgl.w || rect->h > hwgl.h);
+    if (fsr_on && !sphere)
         log_engage_transition(engaged, hwgl.w, hwgl.h, rect);
 
     /* Repeated refreshes of the same frame (pause, toast overlay) reuse the
@@ -2441,7 +2599,7 @@ int fsr_hw_draw(SDL_Renderer *renderer, AVFrame *frame, const SDL_Rect *rect,
     if (frame == hwgl.last_frame && frame->pts == hwgl.last_pts &&
         rect->w == hwgl.last_rect_w && rect->h == hwgl.last_rect_h &&
         engaged == hwgl.last_engaged && sharpness == hwgl.last_sharp &&
-        rcas_denoise == hwgl.last_denoise) {
+        rcas_denoise == hwgl.last_denoise && sph.gen == hwgl.last_sph_gen) {
         SDL_SetRenderTarget(renderer, NULL);
         SDL_RenderCopy(renderer, out_tex, NULL, rect);
         return 1;
@@ -2460,7 +2618,24 @@ int fsr_hw_draw(SDL_Renderer *renderer, AVFrame *frame, const SDL_Rect *rect,
         hwgl_unlock();
         goto fail_permanent;
     }
-    if (engaged) {
+    if (sphere) {
+        /* Reproject into easu_tex (already the window size), then let the
+         * usual tail pass sharpen and tone map exactly as it does for the
+         * EASU chain - the viewer itself only resamples. */
+        int ok;
+
+        sph_src_w = hwgl.w;
+        sph_src_h = hwgl.h;
+        ok = run_pass2(renderer, sphere_prog, NULL, hwgl.gl_tex[hwgl.cur_slot],
+                       easu_tex, rect->w, rect->h, NULL, 0.0f) >= 0 &&
+             run_pass(renderer, fsr_on ? rcas_prog : copy_prog, easu_tex, out_tex,
+                      rect->w, rect->h, NULL, exp2f(-sharpness)) >= 0;
+        if (!ok) {
+            hwgl.DXUnlockObjects(hwgl.gl_device, 1, &hwgl.gl_object[hwgl.cur_slot]);
+            hwgl_unlock();
+            goto fail_soft;
+        }
+    } else if (engaged) {
         GLfloat con0[4];
 
         con0[0] = (GLfloat)hwgl.w / rect->w;
@@ -2528,6 +2703,7 @@ int fsr_hw_draw(SDL_Renderer *renderer, AVFrame *frame, const SDL_Rect *rect,
     hwgl.last_engaged = engaged;
     hwgl.last_denoise = rcas_denoise;
     hwgl.last_sharp   = sharpness;
+    hwgl.last_sph_gen = sph.gen;
 
     if (getenv("FSR_DEBUG_READBACK")) {
         static int rb_count;

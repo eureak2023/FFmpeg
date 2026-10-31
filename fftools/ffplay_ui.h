@@ -143,6 +143,11 @@ int  ui_wants_refresh(void);
  * the lada restored-frame stream can't desync from the master clock. */
 int  ui_window_dragging(void);
 
+/* Give up a window drag that was armed by a press in the video area. The 360
+ * viewer calls this when it decides the same drag is a look-around instead:
+ * the press has already been seen by the time that is known. */
+void ui_cancel_window_drag(void);
+
 void ui_uninit(void);
 
 /* Media info overlay (the TAB block in the top-left corner). ffplay.c builds

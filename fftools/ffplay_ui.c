@@ -986,6 +986,14 @@ int ui_window_dragging(void)
     return ui.wdrag_moving;
 }
 
+void ui_cancel_window_drag(void)
+{
+    if (ui.wdrag_armed || ui.wdrag_moving) {
+        ui.wdrag_armed = ui.wdrag_moving = 0;
+        SDL_CaptureMouse(SDL_FALSE);
+    }
+}
+
 static int seek_track_w(void)
 {
     return ui.win_w - 2 * SEEK_PAD - VOL_AREA;

@@ -446,6 +446,14 @@ static const char *lada_home = "D:/Source_AI/ffplay-fsr1/lada"; /* lada project 
 static const char *jasna_home = "D:/Source_AI/ffplay-fsr1/jasna"; /* jasna source checkout (.venv + model_weights) */
 static SDL_Texture *lada_texture = NULL; /* upload target for restored RGB24 frames */
 static int show_fps = 0;           /* FPS overlay, toggled with TAB */
+/* 360 viewer, off until asked for. It deliberately does not switch itself on:
+ * these files carry no spherical metadata at all - a Gear 360 writes none - so
+ * the only hint is the 2:1 frame shape, and a stitched equirectangular file is
+ * 2:1 as well and would be mapped as if it were two fisheye circles. Guessing
+ * wrong is worse than not guessing. */
+static int vr360;
+static int vr_look;                /* a video-area drag is steering the view */
+static int vr_look_x, vr_look_y;
 static VideoState *hud_is;         /* stream the TAB media info block reports on */
 static int install_assoc = 0;      /* register .mp4/.mkv associations and exit */
 static int uninstall_assoc = 0;
@@ -1810,6 +1818,11 @@ static void status_hud_update(int fps)
             else
                 n += snprintf(buf + n, sizeof(buf) - n, "\nVSR N/A");
         }
+        if (fsr_sphere_active() && n < (int)sizeof(buf))
+            n += snprintf(buf + n, sizeof(buf) - n, "\n360 %d/%d %dFOV",
+                          (int)lrintf(fsr_sphere_yaw_deg()),
+                          (int)lrintf(fsr_sphere_pitch_deg()),
+                          (int)lrintf(fsr_sphere_fov_deg()));
         /* only worth a line while it is actually changing the picture */
         if (saturation != 1.0f && n < (int)sizeof(buf))
             n += snprintf(buf + n, sizeof(buf) - n, "\nCOLOR %d",
@@ -4613,6 +4626,9 @@ static int stream_component_open(VideoState *is, int stream_index)
                 hdr = "SDR";
             ui_set_badges(avctx->hw_device_ctx ? "H/W" : "S/W", vname, hdr,
                           NULL, NULL);
+            /* Only for a frame that can actually be two fisheye circles;
+             * asking for it on anything else would map garbage. */
+            fsr_sphere_set(vr360 && fsr_sphere_fits(avctx->width, avctx->height));
             hud_src_w   = avctx->width;
             hud_src_h   = avctx->height;
             /* picks the restoration head start - see LADA_LEAD_SEC */
@@ -5834,8 +5850,64 @@ static int handle_ui_event(VideoState *cur_stream, const SDL_Event *event)
         cur_stream->force_refresh = 1; /* repaint after the modal menu */
         return 1;
     }
+    /* The 360 viewer steers with the same left drag that otherwise moves the
+     * window, so it only gets what the overlay did not want: ui_handle_event
+     * runs first and UI_ACT_NONE means the press landed on the picture. */
+    /* Outside the fsr_sphere_active() test on purpose: if the viewer is
+     * switched off - or the file changes - in the middle of a drag, the guard
+     * would skip this and the pointer would stay captured for good, which
+     * takes the keyboard with it. */
+    if (event->type == SDL_MOUSEBUTTONUP &&
+        event->button.button == SDL_BUTTON_LEFT && vr_look) {
+        vr_look = 0;
+        SDL_CaptureMouse(SDL_FALSE);
+        return 1;
+    }
+    if (fsr_sphere_active()) {
+        if (event->type == SDL_MOUSEMOTION && vr_look) {
+            /* a drag across the window turns by about the view angle */
+            const float k = fsr_sphere_fov_deg() * (float)M_PI / 180.0f /
+                            FFMAX(cur_stream->width, 1);
+
+            /* Both axes are negated: the drag pulls the world, and the
+             * shader flips the ray's y to match SDL's target orientation,
+             * which reverses pitch along with it. */
+            fsr_sphere_look(-(event->motion.x - vr_look_x) * k,
+                            -(event->motion.y - vr_look_y) * k);
+            vr_look_x = event->motion.x;
+            vr_look_y = event->motion.y;
+            cur_stream->force_refresh = 1;
+            return 1;
+        }
+    }
+
     act = ui_handle_event(event, cur_stream->width, cur_stream->height,
                           &seek_frac);
+    if (fsr_sphere_active() && act == UI_ACT_NONE &&
+        event->type == SDL_MOUSEBUTTONDOWN &&
+        event->button.button == SDL_BUTTON_LEFT) {
+        /* Deliberately not consumed: returning 1 here makes the caller skip
+         * its own event switch, which is where a double-click toggles
+         * fullscreen - and with no way into fullscreen, Escape had nothing to
+         * leave either. Arming the look-drag does not need the event. */
+        static int64_t last_press;
+        int64_t now = av_gettime_relative();
+
+        ui_cancel_window_drag();      /* this drag looks around instead */
+        if (now - last_press > 500000) {
+            vr_look   = 1;
+            vr_look_x = event->button.x;
+            vr_look_y = event->button.y;
+            SDL_CaptureMouse(SDL_TRUE);
+        } else {
+            /* second click of a double-click: it belongs to fullscreen, and a
+             * look armed here would drag the view as the window resizes under
+             * the pointer */
+            vr_look = 0;
+            SDL_CaptureMouse(SDL_FALSE);
+        }
+        last_press = now;
+    }
     switch (act) {
     case UI_ACT_TOGGLE_PAUSE:
         toggle_pause(cur_stream);
@@ -6264,6 +6336,33 @@ static void event_loop(VideoState *cur_stream)
                 cur_stream->force_refresh = 1;
                 break;
             }
+            case SDLK_z:
+                if (event.key.keysym.mod & KMOD_SHIFT) {
+                    fsr_sphere_reset();
+                    if (renderer && fsr_sphere_active())
+                        fsr_toast_show(renderer, "360 CENTER");
+                } else {
+                    int on = !fsr_sphere_setting();
+
+                    if (on && !fsr_sphere_fits(hud_src_w, hud_src_h)) {
+                        av_log(NULL, AV_LOG_INFO,
+                               "360: %dx%d is not a dual-fisheye frame (needs 2:1)\n",
+                               hud_src_w, hud_src_h);
+                        if (renderer)
+                            fsr_toast_show(renderer, "360 N/A");
+                    } else {
+                        vr360 = on;
+                        fsr_sphere_set(on);
+                        av_log(NULL, AV_LOG_INFO, "360 viewer: %s\n",
+                               on ? "on" : "off");
+                        if (renderer)
+                            fsr_toast_show(renderer, on ? "360 ON" : "360 OFF");
+                    }
+                }
+                if (show_fps)
+                    status_hud_update(-1);
+                cur_stream->force_refresh = 1;
+                break;
             case SDLK_TAB:
                 show_fps = !show_fps;
                 av_log(NULL, AV_LOG_INFO, "Status display %s\n", show_fps ? "on" : "off");
@@ -6320,6 +6419,15 @@ static void event_loop(VideoState *cur_stream)
 
                 if (event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED)
                     up = !up;
+                if (fsr_sphere_active()) {
+                    fsr_sphere_zoom(up ? 1 : -1);
+                    snprintf(toast, sizeof(toast), "FOV %d",
+                             (int)lrintf(fsr_sphere_fov_deg()));
+                    if (renderer)
+                        fsr_toast_show(renderer, toast);
+                    cur_stream->force_refresh = 1;
+                    break;
+                }
                 update_volume(cur_stream, up ? 1 : -1, SDL_VOLUME_STEP);
                 snprintf(toast, sizeof(toast), "VOL %d",
                          (int)lrint(cur_stream->audio_volume * 100.0 / SDL_MIX_MAXVOLUME));
@@ -6550,6 +6658,7 @@ static const OptionDef options[] = {
     { "volume",             OPT_TYPE_INT,             0, { &startup_volume}, "set startup volume 0=min 100=max", "volume" },
     { "f",                  OPT_TYPE_FUNC, OPT_FUNC_ARG, { .func_arg = opt_format }, "force format", "fmt" },
     { "stats",              OPT_TYPE_BOOL,   OPT_EXPERT, { &show_status }, "show status", "" },
+    { "vr360",              OPT_TYPE_BOOL,   OPT_EXPERT, { &vr360 }, "360 viewer for dual-fisheye footage: two circles side by side in a 2:1 frame, as a Samsung Gear 360 records. Drag with the left button to look around, the wheel zooms, 'z' toggles it and shift+'z' recentres. Off unless asked for - the files carry no spherical metadata, and a stitched equirectangular video has the same 2:1 shape but needs a different mapping", "" },
     { "fast",               OPT_TYPE_BOOL,   OPT_EXPERT, { &fast }, "non spec compliant optimizations", "" },
     { "genpts",             OPT_TYPE_BOOL,   OPT_EXPERT, { &genpts }, "generate pts", "" },
     { "drp",                OPT_TYPE_INT,    OPT_EXPERT, { &decoder_reorder_pts }, "let decoder reorder pts 0=off 1=on -1=auto", ""},
